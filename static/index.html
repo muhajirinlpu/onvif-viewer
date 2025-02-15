@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ONVIF Camera</title>
+  <script type="importmap">
+    {
+      "imports": {
+        "vue": "https://unpkg.com/vue@3/dist/vue.esm-browser.js"
+      }
+    }
+  </script>
+  <script src="https://unpkg.com/xml-formatter@3/dist/browser/xml-formatter-singleton.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+</head>
+
+<body>
+  <div id="app" class="dark bg-gray-900 text-white min-h-screen p-4">
+    <!-- Camera Config Section -->
+    <div class="bg-gray-800 p-6 rounded-lg shadow-md w-full max-w-md mx-auto mb-4">
+      <h1 class="text-2xl font-bold mb-4 text-center">ONVIF Camera</h1>
+      <p class="text-gray-400 mb-4 text-center">Enter your ONVIF camera details below:</p>
+
+      <!-- Inputs -->
+      <div class="space-y-4">
+        <input v-model="cameraIp" placeholder="Camera IP (e.g., 192.168.0.125)"
+          class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-white" />
+        <input v-model="cameraPort" placeholder="Camera Port (e.g., 8000)"
+          class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-white" />
+        <input v-model="proxy" placeholder="Proxy URL (e.g., socks5://user:pass@host:port)"
+          class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-white" />
+        <input v-model="username" placeholder="Username"
+          class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-white" />
+        <div class="flex space-x-2">
+          <input v-model="password" :type="showPassword ? 'text' : 'password'" placeholder="Password"
+            class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-white" />
+          <button @click="showPassword = !showPassword" type="button"
+            class="px-4 py-2 bg-gray-700 border border-gray-600 rounded-md hover:bg-gray-600">
+            {{ showPassword ? 'Hide' : 'Show' }}
+          </button>
+        </div>
+        <button @click="fetchStreamUri"
+          class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition duration-300">
+          Fetch Stream
+        </button>
+        <hr class="my-4 border-gray-600">
+        <select v-model="func"
+          class="w-full px-4 py-2 bg-gray-700 border border-gray-600 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-white">
+          <option value="">Select Function</option>
+          <option value="GetCapabilities">GetCapabilities</option>
+          <option value="GetDeviceInformation">GetDeviceInformation</option>
+          <option value="GetProfiles">GetProfiles</option>
+        </select>
+        <button @click="fetchDebug"
+          class="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 transition duration-300">
+          Fetch Debug
+        </button>
+      </div>
+
+      <!-- Error Message -->
+      <p v-if="error" class="text-red-500 mt-4">{{ error }}</p>
+    </div>
+
+    <!-- Debug Output -->
+    <div v-if="response" class="bg-gray-800 p-6 rounded-lg shadow-md w-full max-w-4xl mx-auto mb-4">
+      <h4 class="text-lg font-bold mb-2">Response:</h4>
+      <h2 class="text-lg font-bold mb-2">SOAP Request:</h2>
+      <pre class="bg-gray-700 p-4 rounded-md overflow-auto text-sm">{{ format(response.envelope) }}</pre>
+      <h2 class="text-lg font-bold mb-2">SOAP Response:</h2>
+      <pre class="bg-gray-700 p-4 rounded-md overflow-auto text-sm">{{ format(response.rawResponse) }}</pre>
+    </div>
+
+    <!-- Stream List with Refresh -->
+    <div class="bg-gray-800 p-6 rounded-lg shadow-md w-full max-w-4xl mx-auto mb-4">
+      <div class="flex justify-between items-center mb-4">
+        <h3 class="text-xl font-bold">Available Streams</h3>
+        <button @click="loadStreams"
+          class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 flex items-center gap-2">
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+            <path fill-rule="evenodd"
+              d="M4 2a1 1 0 011 1v2.101a7.002 7.002 0 0111.601 2.566 1 1 0 11-1.885.666A5.002 5.002 0 005.999 7H9a1 1 0 010 2H4a1 1 0 01-1-1V3a1 1 0 011-1zm.008 9.057a1 1 0 011.276.61A5.002 5.002 0 0014.001 13H11a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0v-2.101a7.002 7.002 0 01-11.601-2.566 1 1 0 01.61-1.276z"
+              clip-rule="evenodd" />
+          </svg>
+          Refresh List
+        </button>
+      </div>
+
+      <div v-if="streams.length" class="space-y-4">
+        <div v-for="stream in streams" :key="stream.id" class="bg-gray-700 p-4 rounded-lg">
+          <div class="flex justify-between items-center">
+            <div>
+              <p class="text-sm text-gray-300">Stream ID: {{ stream.id }}</p>
+              <p class="text-sm text-gray-300">Started: {{ new Date(stream.startedAt).toLocaleString() }}</p>
+            </div>
+            <div class="flex items-center gap-2">
+              <button v-if="!stream.stopping" @click="toggleVideo(stream)"
+                class="px-3 py-1 bg-blue-600 text-white rounded hover:bg-blue-700">
+                {{ stream.showVideo ? 'Hide Video' : 'Show Video' }}
+              </button>
+              <button @click="stopStream(stream.id)" :disabled="stream.stopping"
+                class="px-3 py-1 bg-red-600 text-white rounded hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed">
+                {{ stream.stopping ? 'Stopping...' : 'Stop Stream' }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p v-else class="text-gray-400 text-center">No active streams</p>
+    </div>
+
+    <div class="space-y-4">
+      <div v-for="stream in streams" :key="stream.id">
+        <div v-if="stream.showVideo" class="bg-gray-800 p-6 rounded-lg shadow-md w-full max-w-4xl mx-auto">
+          <h4 class="text-lg font-bold mb-2">Stream: {{ stream.id }}</h4>
+          <video :id="'video-' + stream.id" controls class="w-full rounded-lg"></video>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { createApp, ref, onMounted, nextTick } from 'vue';
+
+    createApp({
+      setup() {
+        // Initialize refs with empty values
+        const func = ref('');
+        const cameraIp = ref('');
+        const cameraPort = ref('');
+        const username = ref('');
+        const password = ref('');
+        const proxy = ref('');
+        const showPassword = ref(false);
+        const response = ref(null);
+        const error = ref('');
+        const streams = ref([]);
+
+        // Load saved values from localStorage
+        onMounted(() => {
+          loadStreams();
+
+          // Load saved camera settings
+          const savedSettings = JSON.parse(localStorage.getItem('cameraSettings') || '{}');
+          cameraIp.value = savedSettings.cameraIp || '';
+          cameraPort.value = savedSettings.cameraPort || '';
+          username.value = savedSettings.username || '';
+          proxy.value = savedSettings.proxy || '';
+        });
+
+        // Save settings to localStorage
+        const saveSettings = () => {
+          const settings = {
+            cameraIp: cameraIp.value,
+            cameraPort: cameraPort.value,
+            username: username.value,
+            proxy: proxy.value,
+          };
+          localStorage.setItem('cameraSettings', JSON.stringify(settings));
+        };
+
+        const fetchStreamUri = async () => {
+          error.value = '';
+          try {
+            saveSettings(); // Save settings before making request
+            const resp = await fetch('/api/stream/uri', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                cameraIp: cameraIp.value,
+                cameraPort: cameraPort.value,
+                username: username.value,
+                password: password.value,
+                proxy: proxy.value,
+              }),
+            });
+
+            if (!resp.ok) {
+              throw new Error('Failed to fetch stream URI');
+            }
+
+            const data = await resp.json();
+            const rtspUrl = extractRtspUrl(data.rawResponse);
+
+            if (!rtspUrl) {
+              throw new Error('No RTSP URL found in response');
+            }
+
+            // Start the stream with the obtained RTSP URL
+            await startStream(rtspUrl);
+
+          } catch (err) {
+            error.value = err.message;
+            console.error(err);
+          }
+        };
+
+        const startStream = async (rtspUrl) => {
+          try {
+            const resp = await fetch('/api/stream/start', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                rtspUrl,
+                profileToken: 'defaultToken',
+                proxy: proxy.value,
+              }),
+            });
+
+            if (!resp.ok) {
+              throw new Error('Failed to start stream');
+            }
+
+            await loadStreams();
+          } catch (err) {
+            error.value = err.message;
+          }
+        };
+
+        const stopStream = async (streamId) => {
+          // Find stream and set stopping state
+          const stream = streams.value.find(s => s.id === streamId);
+          if (!stream) return;
+          stream.stopping = true;
+
+          toggleVideo(stream); // Hide video before stopping
+
+          try {
+            const resp = await fetch(`/api/stream/stop?id=${streamId}`);
+            if (!resp.ok) {
+              const text = await resp.text();
+              throw new Error(text || 'Failed to stop stream');
+            }
+            await loadStreams();
+          } catch (err) {
+            error.value = `Failed to stop stream: ${err.message}`;
+            console.error(err);
+            // Reset stopping state if failed
+            stream.stopping = false;
+          }
+        };
+
+        const toggleVideo = async (stream) => {
+          stream.showVideo = !stream.showVideo;
+
+          if (stream.showVideo) {
+            // Initialize HLS only when showing video
+            nextTick(() => {
+              const video = document.getElementById(`video-${stream.id}`);
+              if (video && Hls.isSupported()) {
+                // Cleanup existing HLS instance if any
+                if (video.hls) {
+                  video.hls.destroy();
+                }
+                const hls = new Hls();
+                video.hls = hls; // Store HLS instance for cleanup
+                hls.loadSource(stream.hlsUrl);
+                hls.attachMedia(video);
+                hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                  video.play().catch(e => console.log("Auto-play prevented:", e));
+                });
+              }
+            });
+          } else {
+            // Cleanup HLS when hiding video
+            const video = document.getElementById(`video-${stream.id}`);
+            if (video && video.hls) {
+              video.hls.destroy();
+              video.hls = null;
+            }
+          }
+        };
+
+        const loadStreams = async () => {
+          try {
+            const resp = await fetch('/api/stream/list');
+            const data = await resp.json();
+            streams.value = data.map(stream => ({
+              ...stream,
+              showVideo: (streams.value.find(s => s.id === stream.id)?.showVideo) || false,
+              stopping: false
+            }));
+          } catch (err) {
+            console.error('Failed to load streams:', err);
+          }
+        };
+
+        const extractRtspUrl = (soapResponse) => {
+          const match = soapResponse.match(/<tt:Uri>(.+?)<\/tt:Uri>/);
+          return match ? match[1] : null;
+        };
+
+        // Load streams on mount
+        onMounted(() => {
+          loadStreams();
+        });
+
+        const fetchDebug = async () => {
+          error.value = '';
+          try {
+            saveSettings(); // Save settings before making request
+            const resp = await fetch('/api/functest', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({
+                func: func.value,
+                cameraIp: cameraIp.value,
+                cameraPort: cameraPort.value,
+                username: username.value,
+                password: password.value,
+                proxy: proxy.value,
+              }),
+            });
+
+            if (!resp.ok) {
+              const errorMessage = await resp.text();
+              throw new Error(errorMessage || 'Failed to fetch stream.');
+            }
+
+            const data = await resp.json();
+            response.value = data;
+          } catch (err) {
+            error.value = err.message || 'An error occurred while fetching the stream.';
+            console.error(err);
+          }
+        }
+
+        const format = xmlFormatter;
+
+        return {
+          format,
+          func,
+          cameraIp,
+          cameraPort,
+          username,
+          password,
+          proxy,
+          showPassword,
+          response,
+          error,
+          fetchStreamUri,
+          fetchDebug,
+          streams,
+          stopStream,
+          loadStreams,
+          toggleVideo,
+        };
+      },
+    }).mount('#app');
+  </script>
+</body>
+
+</html>
