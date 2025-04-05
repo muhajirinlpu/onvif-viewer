@@ -4,13 +4,14 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha1"
+	"embed"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -21,14 +22,19 @@ import (
 	"time"
 )
 
+//go:embed static
+var staticFiles embed.FS
+
 const streamStopTimeout = 5 * time.Second
+
+// Use OS temp directory for HLS files
+var hlsBaseDir string
 
 type CameraRequest struct {
 	CameraIp   string `json:"cameraIp"`
 	CameraPort string `json:"cameraPort"`
 	Username   string `json:"username"`
 	Password   string `json:"password"`
-	Proxy      string `json:"proxy"`
 }
 
 type GetStreamUriRequest struct {
@@ -199,7 +205,7 @@ var (
 	}
 )
 
-func (sm *StreamManager) StartStream(profileToken, rtspURL, proxy string) (*StreamInfo, error) {
+func (sm *StreamManager) StartStream(profileToken, rtspURL string) (*StreamInfo, error) {
 	sm.mutex.Lock()
 	defer sm.mutex.Unlock()
 
@@ -212,30 +218,22 @@ func (sm *StreamManager) StartStream(profileToken, rtspURL, proxy string) (*Stre
 
 	// Create stream ID and HLS path
 	streamID := fmt.Sprintf("stream_%d", time.Now().Unix())
-	hlsDir := filepath.Join("static", "hls", streamID)
+	hlsDir := filepath.Join(hlsBaseDir, streamID)
 	os.MkdirAll(hlsDir, 0755)
 
-	// Prepare FFmpeg command with proxy if provided
-	args := []string{"-y"}
-	
-	if proxy != "" {
-		// Use FFmpeg's built-in proxy options
-		args = append(args, 
-			"-rtsp_transport", "tcp",
-			"-http_proxy", proxy,
-		)
-	}
-
-	log.Printf("Proxy: %s", proxy)
-
-	args = append(args, "-i", rtspURL,
+	// Prepare FFmpeg command
+	args := []string{
+		"-y",
+		"-rtsp_transport", "tcp",
+		"-i", rtspURL,
 		"-c:v", "copy",
 		"-c:a", "aac",
 		"-hls_time", "2",
 		"-hls_list_size", "3",
 		"-hls_flags", "delete_segments",
 		"-f", "hls",
-		filepath.Join(hlsDir, "stream.m3u8"))
+		filepath.Join(hlsDir, "stream.m3u8"),
+	}
 
 	cmd := exec.Command("ffmpeg", args...)
 
@@ -244,7 +242,6 @@ func (sm *StreamManager) StartStream(profileToken, rtspURL, proxy string) (*Stre
 		Setpgid: true,
 	}
 
-	// We don't need to set environment variables anymore since we're using FFmpeg's proxy options
 	streamProcess := &StreamProcess{
 		Info: StreamInfo{
 			ID:           streamID,
@@ -324,7 +321,7 @@ func (sm *StreamManager) StopStream(streamID string) error {
 
 	// Cleanup files in background
 	go func() {
-		hlsDir := filepath.Join("static", "hls", streamID)
+		hlsDir := filepath.Join(hlsBaseDir, streamID)
 		// Wait a bit before removing files
 		time.Sleep(time.Second)
 		if err := os.RemoveAll(hlsDir); err != nil {
@@ -349,8 +346,7 @@ func (sm *StreamManager) ListStreams() []StreamInfo {
 func handleStartStream(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ProfileToken string `json:"profileToken"`
-		RtspURL     string `json:"rtspUrl"`
-		Proxy       string `json:"proxy"`
+		RtspURL      string `json:"rtspUrl"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -358,7 +354,7 @@ func handleStartStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	streamInfo, err := streamManager.StartStream(req.ProfileToken, req.RtspURL, req.Proxy)
+	streamInfo, err := streamManager.StartStream(req.ProfileToken, req.RtspURL)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -391,28 +387,15 @@ func extractProfileToken(soapResponse string) (string, error) {
 	return "", fmt.Errorf("no profile token found")
 }
 
-// Add this helper function
-func doHTTPRequest(method, targetUrl, contentType string, body io.Reader, proxy string) (*http.Response, error) {
+// Replace doHTTPRequest with a simpler version without proxy
+func doHTTPRequest(method, targetUrl, contentType string, body io.Reader) (*http.Response, error) {
 	client := &http.Client{}
-	
-	if proxy != "" {
-		fmt.Println("Using proxy")
-		proxyURL, err := url.Parse(proxy)
-		if err != nil {
-			return nil, fmt.Errorf("invalid proxy URL: %v", err)
-		}
-		client = &http.Client{
-			Transport: &http.Transport{
-				Proxy: http.ProxyURL(proxyURL),
-			},
-		}
-	}
 
 	httpReq, err := http.NewRequest(method, targetUrl, body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
-	
+
 	if contentType != "" {
 		httpReq.Header.Set("Content-Type", contentType)
 	}
@@ -420,7 +403,7 @@ func doHTTPRequest(method, targetUrl, contentType string, body io.Reader, proxy 
 	return client.Do(httpReq)
 }
 
-// Update handleGetStreamUri to use the helper function
+// Update handleGetStreamUri
 func handleGetStreamUri(w http.ResponseWriter, r *http.Request) {
 	var req GetStreamUriRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -432,9 +415,9 @@ func handleGetStreamUri(w http.ResponseWriter, r *http.Request) {
 	if req.ProfileToken == "" {
 		profilesEnvelope := GetProfiles.envelope(req.CameraRequest)
 		url := fmt.Sprintf("http://%s:%s/%s", req.CameraIp, req.CameraPort, GetProfiles.uri())
-		
-		resp, err := doHTTPRequest("POST", url, "application/soap+xml; charset=utf-8", 
-			strings.NewReader(profilesEnvelope), req.Proxy)
+
+		resp, err := doHTTPRequest("POST", url, "application/soap+xml; charset=utf-8",
+			strings.NewReader(profilesEnvelope))
 		if err != nil {
 			http.Error(w, fmt.Sprintf("Failed to get profiles: %v", err), http.StatusInternalServerError)
 			return
@@ -453,9 +436,9 @@ func handleGetStreamUri(w http.ResponseWriter, r *http.Request) {
 	// Get stream URI with profile token
 	streamUriEnvelope := fmt.Sprintf(GetStreamUri.envelope(req.CameraRequest), req.ProfileToken)
 	url := fmt.Sprintf("http://%s:%s/%s", req.CameraIp, req.CameraPort, GetStreamUri.uri())
-	
-	resp, err := doHTTPRequest("POST", url, "application/soap+xml; charset=utf-8", 
-		strings.NewReader(streamUriEnvelope), req.Proxy)
+
+	resp, err := doHTTPRequest("POST", url, "application/soap+xml; charset=utf-8",
+		strings.NewReader(streamUriEnvelope))
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to get stream URI: %v", err), http.StatusInternalServerError)
 		return
@@ -473,7 +456,7 @@ func handleGetStreamUri(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-// Update handleFuncTest to use the helper function
+// Update handleFuncTest
 func handleFuncTest(w http.ResponseWriter, r *http.Request) {
 	var req map[string]interface{}
 
@@ -511,8 +494,8 @@ func handleFuncTest(w http.ResponseWriter, r *http.Request) {
 	url := fmt.Sprintf("http://%s:%s/%s", camReq.CameraIp, camReq.CameraPort, uri)
 	envelope := cameraFunction.envelope(camReq)
 
-	resp, err := doHTTPRequest("POST", url, "application/soap+xml; charset=utf-8", 
-		strings.NewReader(envelope), camReq.Proxy)
+	resp, err := doHTTPRequest("POST", url, "application/soap+xml; charset=utf-8",
+		strings.NewReader(envelope))
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Failed to send SOAP request: %v", err), http.StatusInternalServerError)
 		return
@@ -536,8 +519,13 @@ func handleFuncTest(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	// Create HLS directory
-	os.MkdirAll(filepath.Join("static", "hls"), 0755)
+	// Create a temporary directory for HLS files
+	var err error
+	hlsBaseDir, err = os.MkdirTemp("", "onvif-hls")
+	if err != nil {
+		log.Fatalf("Failed to create temp directory: %v", err)
+	}
+	log.Printf("HLS files will be stored in: %s", hlsBaseDir)
 
 	// Setup signal handling
 	sigChan := make(chan os.Signal, 1)
@@ -556,13 +544,21 @@ func main() {
 		streamManager.mutex.Unlock()
 
 		// Remove HLS directory
-		os.RemoveAll(filepath.Join("static", "hls"))
+		os.RemoveAll(hlsBaseDir)
 		os.Exit(0)
 	}()
 
-	fs := http.FileServer(http.Dir("./static"))
-	http.Handle("/", fs)
-	http.Handle("/hls/", http.StripPrefix("/hls/", http.FileServer(http.Dir("./static/hls"))))
+	// Serve the embedded static files
+	staticFS, err := fs.Sub(staticFiles, "static")
+	if err != nil {
+		log.Fatalf("Failed to get static files sub-filesystem: %v", err)
+	}
+	
+	// Define HTTP handlers
+	http.Handle("/", http.FileServer(http.FS(staticFS)))
+	
+	// Serve HLS files from temp directory
+	http.Handle("/hls/", http.StripPrefix("/hls/", http.FileServer(http.Dir(hlsBaseDir))))
 
 	http.HandleFunc("/api/functest", handleFuncTest)
 	http.HandleFunc("/api/stream/start", handleStartStream)
