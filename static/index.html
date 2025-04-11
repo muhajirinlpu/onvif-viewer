@@ -3,7 +3,7 @@
 
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=width=device-width, initial-scale=1.0">
   <title>ONVIF Camera Viewer</title>
   <script type="importmap">
     {
@@ -15,19 +15,6 @@
   <script src="https://cdn.jsdelivr.net/npm/xml-formatter@3/dist/browser/xml-formatter-singleton.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <script type="module">
-    import createRnnWasmModuleSync from 'https://cdn.jsdelivr.net/npm/@jitsi/rnnoise-wasm@0.2.1/dist/rnnoise-sync.js';
-
-    window.rnnoiseWasm = createRnnWasmModuleSync();
-
-    if (window.rnnoiseWasm && window.rnnoiseWasm.ready) {
-      window.rnnoiseWasm.ready.then(() => {
-        console.log("Jitsi RNNoise WASM module loaded successfully");
-      });
-    } else {
-      console.error("Failed to load Jitsi RNNoise WASM module");
-    }
-  </script>
   <!-- Add Fontawesome for better icons -->
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
   <style>
@@ -240,6 +227,23 @@
     input:checked+.toggle-slider:before {
       transform: translateX(20px);
     }
+
+    .logs-panel {
+      transition: all 0.3s ease;
+      overflow: hidden;
+    }
+
+    .logs-panel.collapsed {
+      max-height: 0;
+      padding: 0;
+      margin: 0;
+      opacity: 0;
+    }
+
+    .logs-panel.expanded {
+      max-height: 1000px;
+      opacity: 1;
+    }
   </style>
 </head>
 
@@ -385,6 +389,62 @@
       </div>
 
       <div :class="{'md:col-span-2': !configCollapsed, 'md:col-span-3': configCollapsed, 'space-y-6': true}">
+        <!-- FFmpeg Logs Collapsible Panel -->
+        <div class="bg-gray-800 p-5 rounded-lg shadow-md">
+          <div class="flex items-center justify-between cursor-pointer" @click="toggleLogsPanel">
+            <h2 class="text-xl font-bold flex items-center">
+              <i class="fas fa-terminal text-amber-400 mr-2"></i> FFmpeg Logs
+              <span v-if="logConnectionStatus === 'connected'"
+                class="text-xs bg-green-700 text-white px-2 py-0.5 rounded-full ml-2">LIVE</span>
+              <span v-else-if="logConnectionStatus === 'connecting'"
+                class="text-xs bg-amber-700 text-white px-2 py-0.5 rounded-full ml-2">CONNECTING...</span>
+              <span v-else-if="logConnectionStatus === 'disconnected'"
+                class="text-xs bg-red-700 text-white px-2 py-0.5 rounded-full ml-2">DISCONNECTED</span>
+            </h2>
+            <button class="text-gray-400 hover:text-white">
+              <i :class="['fas', 'fa-chevron-up', 'rotate-icon', {'down': logsCollapsed}]"></i>
+            </button>
+          </div>
+
+          <div :class="['logs-panel', logsCollapsed ? 'collapsed' : 'expanded', 'mt-4']">
+            <div class="relative">
+              <div v-if="streamLogs.length === 0" class="flex flex-col items-center justify-center py-8 text-gray-400">
+                <i class="fas fa-info-circle text-3xl mb-2"></i>
+                <p>No logs available yet</p>
+              </div>
+
+              <div v-else ref="logsContainer" class="bg-gray-700 rounded-md h-64 overflow-auto p-4 mb-4">
+                <pre class="text-sm text-gray-300 whitespace-pre-wrap">
+                  <div v-for="(log, index) in streamLogs" :key="index" 
+                       :class="{
+                         'text-red-400': log.message.includes('stderr:'), 
+                         'text-blue-300': log.message.includes('stdout:')
+                       }">
+                    <span class="text-green-400">[{{ log.streamId }}]</span> {{ log.message }}
+                  </div>
+                </pre>
+              </div>
+
+              <div class="flex items-center justify-between">
+                <button @click="clearLogs" class="px-4 py-2 bg-gray-600 text-white rounded-md hover:bg-gray-700">
+                  <i class="fas fa-trash-alt mr-2"></i>
+                  Clear Logs
+                </button>
+                <div class="flex items-center">
+                  <span class="text-sm text-gray-400 mr-2">Max logs:</span>
+                  <select v-model="maxLogEntries"
+                    class="bg-gray-700 text-white rounded px-3 py-1 border border-gray-600">
+                    <option value="100">100</option>
+                    <option value="250">250</option>
+                    <option value="500">500</option>
+                    <option value="1000">1000</option>
+                  </select>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <div class="bg-gray-800 p-5 rounded-lg shadow-md">
           <h2 class="text-xl font-bold mb-4 flex items-center">
             <i class="fas fa-camera text-blue-400 mr-2"></i> Active Streams
@@ -416,41 +476,6 @@
                 <video :id="'video-' + stream.id" controls class="w-full"></video>
               </div>
 
-              <!-- Add Audio Controls -->
-              <div v-if="stream.showVideo && audioSupported" class="mt-3">
-                <div class="flex items-center mb-2">
-                  <span class="text-sm font-medium text-gray-300 mr-2">Audio Controls:</span>
-                  <div class="flex items-center ml-auto">
-                    <label class="toggle-switch">
-                      <input type="checkbox" v-model="noiseReductionEnabled">
-                      <span class="toggle-slider"></span>
-                    </label>
-                    <span class="text-xs text-gray-400">Noise Reduction</span>
-                  </div>
-                </div>
-
-                <div class="audio-controls">
-                  <button @mousedown="startTalking(stream)" @mouseup="stopTalking" @mouseleave="stopTalking"
-                    @touchstart.prevent="startTalking(stream)" @touchend.prevent="stopTalking"
-                    :class="['talk-button', isTalking ? 'talking' : '']">
-                    <i :class="isTalking ? 'fas fa-microphone' : 'fas fa-microphone-slash'" class="mr-2"></i>
-                    Press to Talk
-                  </button>
-                  <div class="audio-visualizer" v-if="isTalking">
-                    <div class="audio-visualizer-bars">
-                      <div v-for="i in 20" :key="i" class="audio-bar" :style="{ height: audioVisualizer[i-1] + 'px' }">
-                      </div>
-                    </div>
-                  </div>
-                  <div class="audio-status" v-if="!isTalking">
-                    <span v-if="audioSupported">
-                      Hold to speak to camera
-                      <span v-if="noiseReductionEnabled" class="text-blue-400">(noise reduction active)</span>
-                    </span>
-                  </div>
-                </div>
-              </div>
-              <!-- End Audio Controls -->
             </div>
           </div>
 
@@ -488,7 +513,6 @@
       <p class="mt-1">For connecting to and streaming from ONVIF-compatible IP cameras</p>
     </footer>
   </div>
-
   <script type="module">
     import { createApp, ref, onMounted, nextTick, watch } from 'vue';
 
@@ -506,20 +530,35 @@
         const streams = ref([]);
         const isProcessing = ref(false);
         const configCollapsed = ref(false);
-        const audioSupported = ref(false);
-        const isTalking = ref(false);
-        const audioContext = ref(null);
-        const audioStream = ref(null);
-        const audioVisualizer = ref(Array(20).fill(5));
-        const analyserNode = ref(null);
         const currentStreamId = ref(null);
-        const noiseReductionEnabled = ref(true);
-        const rnnoiseProcessor = ref(null);
-        const audioWorklet = ref(null);
+        const streamLogs = ref([]);
+        const logConnectionStatus = ref('disconnected');
+        const maxLogEntries = ref(250);
+        const logsCollapsed = ref(true); // Default to collapsed
+        const logsContainer = ref(null);
+        let eventSource = null;
 
         const toggleConfigPanel = () => {
           configCollapsed.value = !configCollapsed.value;
           localStorage.setItem('configCollapsed', configCollapsed.value.toString());
+        };
+
+        const toggleLogsPanel = () => {
+          logsCollapsed.value = !logsCollapsed.value;
+
+          // If expanding the logs panel, ensure logs are visible by scrolling to bottom
+          if (!logsCollapsed.value) {
+            nextTick(() => {
+              if (logsContainer.value) {
+                logsContainer.value.scrollTop = logsContainer.value.scrollHeight;
+              }
+            });
+
+            // Connect to logs if not already connected
+            if (logConnectionStatus.value === 'disconnected') {
+              connectToLogEvents();
+            }
+          }
         };
 
         onMounted(async () => {
@@ -536,21 +575,8 @@
             configCollapsed.value = window.innerWidth >= 768;
           }
 
-          const savedNoiseReduction = localStorage.getItem('noiseReductionEnabled');
-          if (savedNoiseReduction !== null) {
-            noiseReductionEnabled.value = savedNoiseReduction === 'true';
-          }
-
-          try {
-            if (window.rnnoiseWasm && window.rnnoiseWasm.ready) {
-              await window.rnnoiseWasm.ready;
-              console.log("Jitsi RNNoise WASM module is ready");
-            } else {
-              console.error("RNNoise WASM not loaded correctly");
-            }
-          } catch (err) {
-            console.error("Failed to initialize RNNoise:", err);
-          }
+          // Initialize logs connection
+          connectToLogEvents();
         });
 
         const saveSettings = () => {
@@ -690,9 +716,22 @@
             initializeVideoPlayer(stream);
           } else {
             const video = document.getElementById(`video-${stream.id}`);
-            if (video && video.hls) {
-              video.hls.destroy();
-              video.hls = null;
+            if (video) {
+              // Clean up audio processing
+              if (video.audioProcessor) {
+                video.audioProcessor.disconnect();
+                video.audioProcessor = null;
+              }
+              if (video.audioSource) {
+                video.audioSource.disconnect();
+                video.audioSource = null;
+              }
+
+              // Clean up HLS
+              if (video.hls) {
+                video.hls.destroy();
+                video.hls = null;
+              }
             }
           }
         };
@@ -754,128 +793,82 @@
           }
         };
 
-        const initializeAudio = async () => {
-          try {
-            if (audioContext.value) {
-              await audioContext.value.close();
-            }
+        const connectToLogEvents = () => {
+          // Close any existing connection
+          if (eventSource) {
+            eventSource.close();
+            eventSource = null;
+          }
 
-            audioContext.value = new (window.AudioContext || window.webkitAudioContext)();
-            audioStream.value = await navigator.mediaDevices.getUserMedia({
-              audio: {
-                echoCancellation: true,
-                noiseSuppression: true,
-                autoGainControl: true
+          // Clear existing logs
+          streamLogs.value = [];
+          logConnectionStatus.value = 'connecting';
+
+          // Connect to SSE endpoint
+          eventSource = new EventSource('/api/stream/logevents');
+
+          eventSource.onopen = () => {
+            logConnectionStatus.value = 'connected';
+            console.log('Connected to log events stream');
+          };
+
+          eventSource.onmessage = (event) => {
+            try {
+              const logEntry = JSON.parse(event.data);
+
+              // Add to logs array with limit
+              streamLogs.value.push(logEntry);
+
+              // Limit the number of logs to prevent memory issues
+              if (streamLogs.value.length > maxLogEntries.value) {
+                streamLogs.value = streamLogs.value.slice(-maxLogEntries.value);
               }
-            });
 
-            const source = audioContext.value.createMediaStreamSource(audioStream.value);
-            analyserNode.value = audioContext.value.createAnalyser();
-            analyserNode.value.fftSize = 64;
-            const bufferLength = analyserNode.value.frequencyBinCount;
-            const dataArray = new Uint8Array(bufferLength);
-
-            let processedSource = source;
-
-            // Apply Jitsi RNNoise for noise cancellation if enabled
-            if (noiseReductionEnabled.value) {
-              try {
-                const ctx = audioContext.value;
-                if (window.rnnoiseWasm && window.rnnoiseWasm.ready) {
-                  // Make sure WASM is fully loaded
-                  await window.rnnoiseWasm.ready;
-
-                  // Create a simple gain node as we can't use the RNNoise processor directly
-                  // We'll use it as a placeholder for now
-                  const gainNode = ctx.createGain();
-                  gainNode.gain.value = 1.0;
-
-                  // Connect through the gain node
-                  source.connect(gainNode);
-                  processedSource = gainNode;
-                  console.log("Basic audio processing enabled (RNNoise not fully implemented)");
-                } else {
-                  console.error("RNNoise WASM not available, using default audio processing");
-                  processedSource = source;
+              // Auto-scroll to bottom
+              nextTick(() => {
+                if (logsContainer.value) {
+                  logsContainer.value.scrollTop = logsContainer.value.scrollHeight;
                 }
-              } catch (err) {
-                console.error("Failed to initialize audio processing:", err);
-                // Fall back to normal audio
-                processedSource = source;
-              }
+              });
+
+            } catch (err) {
+              console.error('Error parsing log event:', err);
             }
+          };
 
-            // Connect to the analyser for visualization
-            processedSource.connect(analyserNode.value);
+          eventSource.onerror = () => {
+            logConnectionStatus.value = 'disconnected';
+            console.error('Log events stream disconnected');
 
-            // Update visualizer
-            const updateVisualizer = () => {
-              if (!isTalking.value || !analyserNode.value) return;
-
-              analyserNode.value.getByteFrequencyData(dataArray);
-
-              for (let i = 0; i < audioVisualizer.value.length; i++) {
-                const index = Math.floor(i * bufferLength / audioVisualizer.value.length);
-                audioVisualizer.value[i] = 5 + ((dataArray[index] / 255) * 19);
+            // Try to reconnect after a delay
+            setTimeout(() => {
+              if (showLogsModal.value) {
+                connectToLogEvents();
               }
+            }, 5000);
+          };
+        };
 
-              if (isTalking.value) {
-                requestAnimationFrame(updateVisualizer);
-              }
-            };
+        const closeLogsModal = () => {
+          showLogsModal.value = false;
 
-            updateVisualizer();
-            return processedSource;
-          } catch (err) {
-            console.error('Error initializing audio:', err);
-            error.value = "Microphone access denied. Please allow microphone access to use talk feature.";
-            return null;
+          // Close SSE connection when closing modal
+          if (eventSource) {
+            eventSource.close();
+            eventSource = null;
+            logConnectionStatus.value = 'disconnected';
           }
         };
 
-        const startTalking = async (stream) => {
-          if (!audioSupported.value) return;
-
-          isTalking.value = true;
-          currentStreamId.value = stream.id;
-
-          try {
-            const audioSource = await initializeAudio();
-            if (!audioSource) return;
-
-            console.log('Started talking to camera', stream.id);
-            console.log('Noise reduction:', noiseReductionEnabled.value ? 'enabled' : 'disabled');
-          } catch (err) {
-            console.error('Error starting talk:', err);
-            stopTalking();
-          }
+        const clearLogs = () => {
+          streamLogs.value = [];
         };
 
-        const stopTalking = () => {
-          isTalking.value = false;
-
-          if (audioStream.value) {
-            audioStream.value.getTracks().forEach(track => track.stop());
-            audioStream.value = null;
+        watch(maxLogEntries, (newValue) => {
+          // If we have more logs than the new limit, trim them
+          if (streamLogs.value.length > newValue) {
+            streamLogs.value = streamLogs.value.slice(-newValue);
           }
-
-          if (audioWorklet.value) {
-            audioWorklet.value.disconnect();
-            audioWorklet.value = null;
-          }
-
-          if (audioContext.value) {
-            audioContext.value.close().catch(console.error);
-            audioContext.value = null;
-          }
-
-          analyserNode.value = null;
-          currentStreamId.value = null;
-          console.log('Stopped talking');
-        };
-
-        watch(noiseReductionEnabled, (newValue) => {
-          localStorage.setItem('noiseReductionEnabled', newValue.toString());
         });
 
         return {
@@ -898,12 +891,15 @@
           isProcessing,
           configCollapsed,
           toggleConfigPanel,
-          audioSupported,
-          isTalking,
-          startTalking,
-          stopTalking,
-          audioVisualizer,
-          noiseReductionEnabled,
+
+          closeLogsModal,
+          streamLogs,
+
+          logConnectionStatus,
+          clearLogs,
+          maxLogEntries,
+          logsCollapsed,
+          toggleLogsPanel,
         };
       },
     }).mount('#app');

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
 	"crypto/sha1"
@@ -187,21 +188,35 @@ type StreamInfo struct {
 	Status       string    `json:"status"`
 }
 
+type ClientConnection struct {
+	Channel   chan LogEntry
+	LastActive time.Time
+}
+
 type StreamManager struct {
-	streams map[string]*StreamProcess
-	mutex   sync.RWMutex
+	streams       map[string]*StreamProcess
+	mutex         sync.RWMutex
+	sseClients    map[string]*ClientConnection
+	clientTimeout time.Duration // Timeout for inactive clients
+	stopCleanup   chan struct{} // Channel to signal cleanup goroutine to stop
 }
 
 type StreamProcess struct {
-	Info    StreamInfo
-	Command *exec.Cmd
-	Done    chan bool
-	closed  sync.Once
+	Info       StreamInfo
+	Command    *exec.Cmd
+	Done       chan bool
+	Logs       []string
+	LogsMutex  sync.RWMutex
+	LogMaxSize int       // Maximum number of log entries to keep in memory
+	closed     sync.Once
 }
 
 var (
 	streamManager = &StreamManager{
-		streams: make(map[string]*StreamProcess),
+		streams:       make(map[string]*StreamProcess),
+		sseClients:    make(map[string]*ClientConnection),
+		clientTimeout: 3 * time.Minute, // Clean up clients after 3 minutes of inactivity
+		stopCleanup:   make(chan struct{}),
 	}
 )
 
@@ -242,6 +257,16 @@ func (sm *StreamManager) StartStream(profileToken, rtspURL string) (*StreamInfo,
 		Setpgid: true,
 	}
 
+	// Capture stdout and stderr for logging
+	stdoutPipe, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stdout pipe: %v", err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create stderr pipe: %v", err)
+	}
+
 	streamProcess := &StreamProcess{
 		Info: StreamInfo{
 			ID:           streamID,
@@ -251,9 +276,11 @@ func (sm *StreamManager) StartStream(profileToken, rtspURL string) (*StreamInfo,
 			StartedAt:    time.Now(),
 			Status:       "running",
 		},
-		Command: cmd,
-		Done:    make(chan bool),
-		closed:  sync.Once{},
+		Command:    cmd,
+		Done:       make(chan bool),
+		Logs:       []string{},
+		LogMaxSize: 500, // Maximum 500 log entries per stream
+		closed:     sync.Once{},
 	}
 
 	// For debugging - log the complete FFmpeg command
@@ -266,6 +293,36 @@ func (sm *StreamManager) StartStream(profileToken, rtspURL string) (*StreamInfo,
 
 	// Monitor process
 	go func() {
+		// Read and log stdout
+		go func() {
+			scanner := bufio.NewScanner(stdoutPipe)
+			for scanner.Scan() {
+				line := scanner.Text()
+				log.Println("FFmpeg stdout:", line)
+				streamProcess.AddLog("stdout: " + line)
+				sm.broadcastLog(LogEntry{
+					StreamID: streamID,
+					Message:  "stdout: " + line,
+					Time:     time.Now().Format(time.RFC3339),
+				})
+			}
+		}()
+
+		// Read and log stderr
+		go func() {
+			scanner := bufio.NewScanner(stderrPipe)
+			for scanner.Scan() {
+				line := scanner.Text()
+				log.Println("FFmpeg stderr:", line)
+				streamProcess.AddLog("stderr: " + line)
+				sm.broadcastLog(LogEntry{
+					StreamID: streamID,
+					Message:  "stderr: " + line,
+					Time:     time.Now().Format(time.RFC3339),
+				})
+			}
+		}()
+
 		cmd.Wait()
 		sm.mutex.Lock()
 		delete(sm.streams, streamID)
@@ -343,6 +400,19 @@ func (sm *StreamManager) ListStreams() []StreamInfo {
 	return streams
 }
 
+func (sm *StreamManager) broadcastLog(entry LogEntry) {
+	sm.mutex.RLock()
+	defer sm.mutex.RUnlock()
+	for _, clientConn := range sm.sseClients {
+		select {
+		case clientConn.Channel <- entry:
+			// Log sent to client
+		default:
+			// Channel full, skip this client
+		}
+	}
+}
+
 func handleStartStream(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ProfileToken string `json:"profileToken"`
@@ -375,6 +445,126 @@ func handleStopStream(w http.ResponseWriter, r *http.Request) {
 func handleListStreams(w http.ResponseWriter, r *http.Request) {
 	streams := streamManager.ListStreams()
 	json.NewEncoder(w).Encode(streams)
+}
+
+// LogEntry represents a single log entry
+type LogEntry struct {
+	StreamID string `json:"streamId"`
+	Message  string `json:"message"`
+	Time     string `json:"time"`
+}
+
+// LogEventHandler handles SSE connections for streaming logs
+func handleLogEvents(w http.ResponseWriter, r *http.Request) {
+	// Set headers for SSE
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	
+	// Create a client channel
+	clientChan := make(chan LogEntry, 10)
+	clientID := fmt.Sprintf("client-%d", time.Now().UnixNano())
+	
+	// Create mutex for clients map if not exists
+	streamManager.mutex.Lock()
+	
+	// Add this client to the active SSE clients
+	streamManager.sseClients[clientID] = &ClientConnection{
+		Channel:    clientChan,
+		LastActive: time.Now(),
+	}
+	streamManager.mutex.Unlock()
+	
+	// Remove client when connection closes
+	defer func() {
+		streamManager.mutex.Lock()
+		delete(streamManager.sseClients, clientID)
+		streamManager.mutex.Unlock()
+		close(clientChan)
+	}()
+	
+	// Flush the response writer to send the headers
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	} else {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+	
+	// Send initial logs - but limit to prevent memory overload
+	streamManager.mutex.RLock()
+	for streamID, stream := range streamManager.streams {
+		stream.LogsMutex.RLock()
+		// Only send the most recent logs to prevent overwhelming the client
+		startIdx := 0
+		if len(stream.Logs) > 100 {
+			startIdx = len(stream.Logs) - 100
+		}
+		for _, logMsg := range stream.Logs[startIdx:] {
+			entry := LogEntry{
+				StreamID: streamID,
+				Message:  logMsg,
+				Time:     time.Now().Format(time.RFC3339),
+			}
+			data, _ := json.Marshal(entry)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+		stream.LogsMutex.RUnlock()
+	}
+	streamManager.mutex.RUnlock()
+	
+	// Create a heartbeat ticker to keep connection alive and update last active time
+	heartbeat := time.NewTicker(30 * time.Second)
+	defer heartbeat.Stop()
+	
+	// Keep connection open and stream logs
+	for {
+		select {
+		case entry := <-clientChan:
+			// Update last active time for this client
+			streamManager.mutex.Lock()
+			if client, exists := streamManager.sseClients[clientID]; exists {
+				client.LastActive = time.Now()
+			}
+			streamManager.mutex.Unlock()
+			
+			// Marshal the log entry
+			data, err := json.Marshal(entry)
+			if err != nil {
+				continue
+			}
+			
+			// Write the SSE data
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			
+			// Flush to send the data immediately
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			
+		case <-heartbeat.C:
+			// Send heartbeat and update last active time
+			streamManager.mutex.Lock()
+			if client, exists := streamManager.sseClients[clientID]; exists {
+				client.LastActive = time.Now()
+			}
+			streamManager.mutex.Unlock()
+			
+			// Send a comment as heartbeat
+			fmt.Fprintf(w, ": heartbeat %s\n\n", time.Now().Format(time.RFC3339))
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			
+		case <-r.Context().Done():
+			// Client disconnected
+			return
+		}
+	}
 }
 
 func extractProfileToken(soapResponse string) (string, error) {
@@ -412,7 +602,7 @@ func handleGetStreamUri(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// First get profiles if no token provided
-	if req.ProfileToken == "" {
+	if (req.ProfileToken == "") {
 		profilesEnvelope := GetProfiles.envelope(req.CameraRequest)
 		url := fmt.Sprintf("http://%s:%s/%s", req.CameraIp, req.CameraPort, GetProfiles.uri())
 
@@ -543,10 +733,16 @@ func main() {
 		}
 		streamManager.mutex.Unlock()
 
+			// Stop cleanup routine
+		close(streamManager.stopCleanup)
+
 		// Remove HLS directory
 		os.RemoveAll(hlsBaseDir)
 		os.Exit(0)
 	}()
+
+	// Start client cleanup routine
+	go cleanupInactiveClients()
 
 	// Serve the embedded static files
 	staticFS, err := fs.Sub(staticFiles, "static")
@@ -565,6 +761,7 @@ func main() {
 	http.HandleFunc("/api/stream/stop", handleStopStream)
 	http.HandleFunc("/api/stream/list", handleListStreams)
 	http.HandleFunc("/api/stream/uri", handleGetStreamUri)
+	http.HandleFunc("/api/stream/logevents", handleLogEvents)
 
 	log.Println("Server started on :7878")
 	log.Fatal(http.ListenAndServe(":7878", nil))
@@ -614,4 +811,52 @@ func generateSecurityHeader(cam CameraRequest) string {
 			</wsse:UsernameToken>
 		</wsse:Security>
 	</SOAP-ENV:Header>`, cam.Username, passwordDigest, nonce, created)
+}
+
+func (sp *StreamProcess) AddLog(message string) {
+	sp.LogsMutex.Lock()
+	defer sp.LogsMutex.Unlock()
+
+	// Add the log
+	sp.Logs = append(sp.Logs, message)
+
+	// Check if we need to trim the logs to prevent memory leaks
+	if len(sp.Logs) > sp.LogMaxSize {
+		// Keep only the most recent logs (last sp.LogMaxSize entries)
+		sp.Logs = sp.Logs[len(sp.Logs)-sp.LogMaxSize:]
+	}
+}
+
+func cleanupInactiveClients() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now()
+			streamManager.mutex.Lock()
+			
+			// Log current client count for monitoring
+			clientCount := len(streamManager.sseClients)
+			if clientCount > 0 {
+				log.Printf("Cleaning up inactive clients. Current count: %d", clientCount)
+			}
+			
+			// Check each client's last activity time
+			for clientID, clientConn := range streamManager.sseClients {
+				if now.Sub(clientConn.LastActive) > streamManager.clientTimeout {
+					log.Printf("Cleaning up inactive client: %s (inactive for %v)", 
+						clientID, now.Sub(clientConn.LastActive))
+					close(clientConn.Channel)
+					delete(streamManager.sseClients, clientID)
+				}
+			}
+			
+			streamManager.mutex.Unlock()
+			
+		case <-streamManager.stopCleanup:
+			return
+		}
+	}
 }
