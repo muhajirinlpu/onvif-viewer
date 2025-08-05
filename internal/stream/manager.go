@@ -14,8 +14,8 @@ import (
 	"syscall"
 	"time"
 
-	"dengan.dev/onvif/internal/logger"
-	"dengan.dev/onvif/internal/models"
+	"dengan.dev/camera-streamer/internal/logger"
+	"dengan.dev/camera-streamer/internal/models"
 )
 
 const (

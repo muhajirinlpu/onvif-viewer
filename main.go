@@ -9,10 +9,10 @@ import (
 	"os/signal"
 	"syscall"
 
-	"dengan.dev/onvif/internal/handlers"
-	"dengan.dev/onvif/internal/logger"
-	"dengan.dev/onvif/internal/onvif"
-	"dengan.dev/onvif/internal/stream"
+	"dengan.dev/camera-streamer/internal/handlers"
+	"dengan.dev/camera-streamer/internal/logger"
+	"dengan.dev/camera-streamer/internal/onvif"
+	"dengan.dev/camera-streamer/internal/stream"
 )
 
 //go:embed static

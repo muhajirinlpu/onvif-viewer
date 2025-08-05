@@ -24,7 +24,7 @@ A web application for streaming ONVIF-compatible IP cameras using HLS (HTTP Live
 
 ```bash
 git clone https://github.com/muhajirinlpu/onvif-viewer
-cd onvif
+cd camera-streamer
 ```
 
 2. Install FFmpeg:
@@ -45,7 +45,7 @@ brew install ffmpeg
 
 ```bash
 go build
-./onvif
+./camera-streamer
 ```
 
 The server will start on port 7878.

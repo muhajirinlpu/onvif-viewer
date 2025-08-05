@@ -7,10 +7,10 @@ import (
 	"net/http"
 	"time"
 
-	"dengan.dev/onvif/internal/logger"
-	"dengan.dev/onvif/internal/models"
-	"dengan.dev/onvif/internal/onvif"
-	"dengan.dev/onvif/internal/stream"
+	"dengan.dev/camera-streamer/internal/logger"
+	"dengan.dev/camera-streamer/internal/models"
+	"dengan.dev/camera-streamer/internal/onvif"
+	"dengan.dev/camera-streamer/internal/stream"
 )
 
 // Handler contains all the HTTP handlers and their dependencies

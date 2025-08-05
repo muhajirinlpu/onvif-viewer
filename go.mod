@@ -1,4 +1,4 @@
-module dengan.dev/onvif
+module dengan.dev/camera-streamer
 
 go 1.23.6
 

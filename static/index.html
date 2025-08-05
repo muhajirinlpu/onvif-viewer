@@ -414,7 +414,7 @@
 </head>
 
 <body>
-  <div id="app" :data-theme="isDarkMode ? 'dark' : 'light'" class="min-h-screen p-2 md:p-4">
+  <div id="app" class="min-h-screen p-2 md:p-4">
     <!-- Header -->
     <header class="w-full max-w-7xl mx-auto mb-6">
       <div class="card rounded-xl p-6">
@@ -817,6 +817,7 @@
           } else {
             isDarkMode.value = themeMode.value === 'dark';
           }
+          document.documentElement.setAttribute('data-theme', isDarkMode.value ? 'dark' : 'light');
         };
 
         const initializeTheme = () => {

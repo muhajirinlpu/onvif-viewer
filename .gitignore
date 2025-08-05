@@ -1,6 +1,6 @@
 tmp
 static/hls
-onvif
+camera-streamer
 
 # SQLite databases
 *.db
