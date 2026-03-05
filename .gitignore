@@ -1,6 +1,8 @@
 tmp
 static/hls
 camera-streamer
+debug_outputs/
+onvif-debug
 
 # SQLite databases
 *.db
