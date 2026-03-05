@@ -13,420 +13,35 @@
     }
   </script>
   <script src="https://cdn.jsdelivr.net/npm/xml-formatter@3/dist/browser/xml-formatter-singleton.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {}
+      }
+    }
+  </script>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
   <!-- Add Fontawesome for better icons -->
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-  <style>
-    /* CSS Variables for theming */
-    :root {
-      --primary-bg: #f8fafc;
-      --secondary-bg: #ffffff;
-      --tertiary-bg: #f1f5f9;
-      --primary-text: #1e293b;
-      --secondary-text: #64748b;
-      --accent-color: #3b82f6;
-      --accent-hover: #2563eb;
-      --border-color: #e2e8f0;
-      --success-color: #10b981;
-      --warning-color: #f59e0b;
-      --error-color: #ef4444;
-      --shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
-      --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
-    }
-
-    [data-theme="dark"] {
-      --primary-bg: #0f172a;
-      --secondary-bg: #1e293b;
-      --tertiary-bg: #334155;
-      --primary-text: #f1f5f9;
-      --secondary-text: #94a3b8;
-      --border-color: #475569;
-      --shadow: 0 1px 3px 0 rgb(0 0 0 / 0.3), 0 1px 2px -1px rgb(0 0 0 / 0.3);
-      --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.3), 0 4px 6px -4px rgb(0 0 0 / 0.3);
-    }
-
-    * {
-      transition: background-color 0.2s ease, color 0.2s ease, border-color 0.2s ease;
-    }
-
-    body {
-      background-color: var(--primary-bg);
-      color: var(--primary-text);
-    }
-
-    .card {
-      background-color: var(--secondary-bg);
-      border: 1px solid var(--border-color);
-      box-shadow: var(--shadow);
-    }
-
-    .card-header {
-      background-color: var(--tertiary-bg);
-      border-bottom: 1px solid var(--border-color);
-    }
-
-    .input-field {
-      background-color: var(--secondary-bg);
-      border: 1px solid var(--border-color);
-      color: var(--primary-text);
-    }
-
-    .input-field:focus {
-      border-color: var(--accent-color);
-      box-shadow: 0 0 0 3px rgb(59 130 246 / 0.1);
-    }
-
-    .btn-primary {
-      background-color: var(--accent-color);
-      color: white;
-    }
-
-    .btn-primary:hover {
-      background-color: var(--accent-hover);
-    }
-
-    .btn-secondary {
-      background-color: var(--tertiary-bg);
-      color: var(--primary-text);
-      border: 1px solid var(--border-color);
-    }
-
-    .btn-secondary:hover {
-      background-color: var(--border-color);
-    }
-
-    .theme-selector {
-      position: relative;
-      display: flex;
-      align-items: center;
-      background-color: var(--tertiary-bg);
-      border-radius: 20px;
-      padding: 4px;
-      border: 1px solid var(--border-color);
-    }
-
-    .theme-option {
-      position: relative;
-      padding: 6px 12px;
-      border-radius: 16px;
-      cursor: pointer;
-      transition: all 0.3s ease;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 12px;
-      font-weight: 500;
-      color: var(--secondary-text);
-      min-width: 60px;
-      justify-content: center;
-    }
-
-    .theme-option.active {
-      background-color: var(--accent-color);
-      color: white;
-      box-shadow: var(--shadow);
-    }
-
-    .theme-option:hover:not(.active) {
-      color: var(--primary-text);
-    }
-
-    .theme-option i {
-      font-size: 14px;
-    }
-
-    .video-container {
-      position: relative;
-      background-color: #000;
-      border-radius: 12px;
-      overflow: hidden;
-      box-shadow: var(--shadow-lg);
-    }
-
-    .video-container.small {
-      aspect-ratio: 16/9;
-      max-height: 400px;
-    }
-
-    .video-container.medium {
-      aspect-ratio: 16/9;
-      max-height: 600px;
-    }
-
-    .video-container.large {
-      aspect-ratio: 16/9;
-      max-height: 800px;
-    }
-
-    .video-container.fullscreen {
-      position: fixed;
-      top: 0;
-      left: 0;
-      width: 100vw;
-      height: 100vh;
-      z-index: 9999;
-      border-radius: 0;
-      aspect-ratio: unset;
-      max-height: none;
-    }
-
-    .video-container video {
-      width: 100%;
-      height: 100%;
-      object-fit: contain;
-    }
-
-    .video-controls {
-      position: absolute;
-      bottom: 12px;
-      right: 12px;
-      display: flex;
-      gap: 8px;
-      opacity: 0;
-      transition: opacity 0.3s ease;
-    }
-
-    .video-container:hover .video-controls {
-      opacity: 1;
-    }
-
-    .video-control-btn {
-      background-color: rgba(0, 0, 0, 0.7);
-      color: white;
-      border: none;
-      border-radius: 6px;
-      padding: 8px;
-      cursor: pointer;
-      transition: all 0.2s ease;
-    }
-
-    .video-control-btn:hover {
-      background-color: rgba(0, 0, 0, 0.9);
-      transform: scale(1.1);
-    }
-
-    .video-size-selector {
-      display: flex;
-      gap: 4px;
-      background-color: var(--tertiary-bg);
-      border-radius: 8px;
-      padding: 4px;
-      border: 1px solid var(--border-color);
-    }
-
-    .video-size-option {
-      padding: 4px 8px;
-      border-radius: 4px;
-      cursor: pointer;
-      font-size: 12px;
-      color: var(--secondary-text);
-      transition: all 0.2s ease;
-    }
-
-    .video-size-option.active {
-      background-color: var(--accent-color);
-      color: white;
-    }
-
-    .video-size-option:hover:not(.active) {
-      color: var(--primary-text);
-      background-color: var(--border-color);
-    }
-
-    .loader {
-      border: 3px solid var(--border-color);
-      border-top: 3px solid var(--accent-color);
-      border-radius: 50%;
-      width: 20px;
-      height: 20px;
-      animation: spin 1s linear infinite;
-      display: inline-block;
-      margin-right: 10px;
-    }
-
-    @keyframes spin {
-      0% {
-        transform: rotate(0deg);
-      }
-
-      100% {
-        transform: rotate(360deg);
-      }
-    }
-
-    .fade-enter-active,
-    .fade-leave-active {
-      transition: opacity 0.3s;
-    }
-
-    .fade-enter-from,
-    .fade-leave-to {
-      opacity: 0;
-    }
-
-    /* Custom scrollbar */
-    ::-webkit-scrollbar {
-      width: 8px;
-      height: 8px;
-    }
-
-    ::-webkit-scrollbar-track {
-      background: var(--tertiary-bg);
-      border-radius: 4px;
-    }
-
-    ::-webkit-scrollbar-thumb {
-      background: var(--border-color);
-      border-radius: 4px;
-    }
-
-    ::-webkit-scrollbar-thumb:hover {
-      background: var(--secondary-text);
-    }
-
-    .config-panel {
-      transition: all 0.3s ease;
-      overflow: hidden;
-    }
-
-    .config-panel.collapsed {
-      max-height: 0;
-      padding: 0;
-      margin: 0;
-      opacity: 0;
-    }
-
-    .config-panel.expanded {
-      max-height: 1000px;
-      opacity: 1;
-    }
-
-    .rotate-icon {
-      transition: transform 0.3s ease;
-    }
-
-    .rotate-icon.down {
-      transform: rotate(180deg);
-    }
-
-    .logs-panel {
-      transition: all 0.3s ease;
-      overflow: hidden;
-    }
-
-    .logs-panel.collapsed {
-      max-height: 0;
-      padding: 0;
-      margin: 0;
-      opacity: 0;
-    }
-
-    .logs-panel.expanded {
-      max-height: 1000px;
-      opacity: 1;
-    }
-
-    .glass-effect {
-      backdrop-filter: blur(10px);
-      background: rgba(255, 255, 255, 0.1);
-      border: 1px solid rgba(255, 255, 255, 0.2);
-    }
-
-    [data-theme="dark"] .glass-effect {
-      background: rgba(0, 0, 0, 0.2);
-      border: 1px solid rgba(255, 255, 255, 0.1);
-    }
-
-    .status-indicator {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 12px;
-      border-radius: 20px;
-      font-size: 12px;
-      font-weight: 500;
-    }
-
-    .status-connected {
-      background-color: rgba(16, 185, 129, 0.2);
-      color: var(--success-color);
-    }
-
-    .status-connecting {
-      background-color: rgba(245, 158, 11, 0.2);
-      color: var(--warning-color);
-    }
-
-    .status-disconnected {
-      background-color: rgba(239, 68, 68, 0.2);
-      color: var(--error-color);
-    }
-
-    .pulse {
-      animation: pulse 2s infinite;
-    }
-
-    @keyframes pulse {
-
-      0%,
-      100% {
-        opacity: 1;
-      }
-
-      50% {
-        opacity: 0.5;
-      }
-    }
-
-    .gradient-bg {
-      background: linear-gradient(135deg, var(--accent-color), #8b5cf6);
-    }
-
-    .icon-box {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      width: 40px;
-      height: 40px;
-      border-radius: 8px;
-      background-color: var(--tertiary-bg);
-    }
-
-    .floating-action {
-      position: fixed;
-      bottom: 24px;
-      right: 24px;
-      z-index: 1000;
-    }
-
-    @media (max-width: 768px) {
-      .md-grid-full {
-        grid-column: 1 / -1;
-      }
-
-      .floating-action {
-        bottom: 16px;
-        right: 16px;
-      }
-    }
-  </style>
 </head>
 
-<body>
+<body class="bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-200 transition-colors duration-200">
   <div id="app" class="min-h-screen p-2 md:p-4">
     <!-- Header -->
     <header class="w-full max-w-7xl mx-auto mb-6">
-      <div class="card rounded-xl p-6">
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-sm rounded-xl p-6">
         <div class="flex flex-col md:flex-row items-center justify-between">
           <div class="mb-4 md:mb-0">
             <div class="flex items-center mb-2">
-              <div class="icon-box mr-3 gradient-bg">
+              <div
+                class="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-slate-100 dark:bg-slate-700 mr-3 bg-gradient-to-br from-blue-500 to-purple-600 shadow-md text-white">
                 <i class="fas fa-video text-white"></i>
               </div>
               <div>
                 <h1 class="text-2xl font-bold text-primary">ONVIF Camera Viewer</h1>
-                <p class="text-sm" style="color: var(--secondary-text)">Stream and manage IP cameras via ONVIF protocol
+                <p class="text-sm text-slate-500 dark:text-slate-400">Stream and manage IP cameras via ONVIF protocol
                 </p>
               </div>
             </div>
@@ -435,17 +50,27 @@
           <div class="flex items-center space-x-4">
             <!-- Theme Selector -->
             <div class="flex items-center space-x-3">
-              <span class="text-sm" style="color: var(--secondary-text)">Theme</span>
-              <div class="theme-selector">
-                <div class="theme-option" :class="{ active: themeMode === 'light' }" @click="setTheme('light')">
+              <span class="text-sm text-slate-500 dark:text-slate-400">Theme</span>
+              <div
+                class="flex items-center bg-slate-100 dark:bg-slate-800 rounded-full p-1 border border-slate-200 dark:border-slate-700">
+                <div
+                  class="px-3 py-1.5 rounded-full cursor-pointer transition-all flex items-center gap-1.5 text-xs font-medium text-slate-500 dark:text-slate-400 min-w-[60px] justify-center hover:text-slate-900 dark:hover:text-slate-100"
+                  :class="{ 'bg-blue-500 text-white shadow-sm hover:text-white dark:hover:text-white': themeMode === 'light' }"
+                  @click="setTheme('light')">
                   <i class="fas fa-sun"></i>
                   <span class="hidden sm:inline">Light</span>
                 </div>
-                <div class="theme-option" :class="{ active: themeMode === 'auto' }" @click="setTheme('auto')">
+                <div
+                  class="px-3 py-1.5 rounded-full cursor-pointer transition-all flex items-center gap-1.5 text-xs font-medium text-slate-500 dark:text-slate-400 min-w-[60px] justify-center hover:text-slate-900 dark:hover:text-slate-100"
+                  :class="{ 'bg-blue-500 text-white shadow-sm hover:text-white dark:hover:text-white': themeMode === 'auto' }"
+                  @click="setTheme('auto')">
                   <i class="fas fa-magic"></i>
                   <span class="hidden sm:inline">Auto</span>
                 </div>
-                <div class="theme-option" :class="{ active: themeMode === 'dark' }" @click="setTheme('dark')">
+                <div
+                  class="px-3 py-1.5 rounded-full cursor-pointer transition-all flex items-center gap-1.5 text-xs font-medium text-slate-500 dark:text-slate-400 min-w-[60px] justify-center hover:text-slate-900 dark:hover:text-slate-100"
+                  :class="{ 'bg-blue-500 text-white shadow-sm hover:text-white dark:hover:text-white': themeMode === 'dark' }"
+                  @click="setTheme('dark')">
                   <i class="fas fa-moon"></i>
                   <span class="hidden sm:inline">Dark</span>
                 </div>
@@ -453,24 +78,26 @@
             </div>
 
             <!-- Settings Button -->
-            <button @click="toggleConfigPanel" class="btn-secondary px-4 py-2 rounded-lg flex items-center gap-2">
+            <button @click="toggleConfigPanel"
+              class="bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-600 hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors px-4 py-2 rounded-lg flex items-center gap-2">
               <i class="fas fa-cog"></i>
               <span class="hidden sm:inline">{{ configCollapsed ? 'Settings' : 'Close' }}</span>
             </button>
 
             <!-- Stream Counter -->
             <div class="flex items-center space-x-2">
-              <div class="icon-box">
-                <i class="fas fa-broadcast-tower" style="color: var(--accent-color)"></i>
+              <div class="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-slate-100 dark:bg-slate-700">
+                <i class="fas fa-broadcast-tower text-blue-500"></i>
               </div>
               <div>
                 <div class="text-sm font-medium">{{ streams.length }}</div>
-                <div class="text-xs" style="color: var(--secondary-text)">Active Streams</div>
+                <div class="text-xs text-slate-500 dark:text-slate-400">Active Streams</div>
               </div>
             </div>
 
             <!-- Refresh Button -->
-            <button @click="loadStreams" class="btn-primary px-4 py-2 rounded-lg flex items-center gap-2 shadow-lg">
+            <button @click="loadStreams"
+              class="bg-blue-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 shadow-sm transition-colors px-4 py-2 rounded-lg flex items-center gap-2 shadow-lg">
               <i class="fas fa-sync-alt" :class="{ 'animate-spin': isRefreshing }"></i>
               <span>Refresh</span>
             </button>
@@ -479,21 +106,23 @@
       </div>
     </header>
 
-    <div class="w-full max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-4 gap-6">
-      <!-- Left Sidebar: Camera Configuration -->
+    <div class="w-full max-w-7xl mx-auto space-y-6">
+      <!-- Modal: Camera Configuration -->
       <div v-if="!configCollapsed"
-        class="lg:col-span-1 fixed lg:relative top-0 left-0 w-full lg:w-auto h-full lg:h-auto bg-black/50 lg:bg-transparent z-50 lg:z-auto lg:block"
+        class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 backdrop-blur-sm transition-opacity"
         @click.self="toggleConfigPanel">
-        <div class="w-80 lg:w-full h-full lg:h-auto ml-auto lg:ml-0 overflow-y-auto lg:overflow-visible">
-          <div class="card rounded-xl lg:rounded-xl overflow-hidden m-4 lg:m-0 h-fit">
+        <div class="w-full max-w-md max-h-[90vh] overflow-y-auto rounded-xl shadow-2xl">
+          <div
+            class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 w-full rounded-xl overflow-hidden h-fit">
             <!-- Config Header -->
-            <div class="card-header p-4">
+            <div class="bg-slate-100/50 dark:bg-slate-700/50 border-b border-slate-200 dark:border-slate-700 p-4">
               <div class="flex items-center justify-between">
                 <h2 class="text-lg font-semibold flex items-center">
-                  <i class="fas fa-cog mr-2" style="color: var(--accent-color)"></i>
+                  <i class="fas fa-cog mr-2 text-blue-500"></i>
                   Camera Setup
                 </h2>
-                <button @click="toggleConfigPanel" class="btn-secondary p-2 rounded-lg">
+                <button @click="toggleConfigPanel"
+                  class="bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-600 hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors p-2 rounded-lg">
                   <i class="fas fa-times"></i>
                 </button>
               </div>
@@ -503,23 +132,23 @@
             <div class="p-6 space-y-6">
               <!-- Connection Settings -->
               <div>
-                <h3 class="text-sm font-medium mb-4" style="color: var(--secondary-text)">CONNECTION</h3>
+                <h3 class="text-sm font-medium mb-4 text-slate-500 dark:text-slate-400">CONNECTION</h3>
                 <div class="space-y-4">
                   <div>
                     <label class="text-sm font-medium block mb-2">Camera IP Address</label>
                     <div class="relative">
-                      <i class="fas fa-network-wired absolute left-3 top-3" style="color: var(--secondary-text)"></i>
+                      <i class="fas fa-network-wired absolute left-3 top-3 text-slate-500 dark:text-slate-400"></i>
                       <input v-model="cameraIp" placeholder="192.168.0.125"
-                        class="input-field w-full pl-10 pr-4 py-3 rounded-lg outline-none" />
+                        class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all outline-none w-full pl-10 pr-4 py-3 rounded-lg" />
                     </div>
                   </div>
 
                   <div>
                     <label class="text-sm font-medium block mb-2">Port</label>
                     <div class="relative">
-                      <i class="fas fa-plug absolute left-3 top-3" style="color: var(--secondary-text)"></i>
+                      <i class="fas fa-plug absolute left-3 top-3 text-slate-500 dark:text-slate-400"></i>
                       <input v-model="cameraPort" placeholder="8000"
-                        class="input-field w-full pl-10 pr-4 py-3 rounded-lg outline-none" />
+                        class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all outline-none w-full pl-10 pr-4 py-3 rounded-lg" />
                     </div>
                   </div>
                 </div>
@@ -527,14 +156,14 @@
 
               <!-- Authentication -->
               <div>
-                <h3 class="text-sm font-medium mb-4" style="color: var(--secondary-text)">AUTHENTICATION</h3>
+                <h3 class="text-sm font-medium mb-4 text-slate-500 dark:text-slate-400">AUTHENTICATION</h3>
                 <div class="space-y-4">
                   <div>
                     <label class="text-sm font-medium block mb-2">Username</label>
                     <div class="relative">
-                      <i class="fas fa-user absolute left-3 top-3" style="color: var(--secondary-text)"></i>
+                      <i class="fas fa-user absolute left-3 top-3 text-slate-500 dark:text-slate-400"></i>
                       <input v-model="username" placeholder="admin"
-                        class="input-field w-full pl-10 pr-4 py-3 rounded-lg outline-none" />
+                        class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all outline-none w-full pl-10 pr-4 py-3 rounded-lg" />
                     </div>
                   </div>
 
@@ -542,11 +171,12 @@
                     <label class="text-sm font-medium block mb-2">Password</label>
                     <div class="flex space-x-2">
                       <div class="relative flex-1">
-                        <i class="fas fa-lock absolute left-3 top-3" style="color: var(--secondary-text)"></i>
+                        <i class="fas fa-lock absolute left-3 top-3 text-slate-500 dark:text-slate-400"></i>
                         <input v-model="password" :type="showPassword ? 'text' : 'password'" placeholder="••••••••"
-                          class="input-field w-full pl-10 pr-4 py-3 rounded-lg outline-none" />
+                          class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all outline-none w-full pl-10 pr-4 py-3 rounded-lg" />
                       </div>
-                      <button @click="showPassword = !showPassword" class="btn-secondary p-3 rounded-lg">
+                      <button @click="showPassword = !showPassword"
+                        class="bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-600 hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors p-3 rounded-lg">
                         <i :class="showPassword ? 'fas fa-eye-slash' : 'fas fa-eye'"></i>
                       </button>
                     </div>
@@ -555,16 +185,17 @@
               </div>
 
               <!-- Actions -->
-              <div class="pt-4 border-t" style="border-color: var(--border-color)">
+              <div class="pt-4 border-t border-t border-slate-200 dark:border-slate-700">
                 <button @click="fetchStreamUri" :disabled="isProcessing"
-                  class="btn-primary w-full py-3 rounded-lg font-medium flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed">
-                  <span v-if="isProcessing" class="loader"></span>
+                  class="bg-blue-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 shadow-sm transition-colors w-full py-3 rounded-lg font-medium flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed">
+                  <span v-if="isProcessing"
+                    class="animate-spin inline-block w-5 h-5 border-2 border-slate-200 border-t-blue-500 rounded-full mr-2"></span>
                   <i v-else class="fas fa-play mr-2"></i>
                   <span>{{ isProcessing ? 'Connecting...' : 'Start Stream' }}</span>
                 </button>
 
                 <button @click="showAdvanced = !showAdvanced"
-                  class="btn-secondary w-full mt-3 py-3 rounded-lg font-medium flex items-center justify-center">
+                  class="bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-600 hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors w-full mt-3 py-3 rounded-lg font-medium flex items-center justify-center">
                   <i class="fas fa-cogs mr-2"></i>
                   <span>Advanced Options</span>
                   <i :class="['fas fa-chevron-down ml-2 transition-transform', { 'rotate-180': showAdvanced }]"></i>
@@ -572,10 +203,11 @@
               </div>
 
               <!-- Advanced Options -->
-              <div v-if="showAdvanced" class="pt-4 border-t space-y-4" style="border-color: var(--border-color)">
+              <div v-if="showAdvanced" class="pt-4 border-t space-y-4 border-t border-slate-200 dark:border-slate-700">
                 <div>
                   <label class="text-sm font-medium block mb-2">ONVIF Function</label>
-                  <select v-model="func" class="input-field w-full px-4 py-3 rounded-lg outline-none">
+                  <select v-model="func"
+                    class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all outline-none w-full px-4 py-3 rounded-lg">
                     <option value="">Select Function</option>
                     <option value="GetCapabilities">GetCapabilities</option>
                     <option value="GetDeviceInformation">GetDeviceInformation</option>
@@ -585,15 +217,14 @@
                 </div>
 
                 <button @click="fetchDebug" :disabled="!func || isProcessing"
-                  class="btn-primary w-full py-3 rounded-lg font-medium disabled:opacity-50 disabled:cursor-not-allowed">
+                  class="bg-blue-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 shadow-sm transition-colors w-full py-3 rounded-lg font-medium disabled:opacity-50 disabled:cursor-not-allowed">
                   <i class="fas fa-terminal mr-2"></i>
                   Execute Function
                 </button>
               </div>
 
               <!-- Error Display -->
-              <div v-if="error" class="p-4 rounded-lg"
-                style="background-color: rgba(239, 68, 68, 0.1); color: var(--error-color)">
+              <div v-if="error" class="p-4 rounded-lg bg-red-100 dark:bg-red-500/20 text-red-600 dark:text-red-400">
                 <div class="flex items-start">
                   <i class="fas fa-exclamation-triangle mr-2 mt-0.5"></i>
                   <span class="text-sm">{{ error }}</span>
@@ -605,23 +236,29 @@
       </div>
 
       <!-- Main Content Area -->
-      <div :class="{'lg:col-span-3': !configCollapsed, 'lg:col-span-4': configCollapsed}" class="space-y-6">
+      <div class="space-y-6">
         <!-- Logs Panel -->
-        <div class="card rounded-xl overflow-hidden">
-          <div class="card-header p-4 cursor-pointer" @click="toggleLogsPanel">
+        <div
+          class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-sm rounded-xl overflow-hidden">
+          <div
+            class="bg-slate-100/50 dark:bg-slate-700/50 border-b border-slate-200 dark:border-slate-700 p-4 cursor-pointer"
+            @click="toggleLogsPanel">
             <div class="flex items-center justify-between">
               <div class="flex items-center">
-                <i class="fas fa-terminal mr-2" style="color: var(--warning-color)"></i>
+                <i class="fas fa-terminal mr-2 text-amber-500"></i>
                 <h2 class="text-lg font-semibold">System Logs</h2>
-                <div v-if="logConnectionStatus === 'connected'" class="status-indicator status-connected ml-3">
-                  <div class="w-2 h-2 rounded-full bg-current pulse"></div>
+                <div v-if="logConnectionStatus === 'connected'"
+                  class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-emerald-100/50 dark:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 ml-3">
+                  <div class="w-2 h-2 rounded-full bg-current animate-pulse"></div>
                   LIVE
                 </div>
-                <div v-else-if="logConnectionStatus === 'connecting'" class="status-indicator status-connecting ml-3">
-                  <div class="w-2 h-2 rounded-full bg-current pulse"></div>
+                <div v-else-if="logConnectionStatus === 'connecting'"
+                  class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-amber-100/50 dark:bg-amber-500/20 text-amber-600 dark:text-amber-400 ml-3">
+                  <div class="w-2 h-2 rounded-full bg-current animate-pulse"></div>
                   CONNECTING
                 </div>
-                <div v-else class="status-indicator status-disconnected ml-3">
+                <div v-else
+                  class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-red-100/50 dark:bg-red-500/20 text-red-600 dark:text-red-400 ml-3">
                   <div class="w-2 h-2 rounded-full bg-current"></div>
                   OFFLINE
                 </div>
@@ -630,32 +267,32 @@
             </div>
           </div>
 
-          <div :class="['logs-panel', logsCollapsed ? 'collapsed' : 'expanded']">
+          <div v-show="!logsCollapsed" class="transition-all duration-300">
             <div class="p-6">
               <div v-if="streamLogs.length === 0" class="text-center py-12">
-                <i class="fas fa-info-circle text-4xl mb-4" style="color: var(--secondary-text)"></i>
-                <p style="color: var(--secondary-text)">No logs available yet</p>
+                <i class="fas fa-info-circle text-4xl mb-4 text-slate-500 dark:text-slate-400"></i>
+                <p class="text-slate-500 dark:text-slate-400">No logs available yet</p>
               </div>
 
               <div v-else class="space-y-4">
                 <div ref="logsContainer" class="bg-black rounded-lg h-64 overflow-auto p-4 font-mono text-sm">
-                  <div v-for="(log, index) in streamLogs" :key="index" :class="{
-                      'text-red-400': log.message.includes('stderr:'), 
-                      'text-blue-300': log.message.includes('stdout:'),
-                      'text-gray-300': !log.message.includes('stderr:') && !log.message.includes('stdout:')
-                    }" class="mb-1">
+                  <div v-for="(log, index) in streamLogs" :key="index"
+                    :class="{ 'text-red-400': log.message.includes('stderr:'), 'text-blue-300': log.message.includes('stdout:'), 'text-gray-300': !log.message.includes('stderr:') && !log.message.includes('stdout:') }"
+                    class="mb-1">
                     <span class="text-green-400">[{{ log.streamId }}]</span> {{ log.message }}
                   </div>
                 </div>
 
                 <div class="flex items-center justify-between">
-                  <button @click="clearLogs" class="btn-secondary px-4 py-2 rounded-lg">
+                  <button @click="clearLogs"
+                    class="bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-600 hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors px-4 py-2 rounded-lg">
                     <i class="fas fa-trash-alt mr-2"></i>
                     Clear Logs
                   </button>
                   <div class="flex items-center space-x-2">
-                    <span class="text-sm" style="color: var(--secondary-text)">Max entries:</span>
-                    <select v-model="maxLogEntries" class="input-field px-3 py-1 rounded">
+                    <span class="text-sm text-slate-500 dark:text-slate-400">Max entries:</span>
+                    <select v-model="maxLogEntries"
+                      class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all outline-none px-3 py-1 rounded">
                       <option value="100">100</option>
                       <option value="250">250</option>
                       <option value="500">500</option>
@@ -669,39 +306,48 @@
         </div>
 
         <!-- Active Streams -->
-        <div class="card rounded-xl p-6">
+        <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-sm rounded-xl p-6">
           <div class="flex items-center justify-between mb-6">
             <h2 class="text-xl font-bold flex items-center">
-              <i class="fas fa-camera mr-2" style="color: var(--accent-color)"></i>
+              <i class="fas fa-camera mr-2 text-blue-500"></i>
               Active Streams
             </h2>
-            <span class="text-sm px-3 py-1 rounded-full"
-              style="background-color: var(--tertiary-bg); color: var(--secondary-text)">
+            <span
+              class="text-sm px-3 py-1 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400">
               {{ streams.length }} running
             </span>
           </div>
 
           <div v-if="streams.length" class="space-y-6">
-            <div v-for="stream in streams" :key="stream.id" class="card rounded-lg p-4">
+            <div v-for="stream in streams" :key="stream.id"
+              class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-sm rounded-lg p-4">
               <div class="flex justify-between items-center mb-4">
                 <div>
                   <h3 class="font-semibold">{{ stream.id }}</h3>
-                  <p class="text-sm" style="color: var(--secondary-text)">
+                  <p class="text-sm text-slate-500 dark:text-slate-400">
                     Started: {{ new Date(stream.startedAt).toLocaleString() }}
                   </p>
                 </div>
                 <div class="flex items-center space-x-2">
                   <!-- Video Size Selector -->
-                  <div v-if="stream.showVideo" class="video-size-selector">
-                    <div class="video-size-option" :class="{ active: stream.videoSize === 'small' }"
+                  <div v-if="stream.showVideo"
+                    class="flex gap-1 bg-slate-100 dark:bg-slate-800 rounded-lg p-1 border border-slate-200 dark:border-slate-700">
+                    <div
+                      class="px-2 py-1 rounded cursor-pointer text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 transition-all"
+                      :class="{ 'bg-blue-500 text-white shadow-sm hover:text-white dark:hover:text-white': stream.videoSize === 'small' }"
                       @click="setVideoSize(stream, 'small')">S</div>
-                    <div class="video-size-option" :class="{ active: stream.videoSize === 'medium' }"
+                    <div
+                      class="px-2 py-1 rounded cursor-pointer text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 transition-all"
+                      :class="{ 'bg-blue-500 text-white shadow-sm hover:text-white dark:hover:text-white': stream.videoSize === 'medium' }"
                       @click="setVideoSize(stream, 'medium')">M</div>
-                    <div class="video-size-option" :class="{ active: stream.videoSize === 'large' }"
+                    <div
+                      class="px-2 py-1 rounded cursor-pointer text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 transition-all"
+                      :class="{ 'bg-blue-500 text-white shadow-sm hover:text-white dark:hover:text-white': stream.videoSize === 'large' }"
                       @click="setVideoSize(stream, 'large')">L</div>
                   </div>
 
-                  <button v-if="!stream.stopping" @click="toggleVideo(stream)" class="btn-primary px-4 py-2 rounded-lg">
+                  <button v-if="!stream.stopping" @click="toggleVideo(stream)"
+                    class="bg-blue-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 shadow-sm transition-colors px-4 py-2 rounded-lg">
                     <i :class="stream.showVideo ? 'fas fa-eye-slash' : 'fas fa-eye'" class="mr-2"></i>
                     {{ stream.showVideo ? 'Hide' : 'View' }}
                   </button>
@@ -713,11 +359,14 @@
                 </div>
               </div>
 
-              <div v-if="stream.showVideo" :class="['video-container', stream.videoSize || 'medium']">
+              <div v-if="stream.showVideo"
+                :class="['video-container', stream.videoSize === 'small' ? 'aspect-video max-h-[400px]' : stream.videoSize === 'medium' ? 'aspect-video max-h-[600px]' : stream.videoSize === 'large' ? 'aspect-video max-h-[800px]' : stream.isFullscreen ? 'fixed inset-0 w-screen h-screen z-[9999] aspect-auto max-h-none rounded-none' : 'aspect-video max-h-[600px]']">
                 <video :id="'video-' + stream.id" controls class="w-full h-full"></video>
-                <div class="video-controls">
-                  <button class="video-control-btn" @click="toggleFullscreen(stream)"
-                    :title="stream.isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'">
+                <div
+                  class="absolute bottom-3 right-3 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
+                  <button
+                    class="bg-black/70 text-white border-none rounded-lg p-2 cursor-pointer hover:bg-black/90 hover:scale-110 transition-all"
+                    @click="toggleFullscreen(stream)" :title="stream.isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'">
                     <i :class="stream.isFullscreen ? 'fas fa-compress' : 'fas fa-expand'"></i>
                   </button>
                 </div>
@@ -726,18 +375,19 @@
           </div>
 
           <div v-else class="text-center py-16">
-            <i class="fas fa-camera-slash text-6xl mb-4" style="color: var(--secondary-text)"></i>
+            <i class="fas fa-camera-slash text-6xl mb-4 text-slate-500 dark:text-slate-400"></i>
             <h3 class="text-lg font-medium mb-2">No active streams</h3>
-            <p class="text-sm" style="color: var(--secondary-text)">
+            <p class="text-sm text-slate-500 dark:text-slate-400">
               Configure your camera settings and click "Start Stream" to begin
             </p>
           </div>
         </div>
 
         <!-- ONVIF Response -->
-        <div v-if="response" class="card rounded-xl p-6">
+        <div v-if="response"
+          class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-sm rounded-xl p-6">
           <h2 class="text-xl font-bold mb-6 flex items-center">
-            <i class="fas fa-code mr-2" style="color: var(--accent-color)"></i>
+            <i class="fas fa-code mr-2 text-blue-500"></i>
             ONVIF Response
           </h2>
 
@@ -758,16 +408,17 @@
       </div>
     </div>
 
-    <!-- Floating Action Button (mobile) -->
+    <!-- Floating Action Button -->
     <button v-if="configCollapsed" @click="toggleConfigPanel"
-      class="floating-action btn-primary p-4 rounded-full shadow-lg lg:hidden">
+      class="fixed bottom-6 right-6 z-40 bg-blue-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 shadow-xl transition-transform hover:scale-105 p-4 rounded-full">
       <i class="fas fa-cog text-xl"></i>
     </button>
   </div>
 
   <!-- Footer -->
-  <footer class="w-full max-w-7xl mx-auto mt-12 pt-8 border-t text-center" style="border-color: var(--border-color)">
-    <div style="color: var(--secondary-text)">
+  <footer
+    class="w-full max-w-7xl mx-auto mt-12 pt-8 border-t text-center border-t border-slate-200 dark:border-slate-700">
+    <div class="text-slate-500 dark:text-slate-400">
       <p class="text-sm">&copy; 2025 ONVIF Camera Viewer</p>
       <p class="text-xs mt-1">Professional IP camera streaming solution</p>
     </div>
@@ -817,7 +468,11 @@
           } else {
             isDarkMode.value = themeMode.value === 'dark';
           }
-          document.documentElement.setAttribute('data-theme', isDarkMode.value ? 'dark' : 'light');
+          if (isDarkMode.value) {
+            document.documentElement.classList.add('dark');
+          } else {
+            document.documentElement.classList.remove('dark');
+          }
         };
 
         const initializeTheme = () => {
@@ -857,7 +512,7 @@
             } else if (videoContainer.msRequestFullscreen) {
               videoContainer.msRequestFullscreen();
             }
-            videoContainer.classList.add('fullscreen');
+            // Handled by Vue bindings
             stream.isFullscreen = true;
           } else {
             if (document.exitFullscreen) {
@@ -867,7 +522,7 @@
             } else if (document.msExitFullscreen) {
               document.msExitFullscreen();
             }
-            videoContainer.classList.remove('fullscreen');
+            // Handled by Vue bindings
             stream.isFullscreen = false;
           }
         };
@@ -881,7 +536,7 @@
               stream.isFullscreen = false;
               const videoContainer = document.querySelector(`#video-${stream.id}`)?.parentElement;
               if (videoContainer) {
-                videoContainer.classList.remove('fullscreen');
+                // Handled by Vue bindings
               }
             }
           });
@@ -921,7 +576,8 @@
           if (savedCollapsed !== null) {
             configCollapsed.value = savedCollapsed === 'true';
           } else {
-            configCollapsed.value = window.innerWidth < 1024; // Start collapsed on mobile
+            // Open modal automatically if no camera IP is saved yet
+            configCollapsed.value = savedSettings.cameraIp ? true : false;
           }
 
           // Add fullscreen event listeners
@@ -972,6 +628,10 @@
             }
 
             await startStream(rtspUrl);
+
+            // Close the config modal automatically on success
+            configCollapsed.value = true;
+            localStorage.setItem('configCollapsed', 'true');
 
           } catch (err) {
             error.value = err.message;
