@@ -41,7 +41,9 @@ type Client struct {
 // NewClient creates a new ONVIF client
 func NewClient() *Client {
 	return &Client{
-		httpClient: &http.Client{},
+		httpClient: &http.Client{
+			Timeout: 10 * time.Second,
+		},
 	}
 }
 

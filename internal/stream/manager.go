@@ -21,9 +21,9 @@ import (
 const (
 	streamStopTimeout    = 5 * time.Second
 	maxLogEntries        = 500
-	maxReconnectAttempts = 5
-	reconnectDelay       = 2 * time.Second
-	maxReconnectDelay    = 30 * time.Second
+	maxReconnectAttempts = 30 // Covers ~24.5 minutes of total continuous downtime
+	reconnectDelay       = 5 * time.Second
+	maxReconnectDelay    = 60 * time.Second // Max 1 minute between attempts
 )
 
 // Process represents a single FFmpeg stream process
@@ -84,31 +84,6 @@ func (sm *Manager) StartStream(profileToken, rtspURL string) (*models.StreamInfo
 		return nil, fmt.Errorf("failed to create HLS directory: %v", err)
 	}
 
-	// Prepare FFmpeg command with improved settings for stability
-	args := []string{
-		"-y",                 // Overwrite output files
-		"-fflags", "+genpts", // Generate presentation timestamps
-		"-rtsp_transport", "tcp", // Use TCP for RTSP (more reliable)
-		"-rtsp_flags", "prefer_tcp", // Prefer TCP
-		"-i", rtspURL,
-		"-c:v", "copy", // Copy video codec (no transcoding)
-		"-c:a", "aac", // Audio codec
-		"-avoid_negative_ts", "make_zero", // Handle negative timestamps
-		"-hls_time", "2", // 2 second segments
-		"-hls_list_size", "5", // Keep 5 segments in playlist
-		"-hls_flags", "delete_segments+independent_segments", // Delete old segments
-		"-hls_segment_type", "mpegts", // Use MPEG-TS segments
-		"-f", "hls", // Output format
-		filepath.Join(hlsDir, "stream.m3u8"),
-	}
-
-	cmd := exec.Command("ffmpeg", args...)
-
-	// Set process group for better process management
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
-
 	streamProcess := &Process{
 		Info: models.StreamInfo{
 			ID:           streamID,
@@ -118,28 +93,17 @@ func (sm *Manager) StartStream(profileToken, rtspURL string) (*models.StreamInfo
 			StartedAt:    time.Now(),
 			Status:       "starting",
 		},
-		Command:         cmd,
+		Command:         nil,
 		Done:            make(chan bool),
 		logger:          sm.logger,
 		shouldReconnect: true,
 		reconnectCount:  0,
 	}
 
-	// Log the FFmpeg command
-	cmdStr := fmt.Sprintf("ffmpeg %s", strings.Join(args, " "))
-	sm.logger.LogInfo(streamID, "system", fmt.Sprintf("Starting FFmpeg: %s", cmdStr))
-	log.Printf("Starting stream %s with command: %s", streamID, cmdStr)
+	sm.logger.LogInfo(streamID, "system", "Initializing stream monitoring and connection")
+	log.Printf("Initializing stream %s", streamID)
 
-	// Start FFmpeg process
-	if err := cmd.Start(); err != nil {
-		sm.logger.LogError(streamID, "system", fmt.Sprintf("Failed to start FFmpeg: %v", err))
-		return nil, fmt.Errorf("failed to start FFmpeg: %v", err)
-	}
-
-	streamProcess.Info.Status = "running"
-	sm.logger.LogInfo(streamID, "system", "FFmpeg process started successfully")
-
-	// Monitor process in separate goroutines
+	// Monitor process in separate goroutine
 	go sm.monitorStreamWithReconnect(streamProcess, hlsDir)
 
 	sm.streams[streamID] = streamProcess
@@ -154,6 +118,7 @@ func (sm *Manager) createFFmpegCommand(rtspURL string, hlsDir string) *exec.Cmd 
 		"-fflags", "+genpts", // Generate presentation timestamps
 		"-rtsp_transport", "tcp", // Use TCP for RTSP (more reliable)
 		"-rtsp_flags", "prefer_tcp", // Prefer TCP
+		"-stimeout", "5000000", // 5 seconds socket timeout
 		"-i", rtspURL,
 		"-c:v", "copy", // Copy video codec (no transcoding)
 		"-c:a", "aac", // Audio codec
@@ -203,11 +168,15 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 			if delay > maxReconnectDelay {
 				delay = maxReconnectDelay
 			}
+			process.Info.Status = "reconnecting"
 			process.lastReconnect = time.Now()
 			process.mutex.Unlock()
 
 			sm.logger.LogWarn(process.Info.ID, "system", fmt.Sprintf("Reconnection attempt %d/%d in %v", process.reconnectCount, maxReconnectAttempts, delay))
-			time.Sleep(delay)
+			select {
+			case <-time.After(delay):
+			case <-process.Done:
+			}
 			continue
 		}
 
@@ -217,6 +186,13 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 		// Check if we should reconnect
 		process.mutex.Lock()
 		shouldContinue := process.shouldReconnect && process.reconnectCount < maxReconnectAttempts
+
+		if !shouldContinue && process.shouldReconnect {
+			process.Info.Status = "failed"
+			sm.logger.LogError(process.Info.ID, "system", "Max reconnection attempts reached after process failures, giving up")
+		} else if shouldContinue {
+			process.Info.Status = "reconnecting"
+		}
 		process.mutex.Unlock()
 
 		if !shouldContinue {
@@ -224,7 +200,10 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 		}
 
 		// Brief delay before reconnecting
-		time.Sleep(reconnectDelay)
+		select {
+		case <-time.After(reconnectDelay):
+		case <-process.Done:
+		}
 	}
 
 	// Cleanup when done
@@ -330,10 +309,12 @@ func (sm *Manager) monitorSingleProcess(process *Process) {
 		sm.logger.LogError(process.Info.ID, "system", fmt.Sprintf("FFmpeg process exited with error: %v", err))
 		log.Printf("Stream %s: FFmpeg exited with error: %v", process.Info.ID, err)
 
-		// Reset reconnect count on successful periods
+		// Reset reconnect count on successful periods, otherwise increment to prevent infinite loops
 		process.mutex.Lock()
 		if time.Since(process.lastReconnect) > 30*time.Second {
-			process.reconnectCount = 0 // Reset if stream ran for a while
+			process.reconnectCount = 0 // Reset if stream ran stably for a while
+		} else {
+			process.reconnectCount++ // Increment penalty for quick failure
 		}
 		process.mutex.Unlock()
 	} else {
