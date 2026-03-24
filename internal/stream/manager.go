@@ -118,7 +118,7 @@ func (sm *Manager) createFFmpegCommand(rtspURL string, hlsDir string) *exec.Cmd 
 		"-fflags", "+genpts", // Generate presentation timestamps
 		"-rtsp_transport", "tcp", // Use TCP for RTSP (more reliable)
 		"-rtsp_flags", "prefer_tcp", // Prefer TCP
-		"-stimeout", "5000000", // 5 seconds socket timeout
+		"-timeout", "5000000", // 5 seconds socket timeout
 		"-i", rtspURL,
 		"-c:v", "copy", // Copy video codec (no transcoding)
 		"-c:a", "aac", // Audio codec
