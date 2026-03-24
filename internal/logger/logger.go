@@ -38,7 +38,9 @@ type Logger struct {
 
 // NewLogger creates a new logger and initializes the database
 func NewLogger(dbPath string) (*Logger, error) {
-	db, err := sql.Open("sqlite3", dbPath)
+	// Enable WAL mode and shared cache to massively accelerate concurrent read/writes
+	dsn := fmt.Sprintf("%s?cache=shared&mode=rwc&_journal_mode=WAL&_busy_timeout=5000", dbPath)
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
@@ -69,9 +71,7 @@ func (l *Logger) Close() {
 
 // log inserts a new log entry into the database
 func (l *Logger) log(streamID string, level LogLevel, source, message string) {
-	l.mutex.Lock()
-	defer l.mutex.Unlock()
-
+	// Database/sql handles its own concurrency cleanly, no global lock needed
 	query := `INSERT INTO stream_logs (stream_id, timestamp, level, source, message) VALUES (?, ?, ?, ?, ?)`
 	_, err := l.db.Exec(query, streamID, time.Now(), level, source, message)
 	if err != nil {
@@ -101,9 +101,6 @@ func (l *Logger) LogError(streamID, source, message string) {
 
 // GetStreamLogs retrieves all logs for a specific stream
 func (l *Logger) GetStreamLogs(streamID string, limit int) ([]StreamLog, error) {
-	l.mutex.Lock()
-	defer l.mutex.Unlock()
-
 	query := `SELECT id, stream_id, timestamp, level, source, message FROM stream_logs WHERE stream_id = ? ORDER BY timestamp DESC LIMIT ?`
 	rows, err := l.db.Query(query, streamID, limit)
 	if err != nil {
@@ -116,9 +113,6 @@ func (l *Logger) GetStreamLogs(streamID string, limit int) ([]StreamLog, error) 
 
 // GetRecentLogs retrieves the most recent logs from all streams
 func (l *Logger) GetRecentLogs(limit int) ([]StreamLog, error) {
-	l.mutex.Lock()
-	defer l.mutex.Unlock()
-
 	query := `SELECT id, stream_id, timestamp, level, source, message FROM stream_logs ORDER BY timestamp DESC LIMIT ?`
 	rows, err := l.db.Query(query, limit)
 	if err != nil {

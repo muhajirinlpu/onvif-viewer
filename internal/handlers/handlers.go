@@ -328,8 +328,6 @@ func (h *Handler) LogEvents(w http.ResponseWriter, r *http.Request) {
 				// Channel safely closed, exit to prevent 100% CPU infinite spinning
 				return
 			}
-			// Update last active time
-			h.streamManager.UpdateClientActivity(clientID)
 
 			// Marshal the log entry
 			data, err := json.Marshal(entry)
@@ -338,7 +336,9 @@ func (h *Handler) LogEvents(w http.ResponseWriter, r *http.Request) {
 			}
 
 			// Write the SSE data
-			fmt.Fprintf(w, "data: %s\n\n", data)
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+				return // Client connection naturally severed
+			}
 			flusher.Flush()
 
 		case <-heartbeat.C:
@@ -346,7 +346,9 @@ func (h *Handler) LogEvents(w http.ResponseWriter, r *http.Request) {
 			h.streamManager.UpdateClientActivity(clientID)
 
 			// Send a comment as heartbeat
-			fmt.Fprintf(w, ": heartbeat %s\n\n", time.Now().Format(time.RFC3339))
+			if _, err := fmt.Fprintf(w, ": heartbeat %s\n\n", time.Now().Format(time.RFC3339)); err != nil {
+				return // Client connection naturally severed
+			}
 			flusher.Flush()
 
 		case <-r.Context().Done():
