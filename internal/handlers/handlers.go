@@ -270,8 +270,8 @@ func (h *Handler) LogEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no") // Prevent Nginx from buffering SSE streams and stalling the connection
 
 
-	// Create a client channel
-	clientChan := make(chan models.LogEntry, 10)
+	// Create a client channel with a much larger buffer for FFmpeg burst logs
+	clientChan := make(chan models.LogEntry, 500)
 	clientID := fmt.Sprintf("client-%d", time.Now().UnixNano())
 
 	// Add this client to the active SSE clients

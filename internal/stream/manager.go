@@ -490,13 +490,12 @@ func (sm *Manager) broadcastLog(entry models.LogEntry) {
 	sm.mutex.RLock()
 	defer sm.mutex.RUnlock()
 
-	for clientID, clientConn := range sm.sseClients {
+	for _, clientConn := range sm.sseClients {
 		select {
 		case clientConn.Channel <- entry:
 			// Log sent successfully
 		default:
-			// Channel full, skip this client
-			log.Printf("SSE client %s channel full, skipping log broadcast", clientID)
+			// Channel full, silently skip to aggressively prevent console bloat
 		}
 	}
 }
