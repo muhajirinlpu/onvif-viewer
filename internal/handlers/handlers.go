@@ -267,6 +267,8 @@ func (h *Handler) LogEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("X-Accel-Buffering", "no") // Prevent Nginx from buffering SSE streams and stalling the connection
+
 
 	// Create a client channel
 	clientChan := make(chan models.LogEntry, 10)
@@ -321,7 +323,11 @@ func (h *Handler) LogEvents(w http.ResponseWriter, r *http.Request) {
 	// Keep connection open and stream logs
 	for {
 		select {
-		case entry := <-clientChan:
+		case entry, ok := <-clientChan:
+			if !ok {
+				// Channel safely closed, exit to prevent 100% CPU infinite spinning
+				return
+			}
 			// Update last active time
 			h.streamManager.UpdateClientActivity(clientID)
 
