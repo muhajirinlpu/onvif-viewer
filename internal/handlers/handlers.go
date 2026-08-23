@@ -42,7 +42,7 @@ func (h *Handler) StartStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.logger.LogInfo("", "http", fmt.Sprintf("Starting stream for profile %s with URL %s", req.ProfileToken, req.RtspURL))
+	h.logger.LogInfo("", "http", fmt.Sprintf("Starting stream for profile %s", req.ProfileToken))
 
 	streamInfo, err := h.streamManager.StartStream(req.ProfileToken, req.RtspURL)
 	if err != nil {
@@ -268,7 +268,6 @@ func (h *Handler) LogEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("X-Accel-Buffering", "no") // Prevent Nginx from buffering SSE streams and stalling the connection
-
 
 	// Create a client channel with a much larger buffer for FFmpeg burst logs
 	clientChan := make(chan models.LogEntry, 500)

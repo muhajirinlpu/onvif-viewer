@@ -1,10 +1,9 @@
 package stream
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -69,10 +68,14 @@ func (sm *Manager) StartStream(profileToken, rtspURL string) (*models.StreamInfo
 
 	// Check if stream already exists for this profile
 	for _, stream := range sm.streams {
+		stream.mutex.RLock()
 		if stream.Info.ProfileToken == profileToken {
-			sm.logger.LogInfo(stream.Info.ID, "system", "Stream already exists for profile token")
-			return &stream.Info, nil
+			info := stream.Info
+			stream.mutex.RUnlock()
+			sm.logger.LogInfo(info.ID, "system", "Stream already exists for profile token")
+			return &info, nil
 		}
+		stream.mutex.RUnlock()
 	}
 
 	// Create stream ID and HLS path
@@ -107,7 +110,8 @@ func (sm *Manager) StartStream(profileToken, rtspURL string) (*models.StreamInfo
 	go sm.monitorStreamWithReconnect(streamProcess, hlsDir)
 
 	sm.streams[streamID] = streamProcess
-	return &streamProcess.Info, nil
+	info := streamProcess.Info
+	return &info, nil
 }
 
 // reconnectBackoff returns capped exponential delay after consecutive failures.
@@ -132,15 +136,36 @@ func nextReconnectFailureCount(current int, runDuration time.Duration) int {
 	return current + 1
 }
 
-func sanitizeFFmpegArgs(args []string) []string {
-	sanitized := append([]string(nil), args...)
-	for i, arg := range sanitized {
-		if !strings.HasPrefix(arg, "rtsp://") {
+func redactSensitiveText(text string) string {
+	lower := strings.ToLower(text)
+	searchFrom := 0
+	for {
+		rel := strings.Index(lower[searchFrom:], "rtsp://")
+		if rel < 0 {
+			return text
+		}
+		start := searchFrom + rel
+		authStart := start + len("rtsp://")
+		atRel := strings.Index(text[authStart:], "@")
+		if atRel < 0 {
+			return text
+		}
+		at := authStart + atRel
+		endRel := strings.IndexAny(text[authStart:at], " /\t\r\n")
+		if endRel >= 0 {
+			searchFrom = authStart
 			continue
 		}
-		if at := strings.LastIndex(arg, "@"); at >= 0 {
-			sanitized[i] = "rtsp://REDACTED@" + arg[at+1:]
-		}
+		text = text[:authStart] + "REDACTED" + text[at:]
+		lower = strings.ToLower(text)
+		searchFrom = authStart + len("REDACTED@")
+	}
+}
+
+func sanitizeFFmpegArgs(args []string) []string {
+	sanitized := append([]string(nil), args...)
+	for i := range sanitized {
+		sanitized[i] = redactSensitiveText(sanitized[i])
 	}
 	return sanitized
 }
@@ -179,17 +204,10 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 	defer process.closed.Do(func() { close(process.Done) })
 
 	for {
-		process.mutex.RLock()
-		shouldReconnect := process.shouldReconnect
-		process.mutex.RUnlock()
-		if !shouldReconnect {
-			return
-		}
-
 		startedAt := time.Now()
-		err := sm.startFFmpegProcess(process, hlsDir)
+		cmd, err := sm.startFFmpegProcess(process, hlsDir)
 		if err == nil {
-			err = process.Command.Wait()
+			err = cmd.Wait()
 			runDuration := time.Since(startedAt)
 			if err != nil {
 				sm.logger.LogError(process.Info.ID, "system", fmt.Sprintf("FFmpeg exited after %s: %v", runDuration.Round(time.Second), err))
@@ -198,13 +216,20 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 				sm.logger.LogWarn(process.Info.ID, "system", fmt.Sprintf("FFmpeg exited normally after %s; reconnecting", runDuration.Round(time.Second)))
 			}
 			process.mutex.Lock()
+			process.Command = nil
 			process.reconnectCount = nextReconnectFailureCount(process.reconnectCount, runDuration)
 			process.mutex.Unlock()
 		} else {
-			sm.logger.LogError(process.Info.ID, "system", fmt.Sprintf("Failed to start FFmpeg: %v", err))
 			process.mutex.Lock()
-			process.reconnectCount++
+			stopping := !process.shouldReconnect
+			if !stopping {
+				process.reconnectCount++
+			}
 			process.mutex.Unlock()
+			if stopping {
+				return
+			}
+			sm.logger.LogError(process.Info.ID, "system", fmt.Sprintf("Failed to start FFmpeg: %v", err))
 		}
 
 		process.mutex.Lock()
@@ -235,97 +260,69 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 	}
 }
 
-// startFFmpegProcess starts a new FFmpeg process for the given stream
-func (sm *Manager) startFFmpegProcess(process *Process, hlsDir string) error {
-	process.Command = sm.createFFmpegCommand(process.Info.RtspURL, hlsDir)
+type filteredLogWriter struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+	handle func(string)
+}
 
-	// Create pipes for monitoring before starting the process
-	stdoutPipe, err := process.Command.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stdout pipe: %v", err)
+func (w *filteredLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	originalLen := len(p)
+	_, _ = w.buffer.Write(p)
+	for {
+		line, err := w.buffer.ReadString('\n')
+		if err != nil {
+			w.buffer.WriteString(line)
+			break
+		}
+		w.handle(strings.TrimSpace(line))
+	}
+	return originalLen, nil
+}
+
+// startFFmpegProcess creates and starts FFmpeg while holding the process lock,
+// preventing StopStream from missing a concurrently starting process.
+func (sm *Manager) startFFmpegProcess(process *Process, hlsDir string) (*exec.Cmd, error) {
+	process.mutex.Lock()
+	defer process.mutex.Unlock()
+	if !process.shouldReconnect {
+		return nil, fmt.Errorf("stream is stopping")
 	}
 
-	stderrPipe, err := process.Command.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("failed to create stderr pipe: %v", err)
-	}
-
-	// Log the FFmpeg command
-	args := sanitizeFFmpegArgs(process.Command.Args[1:])
+	cmd := sm.createFFmpegCommand(process.Info.RtspURL, hlsDir)
+	args := sanitizeFFmpegArgs(cmd.Args[1:])
 	cmdStr := fmt.Sprintf("ffmpeg %s", strings.Join(args, " "))
 	sm.logger.LogInfo(process.Info.ID, "system", fmt.Sprintf("Starting FFmpeg: %s", cmdStr))
 	log.Printf("Starting stream %s with command: %s", process.Info.ID, cmdStr)
 
-	// Start FFmpeg process
-	if err := process.Command.Start(); err != nil {
-		return fmt.Errorf("failed to start FFmpeg: %v", err)
+	cmd.Stdout = &filteredLogWriter{handle: func(line string) { sm.handleFFmpegLine(process, "ffmpeg_stdout", line) }}
+	cmd.Stderr = &filteredLogWriter{handle: func(line string) { sm.handleFFmpegLine(process, "ffmpeg", line) }}
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start FFmpeg: %v", err)
 	}
-
-	process.mutex.Lock()
+	process.Command = cmd
 	process.Info.Status = "running"
-	process.mutex.Unlock()
 	sm.logger.LogInfo(process.Info.ID, "system", "FFmpeg process started successfully")
-
-	// Start monitoring in goroutines
-	go sm.monitorPipes(process, stdoutPipe, stderrPipe)
-
-	return nil
+	return cmd, nil
 }
 
-// monitorPipes monitors stdout and stderr pipes
-func (sm *Manager) monitorPipes(process *Process, stdoutPipe, stderrPipe io.ReadCloser) {
-	// Monitor stdout
-	go func() {
-		defer stdoutPipe.Close()
-		scanner := bufio.NewScanner(stdoutPipe)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if line != "" && shouldLogFFmpegLine(line) {
-				sm.logger.LogInfo(process.Info.ID, "ffmpeg_stdout", line)
-				sm.broadcastLog(models.LogEntry{
-					StreamID: process.Info.ID,
-					Message:  fmt.Sprintf("stdout: %s", line),
-					Time:     time.Now().Format(time.RFC3339),
-				})
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			sm.logger.LogError(process.Info.ID, "ffmpeg_stdout", fmt.Sprintf("Scanner error: %v", err))
-		}
-	}()
-
-	// Monitor stderr
-	go func() {
-		defer stderrPipe.Close()
-		scanner := bufio.NewScanner(stderrPipe)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if line != "" {
-				// Filter out noisy progress messages (optional)
-				if shouldLogFFmpegLine(line) {
-					// Determine log level based on content
-					logLevel := determineLogLevel(line)
-					switch logLevel {
-					case logger.ERROR:
-						sm.logger.LogError(process.Info.ID, "ffmpeg", line)
-					case logger.WARN:
-						sm.logger.LogWarn(process.Info.ID, "ffmpeg", line)
-					default:
-						sm.logger.LogInfo(process.Info.ID, "ffmpeg", line)
-					}
-
-					sm.broadcastLog(models.LogEntry{
-						StreamID: process.Info.ID,
-						Message:  fmt.Sprintf("ffmpeg: %s", line),
-						Time:     time.Now().Format(time.RFC3339),
-					})
-				}
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			sm.logger.LogError(process.Info.ID, "ffmpeg_stderr", fmt.Sprintf("Scanner error: %v", err))
-		}
-	}()
+func (sm *Manager) handleFFmpegLine(process *Process, source, line string) {
+	line = redactSensitiveText(line)
+	if line == "" || !shouldLogFFmpegLine(line) {
+		return
+	}
+	level := determineLogLevel(line)
+	switch level {
+	case logger.ERROR:
+		sm.logger.LogError(process.Info.ID, source, line)
+	case logger.WARN:
+		sm.logger.LogWarn(process.Info.ID, source, line)
+	default:
+		sm.logger.LogInfo(process.Info.ID, source, line)
+	}
+	sm.broadcastLog(models.LogEntry{StreamID: process.Info.ID, Message: fmt.Sprintf("ffmpeg: %s", line), Time: time.Now().Format(time.RFC3339)})
 }
 
 // determineLogLevel determines the log level based on FFmpeg output content
@@ -398,9 +395,12 @@ func (sm *Manager) StopStream(streamID string) error {
 
 	sm.logger.LogInfo(streamID, "system", "Stopping stream")
 
-	// Disable reconnection first
+	// Disable reconnection and snapshot the current command atomically with start.
 	stream.mutex.Lock()
 	stream.shouldReconnect = false
+	stream.Info.Status = "stopping"
+	cmd := stream.Command
+	stream.closed.Do(func() { close(stream.Done) })
 	stream.mutex.Unlock()
 
 	// Create a timeout context
@@ -408,8 +408,8 @@ func (sm *Manager) StopStream(streamID string) error {
 	defer cancel()
 
 	// Kill the entire process group
-	if stream.Command != nil && stream.Command.Process != nil {
-		pgid, err := syscall.Getpgid(stream.Command.Process.Pid)
+	if cmd != nil && cmd.Process != nil {
+		pgid, err := syscall.Getpgid(cmd.Process.Pid)
 		if err == nil {
 			// First try SIGTERM for graceful shutdown
 			sm.logger.LogInfo(streamID, "system", "Sending SIGTERM to process group")
@@ -427,16 +427,12 @@ func (sm *Manager) StopStream(streamID string) error {
 		} else {
 			// Fallback to regular process kill
 			sm.logger.LogWarn(streamID, "system", "Failed to get process group, using regular kill")
-			_ = stream.Command.Process.Kill()
+			_ = cmd.Process.Kill()
 		}
 	}
 
-	// Update status and cleanup
-	stream.Info.Status = "stopping"
+	// Remove from active streams after signaling the monitor.
 	delete(sm.streams, streamID)
-	stream.closed.Do(func() {
-		close(stream.Done)
-	})
 	sm.mutex.Unlock()
 
 	// Cleanup files in background
@@ -462,7 +458,9 @@ func (sm *Manager) ListStreams() []models.StreamInfo {
 
 	streams := make([]models.StreamInfo, 0, len(sm.streams))
 	for _, stream := range sm.streams {
+		stream.mutex.RLock()
 		streams = append(streams, stream.Info)
+		stream.mutex.RUnlock()
 	}
 	return streams
 }

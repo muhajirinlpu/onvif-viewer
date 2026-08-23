@@ -20,7 +20,7 @@ type GetStreamUriRequest struct {
 type StreamInfo struct {
 	ID           string    `json:"id"`
 	ProfileToken string    `json:"profileToken"`
-	RtspURL      string    `json:"rtspUrl"`
+	RtspURL      string    `json:"-"`
 	HlsURL       string    `json:"hlsUrl"`
 	StartedAt    time.Time `json:"startedAt"`
 	Status       string    `json:"status"`

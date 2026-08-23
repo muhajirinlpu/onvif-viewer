@@ -33,3 +33,28 @@ func TestLoggerRetainsOnlyConfiguredNumberOfRows(t *testing.T) {
 		t.Fatalf("unexpected retained range: newest=%q oldest=%q", logs[0].Message, logs[len(logs)-1].Message)
 	}
 }
+
+func TestLoggerPrunesExistingDatabaseOnOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "logs.db")
+	l, err := newLogger(path, 100, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 25; i++ {
+		l.LogInfo("stream", "test", fmt.Sprintf("old-%d", i))
+	}
+	l.Close()
+
+	l, err = newLogger(path, 10, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	var count int
+	if err := l.db.QueryRow("SELECT COUNT(*) FROM stream_logs").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 10 {
+		t.Fatalf("startup retained %d rows, want 10", count)
+	}
+}

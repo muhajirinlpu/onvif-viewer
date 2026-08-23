@@ -1,7 +1,10 @@
 package stream
 
 import (
+	"encoding/json"
 	"strings"
+
+	"dengan.dev/camera-streamer/internal/models"
 	"testing"
 	"time"
 )
@@ -70,5 +73,41 @@ func TestSanitizeFFmpegArgsRedactsRTSPCredentials(t *testing.T) {
 	}
 	if !strings.Contains(got, "rtsp://REDACTED@10.0.0.4:554/live") {
 		t.Fatalf("unexpected sanitized args: %s", got)
+	}
+}
+
+func TestRedactSensitiveURLIsCaseInsensitiveAndWorksInsideLines(t *testing.T) {
+	input := "Opening input RTSP://admin:secret@10.0.0.4:554/live failed"
+	got := redactSensitiveText(input)
+	if strings.Contains(got, "admin") || strings.Contains(got, "secret") {
+		t.Fatalf("credentials leaked: %s", got)
+	}
+	if !strings.Contains(got, "RTSP://REDACTED@10.0.0.4:554/live") {
+		t.Fatalf("unexpected redaction: %s", got)
+	}
+}
+
+func TestStreamInfoSnapshotDoesNotExposeRTSPURL(t *testing.T) {
+	info := models.StreamInfo{ID: "x", RtspURL: "rtsp://admin:secret@camera/live"}
+	encoded, err := json.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "rtsp") || strings.Contains(string(encoded), "secret") {
+		t.Fatalf("RTSP URL exposed in API JSON: %s", encoded)
+	}
+}
+
+func TestFilteredLogWriterHandlesSplitLines(t *testing.T) {
+	var lines []string
+	w := &filteredLogWriter{handle: func(line string) { lines = append(lines, line) }}
+	if _, err := w.Write([]byte("first line\nsecond")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte(" line\n")); err != nil {
+		t.Fatal(err)
+	}
+	if len(lines) != 2 || lines[0] != "first line" || lines[1] != "second line" {
+		t.Fatalf("unexpected lines: %#v", lines)
 	}
 }

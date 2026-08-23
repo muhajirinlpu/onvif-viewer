@@ -69,6 +69,18 @@ func newLogger(dbPath string, maxRows, pruneInterval int) (*Logger, error) {
 		db.Close()
 		return nil, fmt.Errorf("failed to create table: %w", err)
 	}
+	if maxRows < 1 {
+		maxRows = defaultMaxRows
+	}
+	if pruneInterval < 1 {
+		pruneInterval = defaultPruneInterval
+	}
+	// Enforce retention before index creation so an oversized legacy database does not
+	// require expensive full-table index builds at startup.
+	if _, err := db.Exec(`DELETE FROM stream_logs WHERE id <= (SELECT COALESCE(MAX(id) - ?, 0) FROM stream_logs)`, maxRows); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to prune existing log entries: %w", err)
+	}
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_stream_logs_stream_time ON stream_logs(stream_id, timestamp DESC)`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create stream log index: %w", err)
@@ -76,12 +88,6 @@ func newLogger(dbPath string, maxRows, pruneInterval int) (*Logger, error) {
 	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_stream_logs_time ON stream_logs(timestamp DESC)`); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create log time index: %w", err)
-	}
-	if maxRows < 1 {
-		maxRows = defaultMaxRows
-	}
-	if pruneInterval < 1 {
-		pruneInterval = defaultPruneInterval
 	}
 	return &Logger{db: db, maxRows: maxRows, pruneInterval: pruneInterval}, nil
 }
