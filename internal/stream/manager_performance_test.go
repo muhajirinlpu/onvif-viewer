@@ -111,3 +111,32 @@ func TestFilteredLogWriterHandlesSplitLines(t *testing.T) {
 		t.Fatalf("unexpected lines: %#v", lines)
 	}
 }
+
+func TestFilteredLogWriterSplitsCarriageReturnsAndFlushesPartialLine(t *testing.T) {
+	var lines []string
+	w := &filteredLogWriter{handle: func(line string) { lines = append(lines, line) }}
+	if _, err := w.Write([]byte("frame=1\rframe=2\rfinal diagnostic")); err != nil {
+		t.Fatal(err)
+	}
+	w.Flush()
+	want := []string{"frame=1", "frame=2", "final diagnostic"}
+	if len(lines) != len(want) {
+		t.Fatalf("lines=%#v want=%#v", lines, want)
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Fatalf("lines=%#v want=%#v", lines, want)
+		}
+	}
+}
+
+func TestFilteredLogWriterBoundsUnterminatedInput(t *testing.T) {
+	w := &filteredLogWriter{handle: func(string) {}}
+	payload := strings.Repeat("x", maxBufferedLogLine*3)
+	if _, err := w.Write([]byte(payload)); err != nil {
+		t.Fatal(err)
+	}
+	if w.buffer.Len() > maxBufferedLogLine {
+		t.Fatalf("buffer grew to %d", w.buffer.Len())
+	}
+}

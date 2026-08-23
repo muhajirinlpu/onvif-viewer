@@ -2,7 +2,6 @@ package stream
 
 import (
 	"bytes"
-	"context"
 	"fmt"
 	"log"
 	"os"
@@ -24,6 +23,7 @@ const (
 	reconnectDelay       = 5 * time.Second
 	maxReconnectDelay    = 60 * time.Second
 	stableRunThreshold   = 30 * time.Second
+	maxBufferedLogLine   = 64 * 1024
 )
 
 // Process represents a single FFmpeg stream process
@@ -31,6 +31,7 @@ type Process struct {
 	Info            models.StreamInfo
 	Command         *exec.Cmd
 	Done            chan bool
+	Exited          chan struct{}
 	closed          sync.Once
 	logger          *logger.Logger
 	reconnectCount  int
@@ -98,6 +99,7 @@ func (sm *Manager) StartStream(profileToken, rtspURL string) (*models.StreamInfo
 		},
 		Command:         nil,
 		Done:            make(chan bool),
+		Exited:          make(chan struct{}),
 		logger:          sm.logger,
 		shouldReconnect: true,
 		reconnectCount:  0,
@@ -106,11 +108,11 @@ func (sm *Manager) StartStream(profileToken, rtspURL string) (*models.StreamInfo
 	sm.logger.LogInfo(streamID, "system", "Initializing stream monitoring and connection")
 	log.Printf("Initializing stream %s", streamID)
 
-	// Monitor process in separate goroutine
-	go sm.monitorStreamWithReconnect(streamProcess, hlsDir)
-
-	sm.streams[streamID] = streamProcess
 	info := streamProcess.Info
+	sm.streams[streamID] = streamProcess
+
+	// Monitor process only after the initial response snapshot is complete.
+	go sm.monitorStreamWithReconnect(streamProcess, hlsDir)
 	return &info, nil
 }
 
@@ -201,6 +203,7 @@ func (sm *Manager) createFFmpegCommand(rtspURL string, hlsDir string) *exec.Cmd 
 
 // monitorStreamWithReconnect monitors a stream and handles reconnection
 func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
+	defer close(process.Exited)
 	defer process.closed.Do(func() { close(process.Done) })
 
 	for {
@@ -208,6 +211,12 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 		cmd, err := sm.startFFmpegProcess(process, hlsDir)
 		if err == nil {
 			err = cmd.Wait()
+			if writer, ok := cmd.Stdout.(*filteredLogWriter); ok {
+				writer.Flush()
+			}
+			if writer, ok := cmd.Stderr.(*filteredLogWriter); ok {
+				writer.Flush()
+			}
 			runDuration := time.Since(startedAt)
 			if err != nil {
 				sm.logger.LogError(process.Info.ID, "system", fmt.Sprintf("FFmpeg exited after %s: %v", runDuration.Round(time.Second), err))
@@ -270,16 +279,31 @@ func (w *filteredLogWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	originalLen := len(p)
-	_, _ = w.buffer.Write(p)
-	for {
-		line, err := w.buffer.ReadString('\n')
-		if err != nil {
-			w.buffer.WriteString(line)
-			break
+	for _, b := range p {
+		if b == '\n' || b == '\r' {
+			w.emitLocked()
+			continue
 		}
-		w.handle(strings.TrimSpace(line))
+		if w.buffer.Len() >= maxBufferedLogLine {
+			w.emitLocked()
+		}
+		_ = w.buffer.WriteByte(b)
 	}
 	return originalLen, nil
+}
+
+func (w *filteredLogWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.emitLocked()
+}
+
+func (w *filteredLogWriter) emitLocked() {
+	line := strings.TrimSpace(w.buffer.String())
+	w.buffer.Reset()
+	if line != "" {
+		w.handle(line)
+	}
 }
 
 // startFFmpegProcess creates and starts FFmpeg while holding the process lock,
@@ -392,6 +416,10 @@ func (sm *Manager) StopStream(streamID string) error {
 		sm.mutex.Unlock()
 		return fmt.Errorf("stream not found")
 	}
+	// Remove it from the public active set immediately, but keep the local
+	// reference until FFmpeg and its output writers have fully exited.
+	delete(sm.streams, streamID)
+	sm.mutex.Unlock()
 
 	sm.logger.LogInfo(streamID, "system", "Stopping stream")
 
@@ -403,37 +431,39 @@ func (sm *Manager) StopStream(streamID string) error {
 	stream.closed.Do(func() { close(stream.Done) })
 	stream.mutex.Unlock()
 
-	// Create a timeout context
-	ctx, cancel := context.WithTimeout(context.Background(), streamStopTimeout)
-	defer cancel()
-
-	// Kill the entire process group
+	// Terminate the process group, then wait for the monitor to confirm exit.
 	if cmd != nil && cmd.Process != nil {
 		pgid, err := syscall.Getpgid(cmd.Process.Pid)
 		if err == nil {
-			// First try SIGTERM for graceful shutdown
 			sm.logger.LogInfo(streamID, "system", "Sending SIGTERM to process group")
 			_ = syscall.Kill(-pgid, syscall.SIGTERM)
-
-			// Wait for graceful shutdown
-			select {
-			case <-ctx.Done():
-				// If timeout, force kill
-				sm.logger.LogWarn(streamID, "system", "Graceful shutdown timed out, force killing")
-				_ = syscall.Kill(-pgid, syscall.SIGKILL)
-			case <-time.After(time.Second):
-				// Give it a second to terminate gracefully
-			}
 		} else {
-			// Fallback to regular process kill
 			sm.logger.LogWarn(streamID, "system", "Failed to get process group, using regular kill")
-			_ = cmd.Process.Kill()
+			_ = cmd.Process.Signal(syscall.SIGTERM)
 		}
 	}
 
-	// Remove from active streams after signaling the monitor.
-	delete(sm.streams, streamID)
-	sm.mutex.Unlock()
+	grace := time.NewTimer(streamStopTimeout)
+	select {
+	case <-stream.Exited:
+		grace.Stop()
+	case <-grace.C:
+		if cmd != nil && cmd.Process != nil {
+			sm.logger.LogWarn(streamID, "system", "Graceful shutdown timed out, force killing")
+			if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil {
+				_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			} else {
+				_ = cmd.Process.Kill()
+			}
+		}
+		forceWait := time.NewTimer(streamStopTimeout)
+		select {
+		case <-stream.Exited:
+			forceWait.Stop()
+		case <-forceWait.C:
+			return fmt.Errorf("stream process did not exit after SIGKILL")
+		}
+	}
 
 	// Cleanup files in background
 	go func() {
