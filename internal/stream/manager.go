@@ -21,9 +21,10 @@ import (
 const (
 	streamStopTimeout    = 5 * time.Second
 	maxLogEntries        = 500
-	maxReconnectAttempts = 30 // Covers ~24.5 minutes of total continuous downtime
+	maxReconnectAttempts = 30
 	reconnectDelay       = 5 * time.Second
-	maxReconnectDelay    = 60 * time.Second // Max 1 minute between attempts
+	maxReconnectDelay    = 60 * time.Second
+	stableRunThreshold   = 30 * time.Second
 )
 
 // Process represents a single FFmpeg stream process
@@ -35,7 +36,6 @@ type Process struct {
 	logger          *logger.Logger
 	reconnectCount  int
 	shouldReconnect bool
-	lastReconnect   time.Time
 	mutex           sync.RWMutex
 }
 
@@ -110,6 +110,41 @@ func (sm *Manager) StartStream(profileToken, rtspURL string) (*models.StreamInfo
 	return &streamProcess.Info, nil
 }
 
+// reconnectBackoff returns capped exponential delay after consecutive failures.
+func reconnectBackoff(failures int) time.Duration {
+	if failures < 1 {
+		failures = 1
+	}
+	delay := reconnectDelay
+	for i := 1; i < failures && delay < maxReconnectDelay; i++ {
+		delay *= 2
+		if delay > maxReconnectDelay {
+			delay = maxReconnectDelay
+		}
+	}
+	return delay
+}
+
+func nextReconnectFailureCount(current int, runDuration time.Duration) int {
+	if runDuration >= stableRunThreshold {
+		return 1
+	}
+	return current + 1
+}
+
+func sanitizeFFmpegArgs(args []string) []string {
+	sanitized := append([]string(nil), args...)
+	for i, arg := range sanitized {
+		if !strings.HasPrefix(arg, "rtsp://") {
+			continue
+		}
+		if at := strings.LastIndex(arg, "@"); at >= 0 {
+			sanitized[i] = "rtsp://REDACTED@" + arg[at+1:]
+		}
+	}
+	return sanitized
+}
+
 // createFFmpegCommand creates a new FFmpeg command for the given stream
 func (sm *Manager) createFFmpegCommand(rtspURL string, hlsDir string) *exec.Cmd {
 	// Prepare FFmpeg command with improved settings for stability
@@ -141,75 +176,63 @@ func (sm *Manager) createFFmpegCommand(rtspURL string, hlsDir string) *exec.Cmd 
 
 // monitorStreamWithReconnect monitors a stream and handles reconnection
 func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
+	defer process.closed.Do(func() { close(process.Done) })
+
 	for {
+		process.mutex.RLock()
+		shouldReconnect := process.shouldReconnect
+		process.mutex.RUnlock()
+		if !shouldReconnect {
+			return
+		}
+
+		startedAt := time.Now()
+		err := sm.startFFmpegProcess(process, hlsDir)
+		if err == nil {
+			err = process.Command.Wait()
+			runDuration := time.Since(startedAt)
+			if err != nil {
+				sm.logger.LogError(process.Info.ID, "system", fmt.Sprintf("FFmpeg exited after %s: %v", runDuration.Round(time.Second), err))
+				log.Printf("Stream %s: FFmpeg exited after %s: %v", process.Info.ID, runDuration.Round(time.Second), err)
+			} else {
+				sm.logger.LogWarn(process.Info.ID, "system", fmt.Sprintf("FFmpeg exited normally after %s; reconnecting", runDuration.Round(time.Second)))
+			}
+			process.mutex.Lock()
+			process.reconnectCount = nextReconnectFailureCount(process.reconnectCount, runDuration)
+			process.mutex.Unlock()
+		} else {
+			sm.logger.LogError(process.Info.ID, "system", fmt.Sprintf("Failed to start FFmpeg: %v", err))
+			process.mutex.Lock()
+			process.reconnectCount++
+			process.mutex.Unlock()
+		}
+
 		process.mutex.Lock()
 		if !process.shouldReconnect {
 			process.mutex.Unlock()
-			break
+			return
 		}
-		process.mutex.Unlock()
-
-		// Start or restart the FFmpeg process
-		err := sm.startFFmpegProcess(process, hlsDir)
-		if err != nil {
-			sm.logger.LogError(process.Info.ID, "system", fmt.Sprintf("Failed to start FFmpeg: %v", err))
-
-			process.mutex.Lock()
-			if process.reconnectCount >= maxReconnectAttempts {
-				sm.logger.LogError(process.Info.ID, "system", "Max reconnection attempts reached, giving up")
-				process.shouldReconnect = false
-				process.Info.Status = "failed"
-				process.mutex.Unlock()
-				break
-			}
-
-			process.reconnectCount++
-			delay := time.Duration(process.reconnectCount) * reconnectDelay
-			if delay > maxReconnectDelay {
-				delay = maxReconnectDelay
-			}
-			process.Info.Status = "reconnecting"
-			process.lastReconnect = time.Now()
-			process.mutex.Unlock()
-
-			sm.logger.LogWarn(process.Info.ID, "system", fmt.Sprintf("Reconnection attempt %d/%d in %v", process.reconnectCount, maxReconnectAttempts, delay))
-			select {
-			case <-time.After(delay):
-			case <-process.Done:
-			}
-			continue
-		}
-
-		// Monitor the process
-		sm.monitorSingleProcess(process)
-
-		// Check if we should reconnect
-		process.mutex.Lock()
-		shouldContinue := process.shouldReconnect && process.reconnectCount < maxReconnectAttempts
-
-		if !shouldContinue && process.shouldReconnect {
+		failures := process.reconnectCount
+		if failures >= maxReconnectAttempts {
+			process.shouldReconnect = false
 			process.Info.Status = "failed"
-			sm.logger.LogError(process.Info.ID, "system", "Max reconnection attempts reached after process failures, giving up")
-		} else if shouldContinue {
-			process.Info.Status = "reconnecting"
+			process.mutex.Unlock()
+			sm.logger.LogError(process.Info.ID, "system", "Maximum reconnection attempts reached; stream stopped")
+			return
 		}
+		delay := reconnectBackoff(failures)
+		process.Info.Status = "reconnecting"
 		process.mutex.Unlock()
 
-		if !shouldContinue {
-			break
-		}
-
-		// Brief delay before reconnecting
+		sm.logger.LogWarn(process.Info.ID, "system", fmt.Sprintf("Reconnection attempt %d/%d in %s", failures, maxReconnectAttempts, delay))
+		timer := time.NewTimer(delay)
 		select {
-		case <-time.After(reconnectDelay):
+		case <-timer.C:
 		case <-process.Done:
+			timer.Stop()
+			return
 		}
 	}
-
-	// Cleanup when done
-	process.closed.Do(func() {
-		close(process.Done)
-	})
 }
 
 // startFFmpegProcess starts a new FFmpeg process for the given stream
@@ -228,7 +251,7 @@ func (sm *Manager) startFFmpegProcess(process *Process, hlsDir string) error {
 	}
 
 	// Log the FFmpeg command
-	args := process.Command.Args[1:] // Skip the "ffmpeg" part
+	args := sanitizeFFmpegArgs(process.Command.Args[1:])
 	cmdStr := fmt.Sprintf("ffmpeg %s", strings.Join(args, " "))
 	sm.logger.LogInfo(process.Info.ID, "system", fmt.Sprintf("Starting FFmpeg: %s", cmdStr))
 	log.Printf("Starting stream %s with command: %s", process.Info.ID, cmdStr)
@@ -238,7 +261,9 @@ func (sm *Manager) startFFmpegProcess(process *Process, hlsDir string) error {
 		return fmt.Errorf("failed to start FFmpeg: %v", err)
 	}
 
+	process.mutex.Lock()
 	process.Info.Status = "running"
+	process.mutex.Unlock()
 	sm.logger.LogInfo(process.Info.ID, "system", "FFmpeg process started successfully")
 
 	// Start monitoring in goroutines
@@ -255,8 +280,8 @@ func (sm *Manager) monitorPipes(process *Process, stdoutPipe, stderrPipe io.Read
 		scanner := bufio.NewScanner(stdoutPipe)
 		for scanner.Scan() {
 			line := scanner.Text()
-			if line != "" {
-				sm.logger.LogDebug(process.Info.ID, "ffmpeg_stdout", line)
+			if line != "" && shouldLogFFmpegLine(line) {
+				sm.logger.LogInfo(process.Info.ID, "ffmpeg_stdout", line)
 				sm.broadcastLog(models.LogEntry{
 					StreamID: process.Info.ID,
 					Message:  fmt.Sprintf("stdout: %s", line),
@@ -303,31 +328,6 @@ func (sm *Manager) monitorPipes(process *Process, stdoutPipe, stderrPipe io.Read
 	}()
 }
 
-// monitorSingleProcess monitors a single FFmpeg process instance
-func (sm *Manager) monitorSingleProcess(process *Process) {
-	if err := process.Command.Wait(); err != nil {
-		sm.logger.LogError(process.Info.ID, "system", fmt.Sprintf("FFmpeg process exited with error: %v", err))
-		log.Printf("Stream %s: FFmpeg exited with error: %v", process.Info.ID, err)
-
-		// Reset reconnect count on successful periods, otherwise increment to prevent infinite loops
-		process.mutex.Lock()
-		if time.Since(process.lastReconnect) > 30*time.Second {
-			process.reconnectCount = 0 // Reset if stream ran stably for a while
-		} else {
-			process.reconnectCount++ // Increment penalty for quick failure
-		}
-		process.mutex.Unlock()
-	} else {
-		sm.logger.LogInfo(process.Info.ID, "system", "FFmpeg process completed normally")
-		log.Printf("Stream %s: FFmpeg completed normally", process.Info.ID)
-
-		// Reset reconnect count on normal completion
-		process.mutex.Lock()
-		process.reconnectCount = 0
-		process.mutex.Unlock()
-	}
-}
-
 // determineLogLevel determines the log level based on FFmpeg output content
 func determineLogLevel(line string) logger.LogLevel {
 	lowerLine := strings.ToLower(line)
@@ -336,7 +336,9 @@ func determineLogLevel(line string) logger.LogLevel {
 	if strings.Contains(lowerLine, "error") ||
 		strings.Contains(lowerLine, "failed") ||
 		strings.Contains(lowerLine, "cannot") ||
-		strings.Contains(lowerLine, "unable") {
+		strings.Contains(lowerLine, "unable") ||
+		strings.Contains(lowerLine, "timed out") ||
+		strings.Contains(lowerLine, "connection refused") {
 		return logger.ERROR
 	}
 
@@ -366,7 +368,9 @@ func shouldLogFFmpegLine(line string) bool {
 	if strings.Contains(lowerLine, "error") ||
 		strings.Contains(lowerLine, "failed") ||
 		strings.Contains(lowerLine, "warning") ||
-		strings.Contains(lowerLine, "deprecated") {
+		strings.Contains(lowerLine, "deprecated") ||
+		strings.Contains(lowerLine, "timed out") ||
+		strings.Contains(lowerLine, "connection refused") {
 		return true
 	}
 
@@ -379,13 +383,8 @@ func shouldLogFFmpegLine(line string) bool {
 		return true
 	}
 
-	// Skip noisy frame progress messages (optional - set to true if you want them)
-	if strings.Contains(lowerLine, "frame=") && strings.Contains(lowerLine, "fps=") {
-		return false // Change to true if you want progress messages
-	}
-
-	// Log everything else by default
-	return true
+	// Drop banners, library versions, progress, and other routine chatter.
+	return false
 }
 
 // StopStream stops a stream by its ID

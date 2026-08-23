@@ -18,6 +18,9 @@ const (
 	INFO
 	WARN
 	ERROR
+
+	defaultMaxRows       = 100000
+	defaultPruneInterval = 1000
 )
 
 // StreamLog represents a log entry in the database
@@ -32,12 +35,19 @@ type StreamLog struct {
 
 // Logger handles database logging
 type Logger struct {
-	db    *sql.DB
-	mutex sync.Mutex
+	db            *sql.DB
+	mutex         sync.Mutex
+	maxRows       int
+	pruneInterval int
+	writes        int
 }
 
-// NewLogger creates a new logger and initializes the database
+// NewLogger creates a new logger and initializes the database.
 func NewLogger(dbPath string) (*Logger, error) {
+	return newLogger(dbPath, defaultMaxRows, defaultPruneInterval)
+}
+
+func newLogger(dbPath string, maxRows, pruneInterval int) (*Logger, error) {
 	// Enable WAL mode and shared cache to massively accelerate concurrent read/writes
 	dsn := fmt.Sprintf("%s?cache=shared&mode=rwc&_journal_mode=WAL&_busy_timeout=5000", dbPath)
 	db, err := sql.Open("sqlite3", dsn)
@@ -56,10 +66,24 @@ func NewLogger(dbPath string) (*Logger, error) {
         message TEXT
     );`
 	if _, err := db.Exec(query); err != nil {
+		db.Close()
 		return nil, fmt.Errorf("failed to create table: %w", err)
 	}
-
-	return &Logger{db: db}, nil
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_stream_logs_stream_time ON stream_logs(stream_id, timestamp DESC)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to create stream log index: %w", err)
+	}
+	if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS idx_stream_logs_time ON stream_logs(timestamp DESC)`); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to create log time index: %w", err)
+	}
+	if maxRows < 1 {
+		maxRows = defaultMaxRows
+	}
+	if pruneInterval < 1 {
+		pruneInterval = defaultPruneInterval
+	}
+	return &Logger{db: db, maxRows: maxRows, pruneInterval: pruneInterval}, nil
 }
 
 // Close closes the database connection
@@ -71,11 +95,24 @@ func (l *Logger) Close() {
 
 // log inserts a new log entry into the database
 func (l *Logger) log(streamID string, level LogLevel, source, message string) {
-	// Database/sql handles its own concurrency cleanly, no global lock needed
+	l.mutex.Lock()
+	defer l.mutex.Unlock()
+
 	query := `INSERT INTO stream_logs (stream_id, timestamp, level, source, message) VALUES (?, ?, ?, ?, ?)`
-	_, err := l.db.Exec(query, streamID, time.Now(), level, source, message)
-	if err != nil {
+	if _, err := l.db.Exec(query, streamID, time.Now(), level, source, message); err != nil {
 		log.Printf("Failed to insert log into database: %v", err)
+		return
+	}
+	l.writes++
+	if l.writes%l.pruneInterval == 0 {
+		l.pruneLocked()
+	}
+}
+
+func (l *Logger) pruneLocked() {
+	query := `DELETE FROM stream_logs WHERE id <= (SELECT COALESCE(MAX(id) - ?, 0) FROM stream_logs)`
+	if _, err := l.db.Exec(query, l.maxRows); err != nil {
+		log.Printf("Failed to prune old log entries: %v", err)
 	}
 }
 
