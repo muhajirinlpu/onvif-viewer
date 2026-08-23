@@ -25,31 +25,113 @@
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
   <!-- Add Fontawesome for better icons -->
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+
+  <style>
+    :root { color-scheme: light dark; --accent:#5e6ad2; --accent-hover:#7170ff; }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body { margin:0; font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; font-feature-settings:"cv01","ss03"; }
+    body.modal-open { overflow:hidden; }
+    button,input,select { min-height:44px; }
+    button:focus-visible,input:focus-visible,select:focus-visible { outline:2px solid #7170ff; outline-offset:2px; }
+    .app-shell { min-height:100dvh; background:radial-gradient(circle at 10% 0%,rgba(94,106,210,.12),transparent 30%),#f8fafc; padding:16px; }
+    .dark .app-shell { background:radial-gradient(circle at 10% 0%,rgba(94,106,210,.16),transparent 30%),#08090a; }
+    .page-container { width:min(100%,1280px); margin-inline:auto; }
+    .topbar { display:flex; align-items:center; justify-content:space-between; gap:20px; padding:16px 18px; border:1px solid rgba(148,163,184,.25); border-radius:16px; background:rgba(255,255,255,.88); backdrop-filter:blur(18px); box-shadow:0 10px 35px rgba(15,23,42,.07); }
+    .dark .topbar { background:rgba(15,16,17,.88); border-color:rgba(255,255,255,.08); box-shadow:0 10px 35px rgba(0,0,0,.28); }
+    .brand-block { display:flex; align-items:center; gap:12px; min-width:0; }
+    .brand-copy { min-width:0; }
+    .brand-copy h1 { letter-spacing:-.04em; line-height:1.1; }
+    .topbar-actions { display:flex; align-items:center; justify-content:flex-end; gap:10px; flex-wrap:nowrap; }
+    .toolbar-button { white-space:nowrap; min-height:44px; }
+    .stream-metric { display:flex; align-items:center; gap:9px; min-height:44px; padding:6px 10px; border-radius:10px; background:rgba(148,163,184,.1); }
+    .dashboard-grid { display:grid; grid-template-columns:minmax(0,1fr) 360px; align-items:start; gap:20px; margin-top:20px; }
+    .primary-column,.diagnostics-column { display:flex; flex-direction:column; gap:20px; min-width:0; }
+    .panel { border:1px solid rgba(148,163,184,.24); border-radius:16px; background:rgba(255,255,255,.9); box-shadow:0 8px 30px rgba(15,23,42,.06); overflow:hidden; }
+    .dark .panel { background:rgba(15,16,17,.92); border-color:rgba(255,255,255,.08); box-shadow:0 8px 30px rgba(0,0,0,.25); }
+    .panel-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:18px 20px; border-bottom:1px solid rgba(148,163,184,.18); }
+    .panel-title { display:flex; align-items:center; gap:10px; min-width:0; }
+    .stream-card { border:1px solid rgba(148,163,184,.22); border-radius:14px; padding:16px; background:rgba(148,163,184,.045); }
+    .stream-card-header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
+    .stream-identity { min-width:0; }
+    .stream-identity h3 { overflow-wrap:anywhere; }
+    .stream-actions { display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:8px; }
+    .video-container { position:relative; display:flex; align-items:center; justify-content:center; width:100%; margin-top:16px; overflow:hidden; border-radius:12px; background:#000; }
+    .video-container video { object-fit:contain; background:#000; }
+    .logs-console { min-height:220px; max-height:50dvh; overflow:auto; }
+    .modal-overlay { position:fixed; inset:0; z-index:100; display:flex; align-items:center; justify-content:center; padding:16px; background:rgba(2,6,23,.72); backdrop-filter:blur(8px); }
+    .modal-shell { display:flex; flex-direction:column; width:min(100%,560px); max-height:calc(100dvh - 32px); overflow:hidden; border:1px solid rgba(255,255,255,.1); border-radius:18px; background:#fff; box-shadow:0 30px 90px rgba(0,0,0,.4); }
+    .dark .modal-shell { background:#0f1011; }
+    .modal-header { flex:0 0 auto; display:flex; align-items:center; justify-content:space-between; gap:12px; padding:16px 20px; border-bottom:1px solid rgba(148,163,184,.2); }
+    .modal-body { flex:1 1 auto; min-height:0; overflow-y:auto; padding:20px; }
+    .modal-footer { flex:0 0 auto; display:flex; gap:10px; padding:14px 20px calc(14px + env(safe-area-inset-bottom)); border-top:1px solid rgba(148,163,184,.2); background:rgba(248,250,252,.96); }
+    .dark .modal-footer { background:rgba(15,16,17,.98); }
+    .mobile-fab { display:none; }
+    .footer-shell { padding:28px 16px; text-align:center; }
+    @media (max-width: 1023px) {
+      .dashboard-grid { grid-template-columns:1fr; }
+      .diagnostics-column { order:2; }
+      .topbar { align-items:flex-start; flex-direction:column; }
+      .topbar-actions { width:100%; justify-content:flex-start; flex-wrap:wrap; }
+    }
+    @media (max-width: 767px) {
+      .app-shell { padding:10px; }
+      .topbar { padding:14px; align-items:center; flex-direction:row; }
+      .topbar-actions { width:auto; margin-left:auto; justify-content:flex-end; flex-wrap:nowrap; }
+      .brand-copy p { display:none; }
+      .brand-copy h1 { font-size:1.05rem; }
+      .topbar-actions { gap:8px; flex-wrap:nowrap; }
+      .theme-control,.stream-metric,.refresh-label,.settings-label { display:none!important; }
+      .toolbar-button { width:44px; padding:0!important; justify-content:center; }
+      .dashboard-grid { margin-top:12px; gap:12px; }
+      .primary-column,.diagnostics-column { gap:12px; }
+      .panel { border-radius:14px; }
+      .panel-heading { padding:15px; }
+      .panel-body { padding:15px!important; }
+      .stream-card { padding:14px; }
+      .stream-card-header { flex-direction:column; align-items:stretch; }
+      .stream-actions { justify-content:stretch; }
+      .stream-actions>button { flex:1; }
+      .size-selector { order:3; width:100%; justify-content:center; }
+      .modal-overlay { align-items:flex-end; padding:0; }
+      .modal-shell { width:100%; max-height:94dvh; border-radius:18px 18px 0 0; border-bottom:0; }
+      .modal-body { padding:16px; }
+      .modal-footer { padding:12px 16px calc(12px + env(safe-area-inset-bottom)); }
+      .modal-footer button { flex:1; }
+      .logs-toolbar { align-items:stretch!important; flex-direction:column; gap:10px; }
+      .logs-toolbar>div { justify-content:space-between; }
+      .footer-shell { padding-bottom:90px; }
+      .mobile-fab { display:flex; }
+    }
+    @media (max-width: 420px) {
+      .brand-icon { width:36px!important; height:36px!important; margin-right:0!important; }
+      .topbar-actions { gap:6px; }
+      .stream-actions { display:grid; grid-template-columns:1fr 1fr; }
+      .size-selector { grid-column:1/-1; }
+    }
+  </style>
 </head>
 
-<body class="bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-200 transition-colors duration-200">
-  <div id="app" class="min-h-screen p-2 md:p-4">
+<body class="bg-slate-50 dark:bg-slate-950 text-slate-800 dark:text-slate-200 transition-colors duration-200">
+  <div id="app" class="app-shell">
     <!-- Header -->
-    <header class="w-full max-w-7xl mx-auto mb-6">
-      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-sm rounded-xl p-6">
-        <div class="flex flex-col md:flex-row items-center justify-between">
-          <div class="mb-4 md:mb-0">
-            <div class="flex items-center mb-2">
+    <header class="page-container">
+      <div class="topbar">
+          <div class="brand-block">
               <div
-                class="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-slate-100 dark:bg-slate-700 mr-3 bg-gradient-to-br from-blue-500 to-purple-600 shadow-md text-white">
+                class="brand-icon inline-flex items-center justify-center w-10 h-10 rounded-lg bg-slate-100 dark:bg-slate-700 mr-3 bg-gradient-to-br from-blue-500 to-purple-600 shadow-md text-white">
                 <i class="fas fa-video text-white"></i>
               </div>
-              <div>
-                <h1 class="text-2xl font-bold text-primary">ONVIF Camera Viewer</h1>
+              <div class="brand-copy">
+                <h1 class="text-2xl font-semibold text-primary">ONVIF Camera Viewer</h1>
                 <p class="text-sm text-slate-500 dark:text-slate-400">Stream and manage IP cameras via ONVIF protocol
                 </p>
               </div>
             </div>
-          </div>
 
-          <div class="flex items-center space-x-4">
+          <div class="topbar-actions">
             <!-- Theme Selector -->
-            <div class="flex items-center space-x-3">
+            <div class="theme-control flex items-center space-x-3">
               <span class="text-sm text-slate-500 dark:text-slate-400">Theme</span>
               <div
                 class="flex items-center bg-slate-100 dark:bg-slate-800 rounded-full p-1 border border-slate-200 dark:border-slate-700">
@@ -78,15 +160,15 @@
             </div>
 
             <!-- Settings Button -->
-            <button @click="toggleConfigPanel"
-              class="bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-600 hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors px-4 py-2 rounded-lg flex items-center gap-2">
+            <button type="button" @click="toggleConfigPanel"
+              class="toolbar-button bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-600 hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors px-4 py-2 rounded-lg flex items-center gap-2">
               <i class="fas fa-cog"></i>
-              <span class="hidden sm:inline">{{ configCollapsed ? 'Settings' : 'Close' }}</span>
+              <span class="settings-label">{{ configCollapsed ? 'Settings' : 'Close' }}</span>
             </button>
 
             <!-- Stream Counter -->
-            <div class="flex items-center space-x-2">
-              <div class="inline-flex items-center justify-center w-10 h-10 rounded-lg bg-slate-100 dark:bg-slate-700">
+            <div class="stream-metric">
+              <div class="brand-icon inline-flex items-center justify-center w-10 h-10 rounded-lg bg-slate-100 dark:bg-slate-700">
                 <i class="fas fa-broadcast-tower text-blue-500"></i>
               </div>
               <div>
@@ -96,59 +178,54 @@
             </div>
 
             <!-- Refresh Button -->
-            <button @click="loadStreams"
-              class="bg-blue-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 shadow-sm transition-colors px-4 py-2 rounded-lg flex items-center gap-2 shadow-lg">
+            <button type="button" @click="loadStreams"
+              class="toolbar-button bg-blue-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 shadow-sm transition-colors px-4 py-2 rounded-lg flex items-center gap-2 shadow-lg">
               <i class="fas fa-sync-alt" :class="{ 'animate-spin': isRefreshing }"></i>
-              <span>Refresh</span>
+              <span class="refresh-label">Refresh</span>
             </button>
           </div>
-        </div>
       </div>
     </header>
 
-    <div class="w-full max-w-7xl mx-auto space-y-6">
+    <main class="page-container">
       <!-- Modal: Camera Configuration -->
       <div v-if="!configCollapsed"
-        class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4 backdrop-blur-sm transition-opacity"
+        class="modal-overlay"
         @click.self="toggleConfigPanel">
-        <div class="w-full max-w-md max-h-[90vh] overflow-y-auto rounded-xl shadow-2xl">
-          <div
-            class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 w-full rounded-xl overflow-hidden h-fit">
+        <div class="modal-shell" role="dialog" aria-modal="true" aria-labelledby="camera-setup-title">
             <!-- Config Header -->
-            <div class="bg-slate-100/50 dark:bg-slate-700/50 border-b border-slate-200 dark:border-slate-700 p-4">
-              <div class="flex items-center justify-between">
-                <h2 class="text-lg font-semibold flex items-center">
+            <div class="modal-header">
+                <h2 id="camera-setup-title" class="text-lg font-semibold flex items-center">
                   <i class="fas fa-cog mr-2 text-blue-500"></i>
                   Camera Setup
                 </h2>
-                <button @click="toggleConfigPanel"
+                <button type="button" @click="toggleConfigPanel" aria-label="Close camera setup"
                   class="bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-600 hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors p-2 rounded-lg">
                   <i class="fas fa-times"></i>
                 </button>
-              </div>
             </div>
 
             <!-- Config Form -->
-            <div class="p-6 space-y-6">
+            <div class="modal-body space-y-6">
               <!-- Connection Settings -->
               <div>
                 <h3 class="text-sm font-medium mb-4 text-slate-500 dark:text-slate-400">CONNECTION</h3>
                 <div class="space-y-4">
                   <div>
-                    <label class="text-sm font-medium block mb-2">Camera IP Address</label>
+                    <label for="camera-ip" class="text-sm font-medium block mb-2">Camera IP Address</label>
                     <div class="relative">
                       <i class="fas fa-network-wired absolute left-3 top-3 text-slate-500 dark:text-slate-400"></i>
-                      <input v-model="cameraIp" placeholder="192.168.0.125"
-                        class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all outline-none w-full pl-10 pr-4 py-3 rounded-lg" />
+                      <input id="camera-ip" type="text" inputmode="decimal" autocomplete="off" v-model="cameraIp" placeholder="192.168.0.125"
+                        class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all outline-none w-full pl-10 pr-4 py-3 rounded-lg">
                     </div>
                   </div>
 
                   <div>
-                    <label class="text-sm font-medium block mb-2">Port</label>
+                    <label for="camera-port" class="text-sm font-medium block mb-2">Port</label>
                     <div class="relative">
                       <i class="fas fa-plug absolute left-3 top-3 text-slate-500 dark:text-slate-400"></i>
-                      <input v-model="cameraPort" placeholder="8000"
-                        class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all outline-none w-full pl-10 pr-4 py-3 rounded-lg" />
+                      <input id="camera-port" type="number" inputmode="numeric" min="1" max="65535" v-model="cameraPort" placeholder="8000"
+                        class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all outline-none w-full pl-10 pr-4 py-3 rounded-lg">
                     </div>
                   </div>
                 </div>
@@ -159,23 +236,24 @@
                 <h3 class="text-sm font-medium mb-4 text-slate-500 dark:text-slate-400">AUTHENTICATION</h3>
                 <div class="space-y-4">
                   <div>
-                    <label class="text-sm font-medium block mb-2">Username</label>
+                    <label for="camera-username" class="text-sm font-medium block mb-2">Username</label>
                     <div class="relative">
                       <i class="fas fa-user absolute left-3 top-3 text-slate-500 dark:text-slate-400"></i>
-                      <input v-model="username" placeholder="admin"
-                        class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all outline-none w-full pl-10 pr-4 py-3 rounded-lg" />
+                      <input id="camera-username" type="text" autocomplete="username" v-model="username" placeholder="admin"
+                        class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all outline-none w-full pl-10 pr-4 py-3 rounded-lg">
                     </div>
                   </div>
 
                   <div>
-                    <label class="text-sm font-medium block mb-2">Password</label>
+                    <label for="camera-password" class="text-sm font-medium block mb-2">Password</label>
                     <div class="flex space-x-2">
                       <div class="relative flex-1">
                         <i class="fas fa-lock absolute left-3 top-3 text-slate-500 dark:text-slate-400"></i>
-                        <input v-model="password" :type="showPassword ? 'text' : 'password'" placeholder="••••••••"
-                          class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all outline-none w-full pl-10 pr-4 py-3 rounded-lg" />
+                        <input id="camera-password" type="password" v-model="password" :type="showPassword ? 'text' : 'password'" autocomplete="current-password" placeholder="••••••••"
+                          class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all outline-none w-full pl-10 pr-4 py-3 rounded-lg">
                       </div>
-                      <button @click="showPassword = !showPassword"
+                      <!-- [html-validate-disable-next text-content -- Vue supplies the accessible name dynamically] -->
+                      <button type="button" @click="showPassword = !showPassword" :aria-label="showPassword ? 'Hide password' : 'Show password'" :aria-pressed="showPassword"
                         class="bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-600 hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors p-3 rounded-lg">
                         <i :class="showPassword ? 'fas fa-eye-slash' : 'fas fa-eye'"></i>
                       </button>
@@ -184,18 +262,10 @@
                 </div>
               </div>
 
-              <!-- Actions -->
-              <div class="pt-4 border-t border-t border-slate-200 dark:border-slate-700">
-                <button @click="fetchStreamUri" :disabled="isProcessing"
-                  class="bg-blue-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 shadow-sm transition-colors w-full py-3 rounded-lg font-medium flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed">
-                  <span v-if="isProcessing"
-                    class="animate-spin inline-block w-5 h-5 border-2 border-slate-200 border-t-blue-500 rounded-full mr-2"></span>
-                  <i v-else class="fas fa-play mr-2"></i>
-                  <span>{{ isProcessing ? 'Connecting...' : 'Start Stream' }}</span>
-                </button>
-
-                <button @click="showAdvanced = !showAdvanced"
-                  class="bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-600 hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors w-full mt-3 py-3 rounded-lg font-medium flex items-center justify-center">
+              <!-- Advanced toggle -->
+              <div class="pt-4 border-t border-slate-200 dark:border-slate-700">
+                <button type="button" @click="showAdvanced = !showAdvanced" :aria-expanded="showAdvanced" aria-controls="advanced-options"
+                  class="bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-600 hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors w-full py-3 rounded-lg font-medium flex items-center justify-center">
                   <i class="fas fa-cogs mr-2"></i>
                   <span>Advanced Options</span>
                   <i :class="['fas fa-chevron-down ml-2 transition-transform', { 'rotate-180': showAdvanced }]"></i>
@@ -203,10 +273,10 @@
               </div>
 
               <!-- Advanced Options -->
-              <div v-if="showAdvanced" class="pt-4 border-t space-y-4 border-t border-slate-200 dark:border-slate-700">
+              <div id="advanced-options" v-if="showAdvanced" class="pt-4 border-t space-y-4 border-slate-200 dark:border-slate-700">
                 <div>
-                  <label class="text-sm font-medium block mb-2">ONVIF Function</label>
-                  <select v-model="func"
+                  <label for="onvif-function" class="text-sm font-medium block mb-2">ONVIF Function</label>
+                  <select id="onvif-function" v-model="func"
                     class="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-600 text-slate-900 dark:text-slate-100 focus:border-blue-500 focus:ring-2 focus:ring-blue-500/20 transition-all outline-none w-full px-4 py-3 rounded-lg">
                     <option value="">Select Function</option>
                     <option value="GetCapabilities">GetCapabilities</option>
@@ -216,7 +286,7 @@
                   </select>
                 </div>
 
-                <button @click="fetchDebug" :disabled="!func || isProcessing"
+                <button type="button" @click="fetchDebug" :disabled="!func || isProcessing"
                   class="bg-blue-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 shadow-sm transition-colors w-full py-3 rounded-lg font-medium disabled:opacity-50 disabled:cursor-not-allowed">
                   <i class="fas fa-terminal mr-2"></i>
                   Execute Function
@@ -231,51 +301,167 @@
                 </div>
               </div>
             </div>
+            <div class="modal-footer">
+              <button type="button" @click="toggleConfigPanel" class="bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-5 py-3 rounded-lg font-medium">Cancel</button>
+              <button type="button" @click="fetchStreamUri" :disabled="isProcessing"
+                class="bg-indigo-600 text-white hover:bg-indigo-500 px-5 py-3 rounded-lg font-medium flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed">
+                <span v-if="isProcessing" class="animate-spin inline-block w-5 h-5 border-2 border-white/30 border-t-white rounded-full mr-2"></span>
+                <i v-else class="fas fa-play mr-2"></i>
+                <span>{{ isProcessing ? 'Connecting...' : 'Start Stream' }}</span>
+              </button>
+            </div>
           </div>
         </div>
-      </div>
 
       <!-- Main Content Area -->
-      <div class="space-y-6">
-        <!-- Logs Panel -->
-        <div
-          class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-sm rounded-xl overflow-hidden">
-          <div
-            class="bg-slate-100/50 dark:bg-slate-700/50 border-b border-slate-200 dark:border-slate-700 p-4 cursor-pointer"
-            @click="toggleLogsPanel">
-            <div class="flex items-center justify-between">
-              <div class="flex items-center">
-                <i class="fas fa-terminal mr-2 text-amber-500"></i>
-                <h2 class="text-lg font-semibold">System Logs</h2>
-                <div v-if="logConnectionStatus === 'connected'"
-                  class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-emerald-100/50 dark:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 ml-3">
-                  <div class="w-2 h-2 rounded-full bg-current animate-pulse"></div>
-                  LIVE
+      <div class="dashboard-grid">
+        <section class="primary-column">
+        <!-- Active Streams -->
+        <div class="panel">
+          <div class="panel-heading">
+            <h2 class="panel-title text-xl font-semibold">
+              <i class="fas fa-camera mr-2 text-blue-500"></i>
+              Active Streams
+            </h2>
+            <span
+              class="text-sm px-3 py-1 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400">
+              {{ streams.length }} running
+            </span>
+          </div>
+
+          <div v-if="streams.length" class="panel-body p-5 space-y-4">
+            <div v-for="stream in streams" :key="stream.id"
+              class="stream-card">
+              <div class="stream-card-header">
+                <div class="stream-identity">
+                  <div class="flex items-center gap-2 mb-1"><span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span><span class="text-xs uppercase tracking-wide text-emerald-600 dark:text-emerald-400">Running</span></div>
+                  <h3 class="font-semibold">{{ stream.id }}</h3>
+                  <p class="text-sm text-slate-500 dark:text-slate-400">
+                    Started: {{ new Date(stream.startedAt).toLocaleString() }}
+                  </p>
                 </div>
-                <div v-else-if="logConnectionStatus === 'connecting'"
-                  class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-amber-100/50 dark:bg-amber-500/20 text-amber-600 dark:text-amber-400 ml-3">
-                  <div class="w-2 h-2 rounded-full bg-current animate-pulse"></div>
-                  CONNECTING
-                </div>
-                <div v-else
-                  class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-red-100/50 dark:bg-red-500/20 text-red-600 dark:text-red-400 ml-3">
-                  <div class="w-2 h-2 rounded-full bg-current"></div>
-                  OFFLINE
+                <div class="stream-actions">
+                  <!-- Video Size Selector -->
+                  <div v-if="stream.showVideo"
+                    class="size-selector flex gap-1 bg-slate-100 dark:bg-slate-800 rounded-lg p-1 border border-slate-200 dark:border-slate-700">
+                    <div
+                      class="px-2 py-1 rounded cursor-pointer text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 transition-all"
+                      :class="{ 'bg-blue-500 text-white shadow-sm hover:text-white dark:hover:text-white': stream.videoSize === 'small' }"
+                      @click="setVideoSize(stream, 'small')">S</div>
+                    <div
+                      class="px-2 py-1 rounded cursor-pointer text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 transition-all"
+                      :class="{ 'bg-blue-500 text-white shadow-sm hover:text-white dark:hover:text-white': stream.videoSize === 'medium' }"
+                      @click="setVideoSize(stream, 'medium')">M</div>
+                    <div
+                      class="px-2 py-1 rounded cursor-pointer text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 transition-all"
+                      :class="{ 'bg-blue-500 text-white shadow-sm hover:text-white dark:hover:text-white': stream.videoSize === 'large' }"
+                      @click="setVideoSize(stream, 'large')">L</div>
+                  </div>
+
+                  <button type="button" v-if="!stream.stopping" @click="toggleVideo(stream)"
+                    class="bg-blue-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 shadow-sm transition-colors px-4 py-2 rounded-lg">
+                    <i :class="stream.showVideo ? 'fas fa-eye-slash' : 'fas fa-eye'" class="mr-2"></i>
+                    {{ stream.showVideo ? 'Hide' : 'View' }}
+                  </button>
+                  <button type="button" @click="stopStream(stream.id)" :disabled="stream.stopping"
+                    class="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed">
+                    <i :class="stream.stopping ? 'fas fa-spinner fa-spin' : 'fas fa-stop'" class="mr-2"></i>
+                    {{ stream.stopping ? 'Stopping...' : 'Stop' }}
+                  </button>
                 </div>
               </div>
-              <i :class="['fas fa-chevron-up transition-transform', { 'rotate-180': logsCollapsed }]"></i>
+
+              <div v-if="stream.showVideo"
+                :class="['video-container', stream.videoSize === 'small' ? 'aspect-video max-h-[400px]' : stream.videoSize === 'medium' ? 'aspect-video max-h-[600px]' : stream.videoSize === 'large' ? 'aspect-video max-h-[800px]' : stream.isFullscreen ? 'fixed inset-0 w-screen h-screen z-[9999] aspect-auto max-h-none rounded-none' : 'aspect-video max-h-[600px]']">
+                <video :id="'video-' + stream.id" controls class="w-full h-full"></video>
+                <div
+                  class="absolute bottom-3 right-3 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
+                  <!-- [html-validate-disable-next text-content -- Vue supplies the accessible name dynamically] -->
+                  <button type="button"
+                    class="bg-black/70 text-white border-none rounded-lg p-2 cursor-pointer hover:bg-black/90 hover:scale-110 transition-all"
+                    @click="toggleFullscreen(stream)" :title="stream.isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'" :aria-label="stream.isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'">
+                    <i :class="stream.isFullscreen ? 'fas fa-compress' : 'fas fa-expand'"></i>
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
 
-          <div v-show="!logsCollapsed" class="transition-all duration-300">
-            <div class="p-6">
+          <div v-else class="panel-body text-center py-16 px-5">
+            <i class="fas fa-camera-slash text-6xl mb-4 text-slate-500 dark:text-slate-400"></i>
+            <h3 class="text-lg font-medium mb-2">No active streams</h3>
+            <p class="text-sm text-slate-500 dark:text-slate-400 max-w-md mx-auto">
+              Configure a camera connection to create your first secure HLS stream.
+            </p>
+            <button type="button" @click="toggleConfigPanel"
+              class="mt-5 bg-indigo-600 hover:bg-indigo-500 text-white px-5 py-3 rounded-lg font-medium inline-flex items-center justify-center gap-2">
+              <i class="fas fa-plus"></i><span>Configure Camera</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- ONVIF Response -->
+        <div v-if="response"
+          class="panel p-5">
+          <h2 class="text-xl font-bold mb-6 flex items-center">
+            <i class="fas fa-code mr-2 text-blue-500"></i>
+            ONVIF Response
+          </h2>
+
+          <div class="space-y-6">
+            <div>
+              <h3 class="text-lg font-medium mb-3">SOAP Request</h3>
+              <pre
+                class="bg-black text-gray-300 p-4 rounded-lg overflow-auto text-sm max-h-60">{{ format(response.envelope) }}</pre>
+            </div>
+
+            <div>
+              <h3 class="text-lg font-medium mb-3">SOAP Response</h3>
+              <pre
+                class="bg-black text-gray-300 p-4 rounded-lg overflow-auto text-sm max-h-96">{{ format(response.rawResponse) }}</pre>
+            </div>
+          </div>
+        </div>
+        </section>
+        <aside class="diagnostics-column">
+        <!-- Logs Panel -->
+        <div
+          class="panel">
+          <button type="button" class="panel-heading cursor-pointer w-full text-left"
+            @click="toggleLogsPanel" :aria-expanded="!logsCollapsed" aria-controls="system-logs-body">
+            <span class="flex items-center justify-between w-full">
+              <span class="flex items-center">
+                <i class="fas fa-terminal mr-2 text-amber-500"></i>
+                <span class="text-lg font-semibold">System Logs</span>
+                <span v-if="logConnectionStatus === 'connected'"
+                  class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-emerald-100/50 dark:bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 ml-3">
+                  <span class="w-2 h-2 rounded-full bg-current animate-pulse"></span>
+                  LIVE
+                </span>
+                <span v-else-if="logConnectionStatus === 'connecting'"
+                  class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-amber-100/50 dark:bg-amber-500/20 text-amber-600 dark:text-amber-400 ml-3">
+                  <span class="w-2 h-2 rounded-full bg-current animate-pulse"></span>
+                  CONNECTING
+                </span>
+                <span v-else
+                  class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-red-100/50 dark:bg-red-500/20 text-red-600 dark:text-red-400 ml-3">
+                  <span class="w-2 h-2 rounded-full bg-current"></span>
+                  OFFLINE
+                </span>
+              </span>
+              <i :class="['fas fa-chevron-up transition-transform', { 'rotate-180': logsCollapsed }]"></i>
+            </span>
+          </button>
+
+          <div id="system-logs-body" v-show="!logsCollapsed" class="transition-all duration-300">
+            <div class="panel-body p-5">
               <div v-if="streamLogs.length === 0" class="text-center py-12">
                 <i class="fas fa-info-circle text-4xl mb-4 text-slate-500 dark:text-slate-400"></i>
                 <p class="text-slate-500 dark:text-slate-400">No logs available yet</p>
               </div>
 
               <div v-else class="space-y-4">
-                <div ref="logsContainer" class="bg-black rounded-lg h-64 overflow-auto p-4 font-mono text-sm">
+                <div ref="logsContainer" class="logs-console bg-black rounded-xl p-4 font-mono text-xs leading-relaxed">
                   <div v-for="(log, index) in streamLogs" :key="index"
                     :class="{ 'text-red-400': log.message.includes('stderr:'), 'text-blue-300': log.message.includes('stdout:'), 'text-gray-300': !log.message.includes('stderr:') && !log.message.includes('stdout:') }"
                     class="mb-1">
@@ -283,8 +469,8 @@
                   </div>
                 </div>
 
-                <div class="flex items-center justify-between">
-                  <button @click="clearLogs"
+                <div class="logs-toolbar flex items-center justify-between">
+                  <button type="button" @click="clearLogs"
                     class="bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 border border-slate-200 dark:border-slate-600 hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors px-4 py-2 rounded-lg">
                     <i class="fas fa-trash-alt mr-2"></i>
                     Clear Logs
@@ -305,122 +491,22 @@
           </div>
         </div>
 
-        <!-- Active Streams -->
-        <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-sm rounded-xl p-6">
-          <div class="flex items-center justify-between mb-6">
-            <h2 class="text-xl font-bold flex items-center">
-              <i class="fas fa-camera mr-2 text-blue-500"></i>
-              Active Streams
-            </h2>
-            <span
-              class="text-sm px-3 py-1 rounded-full bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400">
-              {{ streams.length }} running
-            </span>
-          </div>
-
-          <div v-if="streams.length" class="space-y-6">
-            <div v-for="stream in streams" :key="stream.id"
-              class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-sm rounded-lg p-4">
-              <div class="flex justify-between items-center mb-4">
-                <div>
-                  <h3 class="font-semibold">{{ stream.id }}</h3>
-                  <p class="text-sm text-slate-500 dark:text-slate-400">
-                    Started: {{ new Date(stream.startedAt).toLocaleString() }}
-                  </p>
-                </div>
-                <div class="flex items-center space-x-2">
-                  <!-- Video Size Selector -->
-                  <div v-if="stream.showVideo"
-                    class="flex gap-1 bg-slate-100 dark:bg-slate-800 rounded-lg p-1 border border-slate-200 dark:border-slate-700">
-                    <div
-                      class="px-2 py-1 rounded cursor-pointer text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 transition-all"
-                      :class="{ 'bg-blue-500 text-white shadow-sm hover:text-white dark:hover:text-white': stream.videoSize === 'small' }"
-                      @click="setVideoSize(stream, 'small')">S</div>
-                    <div
-                      class="px-2 py-1 rounded cursor-pointer text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 transition-all"
-                      :class="{ 'bg-blue-500 text-white shadow-sm hover:text-white dark:hover:text-white': stream.videoSize === 'medium' }"
-                      @click="setVideoSize(stream, 'medium')">M</div>
-                    <div
-                      class="px-2 py-1 rounded cursor-pointer text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 transition-all"
-                      :class="{ 'bg-blue-500 text-white shadow-sm hover:text-white dark:hover:text-white': stream.videoSize === 'large' }"
-                      @click="setVideoSize(stream, 'large')">L</div>
-                  </div>
-
-                  <button v-if="!stream.stopping" @click="toggleVideo(stream)"
-                    class="bg-blue-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 shadow-sm transition-colors px-4 py-2 rounded-lg">
-                    <i :class="stream.showVideo ? 'fas fa-eye-slash' : 'fas fa-eye'" class="mr-2"></i>
-                    {{ stream.showVideo ? 'Hide' : 'View' }}
-                  </button>
-                  <button @click="stopStream(stream.id)" :disabled="stream.stopping"
-                    class="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed">
-                    <i :class="stream.stopping ? 'fas fa-spinner fa-spin' : 'fas fa-stop'" class="mr-2"></i>
-                    {{ stream.stopping ? 'Stopping...' : 'Stop' }}
-                  </button>
-                </div>
-              </div>
-
-              <div v-if="stream.showVideo"
-                :class="['video-container', stream.videoSize === 'small' ? 'aspect-video max-h-[400px]' : stream.videoSize === 'medium' ? 'aspect-video max-h-[600px]' : stream.videoSize === 'large' ? 'aspect-video max-h-[800px]' : stream.isFullscreen ? 'fixed inset-0 w-screen h-screen z-[9999] aspect-auto max-h-none rounded-none' : 'aspect-video max-h-[600px]']">
-                <video :id="'video-' + stream.id" controls class="w-full h-full"></video>
-                <div
-                  class="absolute bottom-3 right-3 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
-                  <button
-                    class="bg-black/70 text-white border-none rounded-lg p-2 cursor-pointer hover:bg-black/90 hover:scale-110 transition-all"
-                    @click="toggleFullscreen(stream)" :title="stream.isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'">
-                    <i :class="stream.isFullscreen ? 'fas fa-compress' : 'fas fa-expand'"></i>
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div v-else class="text-center py-16">
-            <i class="fas fa-camera-slash text-6xl mb-4 text-slate-500 dark:text-slate-400"></i>
-            <h3 class="text-lg font-medium mb-2">No active streams</h3>
-            <p class="text-sm text-slate-500 dark:text-slate-400">
-              Configure your camera settings and click "Start Stream" to begin
-            </p>
-          </div>
-        </div>
-
-        <!-- ONVIF Response -->
-        <div v-if="response"
-          class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 shadow-sm rounded-xl p-6">
-          <h2 class="text-xl font-bold mb-6 flex items-center">
-            <i class="fas fa-code mr-2 text-blue-500"></i>
-            ONVIF Response
-          </h2>
-
-          <div class="space-y-6">
-            <div>
-              <h3 class="text-lg font-medium mb-3">SOAP Request</h3>
-              <pre
-                class="bg-black text-gray-300 p-4 rounded-lg overflow-auto text-sm max-h-60">{{ format(response.envelope) }}</pre>
-            </div>
-
-            <div>
-              <h3 class="text-lg font-medium mb-3">SOAP Response</h3>
-              <pre
-                class="bg-black text-gray-300 p-4 rounded-lg overflow-auto text-sm max-h-96">{{ format(response.rawResponse) }}</pre>
-            </div>
-          </div>
-        </div>
+        </aside>
       </div>
-    </div>
+    </main>
 
     <!-- Floating Action Button -->
-    <button v-if="configCollapsed" @click="toggleConfigPanel"
-      class="fixed bottom-6 right-6 z-40 bg-blue-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 shadow-xl transition-transform hover:scale-105 p-4 rounded-full">
+    <button type="button" v-if="configCollapsed" @click="toggleConfigPanel" aria-label="Open camera settings"
+      class="mobile-fab fixed bottom-5 right-5 z-40 items-center justify-center w-14 h-14 bg-indigo-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 shadow-xl transition-transform hover:scale-105 p-4 rounded-full">
       <i class="fas fa-cog text-xl"></i>
     </button>
   </div>
 
   <!-- Footer -->
-  <footer
-    class="w-full max-w-7xl mx-auto mt-12 pt-8 border-t text-center border-t border-slate-200 dark:border-slate-700">
+  <footer class="footer-shell page-container border-t border-slate-200 dark:border-white/10">
     <div class="text-slate-500 dark:text-slate-400">
-      <p class="text-sm">&copy; 2025 ONVIF Camera Viewer</p>
-      <p class="text-xs mt-1">Professional IP camera streaming solution</p>
+      <p class="text-sm">&copy; 2026 ONVIF Camera Viewer</p>
+      <p class="text-xs mt-1">Local ONVIF diagnostics and low-overhead HLS streaming</p>
     </div>
   </footer>
   <script type="module">
@@ -454,6 +540,8 @@
         const logsCollapsed = ref(true);
         const logsContainer = ref(null);
         let eventSource = null;
+        let modalTrigger = null;
+        let modalKeydownHandler = null;
 
         // Enhanced theme functions
         const setTheme = (mode) => {
@@ -542,10 +630,67 @@
           });
         };
 
-        const toggleConfigPanel = () => {
-          configCollapsed.value = !configCollapsed.value;
+        const getFocusableElements = () => {
+          const dialog = document.querySelector('.modal-shell');
+          if (!dialog) return [];
+          return [...dialog.querySelectorAll('button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])')];
+        };
+
+        const closeConfigPanel = () => {
+          configCollapsed.value = true;
+          localStorage.setItem('configCollapsed', 'true');
+        };
+
+        const toggleConfigPanel = (event) => {
+          if (configCollapsed.value) {
+            modalTrigger = event?.currentTarget || document.activeElement;
+            configCollapsed.value = false;
+          } else {
+            closeConfigPanel();
+          }
           localStorage.setItem('configCollapsed', configCollapsed.value.toString());
         };
+
+        watch(configCollapsed, async (collapsed) => {
+          document.body.classList.toggle('modal-open', !collapsed);
+          const pageContent = document.querySelectorAll('#app > header, #app > main > .dashboard-grid');
+          pageContent.forEach(element => {
+            if (collapsed) element.removeAttribute('inert');
+            else element.setAttribute('inert', '');
+          });
+
+          if (!collapsed) {
+            await nextTick();
+            const focusable = getFocusableElements();
+            const primaryField = document.getElementById('camera-ip');
+            (primaryField || focusable[0])?.focus();
+            modalKeydownHandler = (event) => {
+              if (event.key === 'Escape') {
+                event.preventDefault();
+                closeConfigPanel();
+                return;
+              }
+              if (event.key !== 'Tab') return;
+              const items = getFocusableElements();
+              if (!items.length) return;
+              const first = items[0];
+              const last = items[items.length - 1];
+              if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault();
+                last.focus();
+              } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault();
+                first.focus();
+              }
+            };
+            document.addEventListener('keydown', modalKeydownHandler);
+          } else {
+            if (modalKeydownHandler) document.removeEventListener('keydown', modalKeydownHandler);
+            modalKeydownHandler = null;
+            modalTrigger?.focus?.();
+            modalTrigger = null;
+          }
+        });
 
         const toggleLogsPanel = () => {
           logsCollapsed.value = !logsCollapsed.value;
@@ -586,6 +731,7 @@
           document.addEventListener('msfullscreenchange', handleFullscreenChange);
 
           connectToLogEvents();
+          document.body.classList.toggle('modal-open', !configCollapsed.value);
         });
 
         const saveSettings = () => {
@@ -630,8 +776,7 @@
             await startStream(rtspUrl);
 
             // Close the config modal automatically on success
-            configCollapsed.value = true;
-            localStorage.setItem('configCollapsed', 'true');
+            closeConfigPanel();
 
           } catch (err) {
             error.value = err.message;
