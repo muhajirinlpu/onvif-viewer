@@ -57,6 +57,32 @@ func (h *Handler) StartStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Snapshot returns one current JPEG frame from an active HLS stream.
+func (h *Handler) Snapshot(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	streamID := r.URL.Query().Get("id")
+	if streamID == "" {
+		http.Error(w, "missing stream ID", http.StatusBadRequest)
+		return
+	}
+
+	jpeg, err := h.streamManager.Snapshot(streamID)
+	if err != nil {
+		h.logger.LogError(streamID, "snapshot", fmt.Sprintf("Failed to capture snapshot: %v", err))
+		http.Error(w, "snapshot unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(jpeg)))
+	_, _ = w.Write(jpeg)
+}
+
 // StopStream handles stream stop requests
 func (h *Handler) StopStream(w http.ResponseWriter, r *http.Request) {
 	streamID := r.URL.Query().Get("id")
