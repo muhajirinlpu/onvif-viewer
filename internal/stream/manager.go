@@ -48,6 +48,7 @@ type Manager struct {
 	stopCleanup   chan struct{}
 	hlsBaseDir    string
 	logger        *logger.Logger
+	snapshotSem   chan struct{}
 }
 
 // NewManager creates a new stream manager
@@ -59,6 +60,7 @@ func NewManager(hlsBaseDir string, logger *logger.Logger) *Manager {
 		stopCleanup:   make(chan struct{}),
 		hlsBaseDir:    hlsBaseDir,
 		logger:        logger,
+		snapshotSem:   make(chan struct{}, 1),
 	}
 }
 

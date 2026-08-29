@@ -18,6 +18,13 @@ import (
 //go:embed static
 var staticFiles embed.FS
 
+func listenAddress() string {
+	if address := os.Getenv("ONVIF_VIEWER_LISTEN_ADDR"); address != "" {
+		return address
+	}
+	return ":7878"
+}
+
 func main() {
 	// Create a temporary directory for HLS files
 	hlsBaseDir, err := os.MkdirTemp("", "onvif-hls")
@@ -59,6 +66,7 @@ func main() {
 	http.HandleFunc("/api/stream/start", apiHandler.StartStream)
 	http.HandleFunc("/api/stream/stop", apiHandler.StopStream)
 	http.HandleFunc("/api/stream/list", apiHandler.ListStreams)
+	http.HandleFunc("/api/stream/snapshot", apiHandler.Snapshot)
 	http.HandleFunc("/api/stream/uri", apiHandler.GetStreamUri)
 	http.HandleFunc("/api/stream/logevents", apiHandler.LogEvents)
 	http.HandleFunc("/api/logs", apiHandler.GetLogs)
@@ -74,8 +82,9 @@ func main() {
 		os.Exit(0)
 	}()
 
-	log.Println("Server started on :7878")
-	if err := http.ListenAndServe(":7878", nil); err != nil {
+	address := listenAddress()
+	log.Printf("Server started on %s", address)
+	if err := http.ListenAndServe(address, nil); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
 }
