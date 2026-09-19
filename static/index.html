@@ -334,11 +334,17 @@
               class="stream-card">
               <div class="stream-card-header">
                 <div class="stream-identity">
-                  <div class="flex items-center gap-2 mb-1"><span class="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span><span class="text-xs uppercase tracking-wide text-emerald-600 dark:text-emerald-400">Running</span></div>
+                  <div class="flex items-center gap-2 mb-1">
+                    <span class="w-2 h-2 rounded-full" :class="stream.status === 'running' ? 'bg-emerald-500 animate-pulse' : stream.status === 'failed' || stream.status === 'stalled' ? 'bg-red-500' : 'bg-amber-500 animate-pulse'"></span>
+                    <span class="text-xs uppercase tracking-wide" :class="stream.status === 'running' ? 'text-emerald-600 dark:text-emerald-400' : stream.status === 'failed' || stream.status === 'stalled' ? 'text-red-600 dark:text-red-400' : 'text-amber-600 dark:text-amber-400'">{{ stream.status }}</span>
+                  </div>
                   <h3 class="font-semibold">{{ stream.id }}</h3>
                   <p class="text-sm text-slate-500 dark:text-slate-400">
                     Started: {{ new Date(stream.startedAt).toLocaleString() }}
                   </p>
+                  <p v-if="stream.detail" class="text-sm mt-1 text-slate-600 dark:text-slate-300">{{ stream.detail }}</p>
+                  <p v-if="stream.reconnectCount" class="text-xs mt-1 text-amber-600 dark:text-amber-400">Reconnect attempt {{ stream.reconnectCount }}<span v-if="stream.reconnectDelay"> · retry in {{ stream.reconnectDelay }}</span></p>
+                  <p v-if="stream.lastHlsAdvance" class="text-xs mt-1 text-slate-500 dark:text-slate-400">Last video segment: {{ new Date(stream.lastHlsAdvance).toLocaleString() }}</p>
                 </div>
                 <div class="stream-actions">
                   <!-- Video Size Selector -->
@@ -362,6 +368,18 @@
                     class="bg-blue-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 shadow-sm transition-colors px-4 py-2 rounded-lg">
                     <i :class="stream.showVideo ? 'fas fa-eye-slash' : 'fas fa-eye'" class="mr-2"></i>
                     {{ stream.showVideo ? 'Hide' : 'View' }}
+                  </button>
+                  <button type="button" @click="synchronizeStream(stream)" :disabled="stream.actionPending"
+                    class="bg-violet-600 hover:bg-violet-500 text-white px-4 py-2 rounded-lg disabled:opacity-50">
+                    <i class="fas fa-bolt mr-2"></i>Sync
+                  </button>
+                  <button type="button" @click="diagnoseStream(stream)" :disabled="stream.actionPending"
+                    class="bg-amber-600 hover:bg-amber-500 text-white px-4 py-2 rounded-lg disabled:opacity-50">
+                    <i class="fas fa-stethoscope mr-2"></i>Diagnose
+                  </button>
+                  <button type="button" @click="reconnectStream(stream)" :disabled="stream.actionPending"
+                    class="bg-cyan-600 hover:bg-cyan-500 text-white px-4 py-2 rounded-lg disabled:opacity-50">
+                    <i class="fas fa-rotate mr-2"></i>Reconnect
                   </button>
                   <button type="button" @click="stopStream(stream.id)" :disabled="stream.stopping"
                     class="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed">
@@ -815,6 +833,53 @@
           }
         };
 
+        const runStreamAction = async (stream, action, request) => {
+          if (stream.actionPending) return;
+          stream.actionPending = action;
+          error.value = '';
+          try {
+            const resp = await request();
+            if (!resp.ok) {
+              const text = await resp.text();
+              throw new Error(text || `${action} failed`);
+            }
+            if (action === 'Diagnose') {
+              const data = await resp.json();
+              stream.detail = data.detail;
+            }
+          } catch (err) {
+            error.value = `${action} failed: ${err.message}`;
+          } finally {
+            stream.actionPending = '';
+          }
+        };
+
+        const diagnoseStream = (stream) => runStreamAction(stream, 'Diagnose', () =>
+          fetch(`/api/stream/diagnose?id=${encodeURIComponent(stream.id)}`, { method: 'POST' }));
+
+        const reconnectStream = (stream) => runStreamAction(stream, 'Reconnect', () =>
+          fetch(`/api/stream/reconnect?id=${encodeURIComponent(stream.id)}`, { method: 'POST' }));
+
+        const synchronizeStream = (stream) => {
+          if (!cameraIp.value || !username.value || !password.value) {
+            error.value = 'Sync requires camera address and credentials in Camera Setup.';
+            return;
+          }
+          return runStreamAction(stream, 'Sync', () =>
+            fetch('/api/stream/synchronize', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                cameraIp: cameraIp.value,
+                cameraPort: cameraPort.value || '8000',
+                username: username.value,
+                password: password.value,
+                profileToken: stream.profileToken,
+                streamId: stream.id
+              })
+            }));
+        };
+
         const stopStream = async (streamId) => {
           const stream = streams.value.find(s => s.id === streamId);
           if (!stream) return;
@@ -857,9 +922,16 @@
               });
 
               hls.on(Hls.Events.ERROR, (event, data) => {
-                if (data.fatal) {
-                  console.error('Fatal HLS error:', data);
+                if (!data.fatal) return;
+                console.error('Fatal HLS error:', data);
+                if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                  hls.startLoad();
+                } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                  hls.recoverMediaError();
+                } else {
                   hls.destroy();
+                  video.hls = null;
+                  window.setTimeout(() => initializeVideoPlayer(stream), 3000);
                 }
               });
             }
@@ -894,6 +966,14 @@
 
               return {
                 ...stream,
+                ...(existingStream?.lastStateEventAt ? {
+                  status: existingStream.status,
+                  detail: existingStream.detail,
+                  reconnectCount: existingStream.reconnectCount,
+                  reconnectDelay: existingStream.reconnectDelay,
+                  lastHlsAdvance: existingStream.lastHlsAdvance,
+                  lastStateEventAt: existingStream.lastStateEventAt
+                } : {}),
                 showVideo: existingStream?.showVideo || false,
                 stopping: false,
                 videoSize: existingStream?.videoSize || savedVideoSize,
@@ -971,6 +1051,19 @@
             try {
               const logEntry = JSON.parse(event.data);
 
+              if (logEntry.type === 'state' && logEntry.state) {
+                const index = streams.value.findIndex(stream => stream.id === logEntry.streamId);
+                if (index >= 0) {
+                  streams.value[index] = { ...streams.value[index], ...logEntry.state, lastStateEventAt: logEntry.time };
+                } else if (logEntry.state.status !== 'stopped') {
+                  streams.value.push({ ...logEntry.state, lastStateEventAt: logEntry.time });
+                }
+                if (logEntry.state.status === 'stopped') {
+                  streams.value = streams.value.filter(stream => stream.id !== logEntry.streamId);
+                }
+                return;
+              }
+
               streamLogs.value.push(logEntry);
 
               if (streamLogs.value.length > maxLogEntries.value) {
@@ -989,14 +1082,9 @@
           };
 
           eventSource.onerror = () => {
-            logConnectionStatus.value = 'disconnected';
-            console.error('Log events stream disconnected');
-
-            setTimeout(() => {
-              if (!logsCollapsed.value) {
-                connectToLogEvents();
-              }
-            }, 5000);
+            logConnectionStatus.value = 'connecting';
+            console.error('Log events stream disconnected; EventSource will retry');
+            // EventSource reconnects natively; avoid competing retry timers.
           };
         };
 
@@ -1030,6 +1118,9 @@
           fetchDebug,
           streams,
           stopStream,
+          synchronizeStream,
+          diagnoseStream,
+          reconnectStream,
           loadStreams,
           toggleVideo,
           isProcessing,

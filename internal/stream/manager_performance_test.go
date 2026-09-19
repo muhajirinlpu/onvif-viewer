@@ -2,12 +2,22 @@ package stream
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"dengan.dev/camera-streamer/internal/models"
 	"testing"
 	"time"
 )
+
+func TestStreamIDsAreUnique(t *testing.T) {
+	first := newStreamID()
+	second := newStreamID()
+	if first == second {
+		t.Fatalf("stream IDs collided: %q", first)
+	}
+}
 
 func TestReconnectDelayUsesExponentialBackoff(t *testing.T) {
 	tests := []struct {
@@ -29,11 +39,34 @@ func TestReconnectDelayUsesExponentialBackoff(t *testing.T) {
 }
 
 func TestStableRunResetsFailureCount(t *testing.T) {
-	if got := nextReconnectFailureCount(7, 31*time.Second); got != 1 {
-		t.Fatalf("stable run should reset failures to 1, got %d", got)
+	if got := nextReconnectFailureCount(7, 31*time.Second); got != 0 {
+		t.Fatalf("stable run should reset failures to 0, got %d", got)
 	}
 	if got := nextReconnectFailureCount(7, 2*time.Second); got != 8 {
 		t.Fatalf("short run should increment failures, got %d", got)
+	}
+}
+
+func TestHLSOutputStaleOnlyAfterPlaylistStopsAdvancing(t *testing.T) {
+	dir := t.TempDir()
+	playlist := filepath.Join(dir, "stream.m3u8")
+	now := time.Now()
+
+	if hlsOutputStale(playlist, now, 15*time.Second) {
+		t.Fatal("missing playlist must get a startup grace period")
+	}
+	if err := os.WriteFile(playlist, []byte("#EXTM3U\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if hlsOutputStale(playlist, now, 15*time.Second) {
+		t.Fatal("fresh playlist reported stale")
+	}
+	old := now.Add(-16 * time.Second)
+	if err := os.Chtimes(playlist, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if !hlsOutputStale(playlist, now, 15*time.Second) {
+		t.Fatal("playlist that stopped advancing was not reported stale")
 	}
 }
 

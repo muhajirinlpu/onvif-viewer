@@ -5,9 +5,13 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
+	"encoding/xml"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +30,7 @@ const (
 	GetSnapshotUri              CameraFunction = "GetSnapshotUri"
 	GetVideoEncoderConfig       CameraFunction = "GetVideoEncoderConfig"
 	GetSystemDateAndTime        CameraFunction = "GetSystemDateAndTime"
+	SetSynchronizationPoint     CameraFunction = "SetSynchronizationPoint"
 	ContinuousMove              CameraFunction = "ContinuousMove"
 	Stop                        CameraFunction = "Stop"
 	GetStatus                   CameraFunction = "GetStatus"
@@ -74,7 +79,7 @@ func (f CameraFunction) URI() string {
 	switch f {
 	case GetCapabilities, GetDeviceInformation, GetSystemDateAndTime:
 		return "onvif/device_service"
-	case GetProfiles, GetStreamUri, GetSnapshotUri, GetVideoEncoderConfig:
+	case GetProfiles, GetStreamUri, GetSnapshotUri, GetVideoEncoderConfig, SetSynchronizationPoint:
 		return "onvif/media_service"
 	case ContinuousMove, Stop, GetStatus:
 		return "onvif/ptz_service"
@@ -123,6 +128,12 @@ func (f CameraFunction) Envelope(cam models.CameraRequest, params ...string) str
 		body = fmt.Sprintf(`<trt:GetVideoEncoderConfiguration><ProfileToken>%s</ProfileToken></trt:GetVideoEncoderConfiguration>`, token)
 	case GetSystemDateAndTime:
 		body = `<tds:GetSystemDateAndTime/>`
+	case SetSynchronizationPoint:
+		token := ""
+		if len(params) > 0 {
+			token = params[0]
+		}
+		body = fmt.Sprintf(`<trt:SetSynchronizationPoint><trt:ProfileToken>%s</trt:ProfileToken></trt:SetSynchronizationPoint>`, token)
 	case ContinuousMove:
 		token := ""
 		x, y, zoom := "0.0", "0.0", "0.0"
@@ -184,12 +195,36 @@ func (f CameraFunction) Envelope(cam models.CameraRequest, params ...string) str
 		</SOAP-ENV:Envelope>`
 }
 
-// SendRequest sends a SOAP request to the camera
+func cameraServiceURL(cam models.CameraRequest, servicePath string) (string, error) {
+	if net.ParseIP(cam.CameraIp) == nil {
+		return "", fmt.Errorf("invalid camera IP")
+	}
+	port, err := strconv.Atoi(cam.CameraPort)
+	if err != nil || port < 1 || port > 65535 {
+		return "", fmt.Errorf("invalid camera port")
+	}
+	u := &url.URL{Scheme: "http", Host: net.JoinHostPort(cam.CameraIp, cam.CameraPort), Path: "/" + servicePath}
+	return u.String(), nil
+}
+
+func xmlEscape(value string) string {
+	var b bytes.Buffer
+	_ = xml.EscapeText(&b, []byte(value))
+	return b.String()
+}
+
+// SendRequest sends a SOAP request to the camera.
 func (c *Client) SendRequest(cam models.CameraRequest, f CameraFunction, params ...string) (*http.Response, error) {
-	url := fmt.Sprintf("http://%s:%s/%s", cam.CameraIp, cam.CameraPort, f.URI())
+	requestURL, err := cameraServiceURL(cam, f.URI())
+	if err != nil {
+		return nil, err
+	}
+	for i := range params {
+		params[i] = xmlEscape(params[i])
+	}
 	envelope := f.Envelope(cam, params...)
 
-	req, err := http.NewRequest("POST", url, bytes.NewBufferString(envelope))
+	req, err := http.NewRequest("POST", requestURL, bytes.NewBufferString(envelope))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %v", err)
 	}
@@ -226,6 +261,23 @@ func (c *Client) GetStreamUri(cam models.CameraRequest, profileToken string) (st
 		return "", err
 	}
 	return string(body), nil
+}
+
+// SetSynchronizationPoint requests an immediate keyframe for a media profile.
+func (c *Client) SetSynchronizationPoint(cam models.CameraRequest, profileToken string) error {
+	resp, err := c.SendRequest(cam, SetSynchronizationPoint, profileToken)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 || strings.Contains(string(body), ":Fault") {
+		return fmt.Errorf("camera rejected synchronization request (HTTP %d)", resp.StatusCode)
+	}
+	return nil
 }
 
 // GetSystemDateAndTime sends a GetSystemDateAndTime request
@@ -517,5 +569,5 @@ func generateSecurityHeader(cam models.CameraRequest) string {
 				<wsu:Created>%s</wsu:Created>
 			</wsse:UsernameToken>
 		</wsse:Security>
-	</SOAP-ENV:Header>`, cam.Username, passwordDigest, nonce, created)
+	</SOAP-ENV:Header>`, xmlEscape(cam.Username), passwordDigest, nonce, created)
 }

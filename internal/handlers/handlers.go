@@ -112,6 +112,69 @@ func (h *Handler) ListStreams(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// DiagnoseStream runs non-destructive network and service reachability checks.
+func (h *Handler) DiagnoseStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	detail, err := h.streamManager.DiagnoseStream(r.URL.Query().Get("id"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"detail": detail})
+}
+
+// ReconnectStream requests a controlled FFmpeg/RTSP reconnect.
+func (h *Handler) ReconnectStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := h.streamManager.ReconnectStream(r.URL.Query().Get("id")); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	w.WriteHeader(http.StatusAccepted)
+}
+
+// SynchronizeStream asks ONVIF Media to inject a synchronization point/I-frame.
+func (h *Handler) SynchronizeStream(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		models.GetStreamUriRequest
+		StreamID string `json:"streamId"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	if req.CameraPort == "" {
+		req.CameraPort = "8000"
+	}
+	if req.CameraIp == "" || req.Username == "" || req.Password == "" || req.ProfileToken == "" || req.StreamID == "" {
+		http.Error(w, "stream, camera address, credentials, and profile token are required", http.StatusBadRequest)
+		return
+	}
+	if err := h.streamManager.ValidateCameraForStream(req.StreamID, req.CameraIp, req.ProfileToken); err != nil {
+		http.Error(w, "camera does not match selected stream", http.StatusConflict)
+		return
+	}
+	if err := h.onvifClient.SetSynchronizationPoint(req.CameraRequest, req.ProfileToken); err != nil {
+		h.logger.LogError("", "onvif", fmt.Sprintf("Synchronization request failed: %v", err))
+		http.Error(w, "camera synchronization request failed", http.StatusBadGateway)
+		return
+	}
+	h.logger.LogInfo("", "onvif", "Synchronization point requested")
+	w.WriteHeader(http.StatusAccepted)
+}
+
 // GetStreamUri handles ONVIF GetStreamUri requests
 func (h *Handler) GetStreamUri(w http.ResponseWriter, r *http.Request) {
 	var req models.GetStreamUriRequest
@@ -322,24 +385,8 @@ func (h *Handler) LogEvents(w http.ResponseWriter, r *http.Request) {
 
 	h.logger.LogInfo("", "sse", fmt.Sprintf("New SSE client connected: %s", clientID))
 
-	// Send recent logs from database
-	recentLogs, err := h.logger.GetRecentLogs(500)
-	if err != nil {
-		h.logger.LogError("", "sse", fmt.Sprintf("Failed to get recent logs: %v", err))
-	} else {
-		// Convert database logs to SSE format and send them
-		for i := len(recentLogs) - 1; i >= 0; i-- {
-			dbLog := recentLogs[i]
-			entry := models.LogEntry{
-				StreamID: dbLog.StreamID,
-				Message:  fmt.Sprintf("[%s] %s", dbLog.Source, dbLog.Message),
-				Time:     dbLog.Timestamp.Format(time.RFC3339),
-			}
-			data, _ := json.Marshal(entry)
-			fmt.Fprintf(w, "data: %s\n\n", data)
-			flusher.Flush()
-		}
-	}
+	// AddSSEClient queued distinct current-state snapshots. Historical FFmpeg
+	// logs are intentionally not replayed because they are stale and noisy.
 
 	// Create a heartbeat ticker
 	heartbeat := time.NewTicker(30 * time.Second)

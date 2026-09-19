@@ -46,6 +46,7 @@ func main() {
 
 	// Initialize Stream Manager
 	streamManager := stream.NewManager(hlsBaseDir, dbLogger)
+	streamManager.RestoreStreams()
 	go streamManager.CleanupInactiveClients()
 
 	// Initialize HTTP handlers
@@ -66,6 +67,9 @@ func main() {
 	http.HandleFunc("/api/stream/start", apiHandler.StartStream)
 	http.HandleFunc("/api/stream/stop", apiHandler.StopStream)
 	http.HandleFunc("/api/stream/list", apiHandler.ListStreams)
+	http.HandleFunc("/api/stream/diagnose", apiHandler.DiagnoseStream)
+	http.HandleFunc("/api/stream/reconnect", apiHandler.ReconnectStream)
+	http.HandleFunc("/api/stream/synchronize", apiHandler.SynchronizeStream)
 	http.HandleFunc("/api/stream/snapshot", apiHandler.Snapshot)
 	http.HandleFunc("/api/stream/uri", apiHandler.GetStreamUri)
 	http.HandleFunc("/api/stream/logevents", apiHandler.LogEvents)

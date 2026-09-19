@@ -44,3 +44,49 @@ func TestFrontendModalLocksBodyScroll(t *testing.T) {
 		t.Error("camera setup modal must lock background scrolling")
 	}
 }
+
+func TestFrontendRecoversFatalHLSFailures(t *testing.T) {
+	data, err := os.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(data)
+	for _, token := range []string{"Hls.ErrorTypes.NETWORK_ERROR", "hls.startLoad()", "Hls.ErrorTypes.MEDIA_ERROR", "hls.recoverMediaError()"} {
+		if !strings.Contains(html, token) {
+			t.Errorf("missing HLS recovery behavior %q", token)
+		}
+	}
+}
+
+func TestFrontendProvidesManualStreamRecoveryControls(t *testing.T) {
+	data, err := os.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(data)
+	for _, token := range []string{
+		`@click="synchronizeStream(stream)"`,
+		`@click="diagnoseStream(stream)"`,
+		`@click="reconnectStream(stream)"`,
+		`fetch('/api/stream/synchronize'`,
+		"fetch(`/api/stream/diagnose?id=${encodeURIComponent(stream.id)}`",
+		"fetch(`/api/stream/reconnect?id=${encodeURIComponent(stream.id)}`",
+	} {
+		if !strings.Contains(html, token) {
+			t.Errorf("missing manual recovery control %q", token)
+		}
+	}
+}
+
+func TestFrontendDisplaysStreamHealthDiagnostics(t *testing.T) {
+	data, err := os.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(data)
+	for _, token := range []string{"stream.status", "stream.detail", "stream.reconnectCount", "stream.lastHlsAdvance"} {
+		if !strings.Contains(html, token) {
+			t.Errorf("missing visible stream health field %q", token)
+		}
+	}
+}

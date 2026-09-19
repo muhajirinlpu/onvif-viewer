@@ -18,12 +18,16 @@ type GetStreamUriRequest struct {
 
 // StreamInfo contains information about an active FFmpeg stream.
 type StreamInfo struct {
-	ID           string    `json:"id"`
-	ProfileToken string    `json:"profileToken"`
-	RtspURL      string    `json:"-"`
-	HlsURL       string    `json:"hlsUrl"`
-	StartedAt    time.Time `json:"startedAt"`
-	Status       string    `json:"status"`
+	ID             string     `json:"id"`
+	ProfileToken   string     `json:"profileToken"`
+	RtspURL        string     `json:"-"`
+	HlsURL         string     `json:"hlsUrl"`
+	StartedAt      time.Time  `json:"startedAt"`
+	Status         string     `json:"status"`
+	ReconnectCount int        `json:"reconnectCount"`
+	ReconnectDelay string     `json:"reconnectDelay,omitempty"`
+	LastHLSAdvance *time.Time `json:"lastHlsAdvance,omitempty"`
+	Detail         string     `json:"detail,omitempty"`
 }
 
 // ClientConnection represents a connection for a Server-Sent Events (SSE) client.
@@ -34,7 +38,9 @@ type ClientConnection struct {
 
 // LogEntry represents a single log message for SSE.
 type LogEntry struct {
-	StreamID string `json:"streamId"`
-	Message  string `json:"message"`
-	Time     string `json:"time"`
+	Type     string      `json:"type,omitempty"`
+	StreamID string      `json:"streamId"`
+	Message  string      `json:"message"`
+	Time     string      `json:"time"`
+	State    *StreamInfo `json:"state,omitempty"`
 }
