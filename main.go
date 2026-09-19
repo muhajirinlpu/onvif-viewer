@@ -50,9 +50,12 @@ func main() {
 	streamManager.RestoreStreams()
 	go streamManager.CleanupInactiveClients()
 
-	// Tuya bridge: the engine is a supervised child process, started lazily on
-	// the first Tuya stream. It stays off entirely until TUYA_ENGINE_SESSION_FILE
-	// is configured, so an ONVIF-only install is unchanged.
+	// Tuya bridge: the Tuya source runs IN THIS PROCESS through the vendored
+	// go2rtc code in internal/go2rtc, exposed as a loopback RTSP endpoint that
+	// the existing ffmpeg pipeline consumes. No child process and no external
+	// engine binary are involved, and it stays off entirely until
+	// TUYA_ENGINE_SESSION_FILE is configured, so an ONVIF-only install is
+	// unchanged.
 	tuyaBridge, err := tuyaengine.NewBridgeFromEnv(streamManager, dbLogger)
 	if err != nil {
 		log.Printf("Tuya bridge disabled: %v", err)
