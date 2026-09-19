@@ -35,6 +35,8 @@ const (
 	EnvSessionFile = "TUYA_ENGINE_SESSION_FILE"
 	EnvTuyaHost    = "TUYA_ENGINE_TUYA_HOST"
 	EnvLogLevel    = "TUYA_ENGINE_LOG_LEVEL"
+	// EnvMode selects the backend: "inprocess" (default) or "external".
+	EnvMode = "TUYA_ENGINE_MODE"
 )
 
 const (
@@ -48,30 +50,36 @@ const (
 	defaultConfigName   = "go2rtc"
 )
 
-// DefaultBinCandidates is the search order used when Config.BinPath is empty.
-// The first candidate that resolves is used. The durable ~/.local/bin path comes
-// first; /tmp is kept last only as a bring-up fallback, since a /tmp wipe would
-// otherwise break Tuya streaming.
+// DefaultBinCandidates is the search order used by the *external* backend when
+// Config.BinPath is empty. The in-process backend never looks at it. The durable
+// ~/.local/bin path comes first; a /tmp checkout is deliberately absent because
+// a /tmp wipe must not be able to take Tuya streaming down, and the default
+// backend does not need any binary at all.
 var DefaultBinCandidates = []string{
 	"go2rtc-tuyaqr",
 	"/home/muhajirin/.local/bin/go2rtc-tuyaqr",
 	"/usr/local/bin/go2rtc-tuyaqr",
-	"/tmp/go2rtc-qr",
 }
 
-// Config describes how to run and supervise the Tuya->RTSP engine.
+// Config describes how to run the Tuya->RTSP engine.
 type Config struct {
-	// BinPath is the engine executable. Empty means "search DefaultBinCandidates"
-	// (or whatever DefaultBinCandidates has been replaced with).
+	// Mode selects the backend: ModeInProcess (default) or ModeExternal.
+	// ModeExternal, or a non-empty BinPath, selects the supervised external
+	// binary; everything else serves Tuya in-process with no child process.
+	Mode string
+	// BinPath is the *external* engine executable. Empty means the external
+	// backend searches DefaultBinCandidates. It has no effect on the default
+	// in-process backend.
 	BinPath string
-	// ConfigDir receives the generated engine YAML and its log file. Empty means
-	// os.TempDir()/tuyaengine.
+	// ConfigDir receives the generated external-engine YAML and its log file.
+	// Empty means os.TempDir()/tuyaengine.
 	ConfigDir string
-	// APIPort / RTSPPort pin the engine ports. 0 means "allocate a free port on
-	// every spawn".
+	// APIPort / RTSPPort pin the engine ports. 0 means "allocate a free
+	// loopback port". The in-process backend uses RTSPPort only.
 	APIPort  int
 	RTSPPort int
-	// RTSPHost is the host component of the URL handed to ffmpeg.
+	// RTSPHost is the host component of the URL handed to ffmpeg. The engine
+	// only ever binds loopback.
 	RTSPHost string
 	// SessionFile and TuyaHost are resolver defaults for DeviceSpec.
 	SessionFile string
@@ -93,6 +101,7 @@ type Config struct {
 // DefaultConfig returns an environment-aware Config.
 func DefaultConfig() Config {
 	return Config{
+		Mode:         strings.TrimSpace(os.Getenv(EnvMode)),
 		BinPath:      os.Getenv(EnvBinPath),
 		ConfigDir:    os.Getenv(EnvConfigDir),
 		APIPort:      envPort(EnvAPIPort),

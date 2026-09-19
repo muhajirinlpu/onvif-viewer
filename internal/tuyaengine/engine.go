@@ -1,10 +1,15 @@
-// Package tuyaengine supervises a Tuya-cloud -> RTSP bridge engine as a child
-// process of the viewer and exposes the resulting RTSP URL, so the existing
-// internal/stream HLS pipeline can consume a Tuya camera exactly like an ONVIF
-// camera.
+// Package tuyaengine bridges a Tuya camera to the viewer's HLS pipeline.
 //
-// The engine is a long-lived process that can serve many streams: one instance
-// is shared by every Tuya camera, never one process per camera.
+// The default backend is entirely in-repo: internal/tuyartsp serves the Tuya
+// WebRTC source (vendored from go2rtc into internal/go2rtc) over a loopback RTSP
+// endpoint, which the existing internal/stream ffmpeg pipeline consumes exactly
+// like an ONVIF camera. The package therefore builds into ONE binary with NO
+// external executable.
+//
+// One engine serves every Tuya camera: the stream registry is shared, and the
+// in-process RTSP server multiplexes connections. An opt-in ModeExternal backend
+// still supervises an external Tuya->RTSP engine binary for operators who have
+// one; it is never selected unless explicitly configured.
 package tuyaengine
 
 import (
@@ -97,6 +102,12 @@ type Engine struct {
 	events    []Event
 	sink      func(Event)
 
+	// in-process backend
+	local        *localServer
+	localRunning bool
+	localOnce    sync.Once
+	localErr     error
+
 	superviseOnce sync.Once
 	startOnce     sync.Once
 	wg            sync.WaitGroup
@@ -188,11 +199,20 @@ func (e *Engine) AddStream(spec DeviceSpec) (rtspURL, profileToken string, err e
 	e.streams[name] = source
 	e.byToken[token] = name
 	running := e.running && e.cmd != nil && e.cmd.Process != nil
+	localRunning := e.localRunning
+	local := e.local
 	rtspPort := e.rtspPort
 	e.mu.Unlock()
 
 	e.record(Event{Kind: EventStreamAdded, Detail: fmt.Sprintf("stream=%s token=%s", name, token)})
 
+	if localRunning && local != nil {
+		// In-process backend: register the stream with the live RTSP server so
+		// a new camera needs no restart and no respawn.
+		if err := local.AddStream(name, source); err != nil {
+			e.lastError(err)
+		}
+	}
 	if running {
 		if err := e.putStream(context.Background(), name, source); err != nil {
 			// Not fatal: the stream is in the registry and will exist after the
@@ -210,7 +230,6 @@ func (e *Engine) AddStream(spec DeviceSpec) (rtspURL, profileToken string, err e
 		port = rtspPort
 	}
 	e.mu.Unlock()
-
 	rtspURL = RTSPURL(e.cfg.RTSPHost, port, name)
 	e.mu.Lock()
 	e.streamURL[name] = rtspURL
@@ -233,11 +252,15 @@ func (e *Engine) RemoveStream(deviceID string) error {
 		delete(e.streamURL, name)
 	}
 	running := e.running && e.cmd != nil
+	localRunning := e.localRunning
 	e.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("tuyaengine: device %s is not registered", deviceID)
 	}
 	e.record(Event{Kind: EventStreamRemoved, Detail: "stream=" + name})
+	if localRunning {
+		e.removeLocalStream(name)
+	}
 	if running {
 		if err := e.deleteStream(context.Background(), name); err != nil {
 			e.lastError(err)
@@ -295,14 +318,26 @@ func (e *Engine) streamNamesLocked() []string {
 // Supervision
 // ---------------------------------------------------------------------------
 
-// Running reports whether a supervised child currently exists.
+// Running reports whether the engine currently serves RTSP, either from the
+// in-process server or from a supervised child.
 func (e *Engine) Running() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.localRunning && e.local != nil {
+		return true
+	}
 	return e.running && e.cmd != nil && e.cmd.Process != nil
 }
 
-// PID returns the current child pid, or 0 when not running.
+// LocalRunning reports whether the in-process RTSP server is serving.
+func (e *Engine) LocalRunning() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.localRunning && e.local != nil
+}
+
+// PID returns the current child pid, or 0 when not running. The in-process
+// backend never has a pid: it is the viewer's own process.
 func (e *Engine) PID() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -333,14 +368,29 @@ func (e *Engine) RTSPPort() int {
 	return e.rtspPort
 }
 
-// EnsureRunning starts the supervisor and waits until the RTSP endpoint answers.
+// EnsureRunning starts the engine and waits until the RTSP endpoint answers.
 // It is idempotent and safe for concurrent use.
 //
-// The engine binary is resolved up front so a missing or non-executable binary is
-// reported to the caller immediately instead of only being retried in the
-// background. The supervisor is still started, so the engine recovers on its own
-// once the binary appears.
+// With the default in-process backend this binds the loopback RTSP listener and
+// registers every known stream; there is no child process and no executable to
+// resolve, so a missing external binary can never be the reason a Tuya stream
+// fails. With ModeExternal the external binary is resolved up front instead, so
+// a missing or non-executable binary is reported to the caller immediately; the
+// supervisor is still started, so the engine recovers on its own once it
+// appears.
 func (e *Engine) EnsureRunning() error {
+	if !e.usesExternalEngine() {
+		if err := e.cfg.Validate(); err != nil {
+			e.lastError(err)
+			return err
+		}
+		if err := e.ensureLocal(); err != nil {
+			e.lastError(err)
+			return err
+		}
+		return e.waitLocalReady(context.Background(), e.cfg.ReadyTimeout)
+	}
+
 	e.startOnce.Do(func() {
 		e.wg.Add(1)
 		go func() {
@@ -422,8 +472,8 @@ func dialAddress(rawURL string) string {
 	return net.JoinHostPort(parsed.Hostname(), port)
 }
 
-// Stop terminates the supervised child and prevents further restarts. It is
-// idempotent and safe to call more than once.
+// Stop terminates the in-process RTSP server and any supervised child and
+// prevents further restarts. It is idempotent and safe to call more than once.
 func (e *Engine) Stop() {
 	e.mu.Lock()
 	if e.stopped {
@@ -434,6 +484,7 @@ func (e *Engine) Stop() {
 	cmd := e.cmd
 	e.mu.Unlock()
 
+	e.stopLocal()
 	if cmd != nil && cmd.Process != nil {
 		e.terminate(cmd)
 	}

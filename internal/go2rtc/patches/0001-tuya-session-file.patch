@@ -1,0 +1,243 @@
+diff --git a/pkg/tuya/client.go b/pkg/tuya/client.go
+index 3043a8d..d0c5af6 100644
+--- a/pkg/tuya/client.go
++++ b/pkg/tuya/client.go
+@@ -59,6 +59,7 @@ func Dial(rawURL string) (core.Producer, error) {
+ 	// Tuya Smart API
+ 	email := query.Get("email")
+ 	password := query.Get("password")
++	sessionFile := query.Get("session_file")
+ 
+ 	// Tuya Cloud API
+ 	uid := query.Get("uid")
+@@ -71,7 +72,7 @@ func Dial(rawURL string) (core.Producer, error) {
+ 	// Stream params
+ 	streamResolution := query.Get("resolution")
+ 
+-	useSmartApi := deviceId != "" && email != "" && password != ""
++	useSmartApi := deviceId != "" && (sessionFile != "" || (email != "" && password != ""))
+ 	useCloudApi := deviceId != "" && uid != "" && clientId != "" && clientSecret != ""
+ 
+ 	if streamResolution == "" || (streamResolution != "hd" && streamResolution != "sd") {
+@@ -87,7 +88,12 @@ func Dial(rawURL string) (core.Producer, error) {
+ 	}
+ 
+ 	if useSmartApi {
+-		if client.api, err = NewTuyaSmartApiClient(nil, u.Hostname(), email, password, deviceId); err != nil {
++		if sessionFile != "" {
++			client.api, err = NewTuyaSmartApiClientFromSession(nil, u.Hostname(), sessionFile, deviceId)
++		} else {
++			client.api, err = NewTuyaSmartApiClient(nil, u.Hostname(), email, password, deviceId)
++		}
++		if err != nil {
+ 			return nil, fmt.Errorf("tuya: %w", err)
+ 		}
+ 	} else {
+diff --git a/pkg/tuya/smart_api.go b/pkg/tuya/smart_api.go
+index 09615db..efaa3fe 100644
+--- a/pkg/tuya/smart_api.go
++++ b/pkg/tuya/smart_api.go
+@@ -241,6 +241,7 @@ type TuyaSmartApiClient struct {
+ 	password    string
+ 	countryCode string
+ 	mqttsUrl    string
++	sessionOnly bool
+ }
+ 
+ type Region struct {
+@@ -410,6 +411,9 @@ func (c *TuyaSmartApiClient) GetRoomList(homeId string) (*RoomListResponse, erro
+ }
+ 
+ func (c *TuyaSmartApiClient) initToken() error {
++	if c.sessionOnly {
++		return nil
++	}
+ 	tokenUrl := fmt.Sprintf("https://%s/api/login/token", c.baseUrl)
+ 
+ 	tokenReq := LoginTokenRequest{
+diff --git a/pkg/tuya/session.go b/pkg/tuya/session.go
+new file mode 100644
+index 0000000..333336f
+--- /dev/null
++++ b/pkg/tuya/session.go
+@@ -0,0 +1,68 @@
++package tuya
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net/http"
++	"net/url"
++	"os"
++)
++
++// NewTuyaSmartApiClientFromSession imports a tuya-ipc-terminal QR session read-only.
++// It never falls back to password login; renew expired sessions in the QR tool.
++func NewTuyaSmartApiClientFromSession(httpClient *http.Client, baseURL, sessionFile, deviceID string) (*TuyaSmartApiClient, error) {
++	data, err := os.ReadFile(sessionFile)
++	if err != nil {
++		return nil, err
++	}
++	var saved struct {
++		SessionData struct {
++			ServerHost  string         `json:"serverHost"`
++			LoginResult LoginResult    `json:"loginResult"`
++			Cookies     []*http.Cookie `json:"cookies"`
++		} `json:"sessionData"`
++	}
++	if err := json.Unmarshal(data, &saved); err != nil {
++		return nil, errors.New("tuya: invalid stored session JSON")
++	}
++	session := saved.SessionData
++	if session.ServerHost != baseURL {
++		return nil, errors.New("tuya: session host differs from requested host")
++	}
++	c, err := NewTuyaSmartApiClient(nil, baseURL, "", "", deviceID)
++	if err != nil {
++		return nil, err
++	}
++	if httpClient != nil {
++		clone := *httpClient
++		clone.Jar = c.httpClient.Jar
++		c.httpClient = &clone
++	}
++	// Do not send session credentials to a redirected origin.
++	c.httpClient.CheckRedirect = func(req *http.Request, via []*http.Request) error {
++		if req.URL.Scheme != "https" || req.URL.Host != baseURL {
++			return errors.New("tuya: cross-origin session redirect refused")
++		}
++		if len(via) >= 10 {
++			return errors.New("tuya: too many redirects")
++		}
++		return nil
++	}
++	origin := &url.URL{Scheme: "https", Host: baseURL, Path: "/"}
++	c.httpClient.Jar.SetCookies(origin, session.Cookies)
++	found := map[string]bool{}
++	for _, cookie := range c.httpClient.Jar.Cookies(origin) {
++		found[cookie.Name] = cookie.Value != ""
++	}
++	if !found["fast-sid"] || !found["s-sid"] {
++		return nil, errors.New("tuya: stored session lacks valid fast-sid/s-sid cookies; renew QR login")
++	}
++	domain := session.LoginResult.Domain
++	if domain.MobileMqttsUrl == "" || domain.MqttsPort == 0 {
++		return nil, errors.New("tuya: stored session lacks MQTT endpoint")
++	}
++	c.mqttsUrl = fmt.Sprintf("ssl://%s:%d", domain.MobileMqttsUrl, domain.MqttsPort)
++	c.sessionOnly = true
++	return c, nil
++}
+diff --git a/pkg/tuya/session_test.go b/pkg/tuya/session_test.go
+new file mode 100644
+index 0000000..e00304a
+--- /dev/null
++++ b/pkg/tuya/session_test.go
+@@ -0,0 +1,106 @@
++package tuya
++
++import (
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/http"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++type sessionTransport func(*http.Request) (*http.Response, error)
++
++func (f sessionTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
++
++func TestStoredSessionSkipsLogin(t *testing.T) {
++	path := filepath.Join(t.TempDir(), "session.json")
++	fixture := `{"sessionData":{"serverHost":"protect-us.ismartlife.me","loginResult":{"domain":{"mobileMqttsUrl":"mqtt.example.test","mqttsPort":8883}},"cookies":[{"name":"fast-sid","value":"test-cookie","expires":"0001-01-01T00:00:00Z"},{"name":"s-sid","value":"test-cookie-2"}]}}`
++	if err := os.WriteFile(path, []byte(fixture), 0600); err != nil {
++		t.Fatal(err)
++	}
++	c, err := NewTuyaSmartApiClientFromSession(nil, "protect-us.ismartlife.me", path, "test-device")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if c.email != "" || c.password != "" {
++		t.Fatal("session constructor populated account credentials")
++	}
++	calls := []string{}
++	c.httpClient.Transport = sessionTransport(func(r *http.Request) (*http.Response, error) {
++		calls = append(calls, r.URL.Path)
++		cookie, err := r.Cookie("fast-sid")
++		if err != nil || cookie.Value != "test-cookie" {
++			t.Fatal("stored cookie missing")
++		}
++		if strings.Contains(r.URL.Path, "login") {
++			t.Fatal("password login attempted")
++		}
++		body := `{"success":true,"result":{"auth":"fixture-auth","supportsWebrtc":true,"skill":"{\"videos\":[]}","p2pConfig":{"ices":[]}}}`
++		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: make(http.Header)}, nil
++	})
++	// initToken itself must be guarded so every caller is password-free in session mode.
++	if err := c.initToken(); err != nil {
++		t.Fatal(err)
++	}
++	cfg, err := c.loadWebrtcConfig()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if cfg.Auth == "" || !cfg.SupportsWebRTC {
++		t.Fatal("missing WebRTC credentials")
++	}
++	if len(calls) != 1 || calls[0] != "/api/jarvis/config" {
++		t.Fatalf("unexpected paths: %v", calls)
++	}
++	if c.mqttsUrl != "ssl://mqtt.example.test:8883" {
++		t.Fatal("missing saved MQTT endpoint")
++	}
++}
++
++func TestDialAcceptsSessionFileWithoutPassword(t *testing.T) {
++	_, err := Dial("tuya://protect-us.ismartlife.me?device_id=test&session_file=/nonexistent/tuya-session.json&resolution=sd")
++	if err == nil || !strings.Contains(err.Error(), "no such file") {
++		t.Fatalf("expected session file read, got %v", err)
++	}
++}
++
++func TestLiveStoredSessionCredentials(t *testing.T) {
++	path := os.Getenv("TUYA_SESSION_TEST_FILE")
++	if path == "" {
++		t.Skip("opt-in live cookie-only API verification")
++	}
++	c, err := NewTuyaSmartApiClientFromSession(nil, "protect-us.ismartlife.me", path, "eb9f1d6e677b1b39f222ag")
++	if err != nil {
++		t.Fatal(err)
++	}
++	paths := []string{}
++	transport := http.DefaultTransport
++	c.httpClient.Transport = sessionTransport(func(r *http.Request) (*http.Response, error) {
++		if strings.Contains(r.URL.Path, "login") {
++			return nil, fmt.Errorf("forbidden login endpoint")
++		}
++		paths = append(paths, r.URL.Path)
++		t.Logf("HTTP %s %s cookie_count=%d", r.Method, r.URL.Path, len(r.Cookies()))
++		return transport.RoundTrip(r)
++	})
++	if err := c.initToken(); err != nil {
++		t.Fatal(err)
++	}
++	cfg, err := c.loadWebrtcConfig()
++	if err != nil {
++		t.Fatal(err)
++	}
++	hub, err := c.loadHubConfig()
++	if err != nil {
++		t.Fatal(err)
++	}
++	evidence := map[string]any{"request_paths": paths, "account_email_empty": c.email == "", "account_password_empty": c.password == "", "auth_present": cfg.Auth != "", "local_key_present": c.localKey != "", "ice_servers": len(cfg.P2PConfig.Ices), "supports_webrtc": cfg.SupportsWebRTC, "mqtt_credentials_present": hub.Password != "", "mqtt_url_present": hub.Url != ""}
++	b, _ := json.Marshal(evidence)
++	t.Log(string(b))
++	if cfg.Auth == "" || !cfg.SupportsWebRTC || hub.Password == "" || len(cfg.P2PConfig.Ices) == 0 {
++		t.Fatal("incomplete credentials")
++	}
++}

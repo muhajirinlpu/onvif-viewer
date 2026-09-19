@@ -16,12 +16,14 @@ import (
 	"dengan.dev/camera-streamer/internal/stream"
 )
 
-// These tests drive the REAL Tuya engine and the REAL HLS pipeline. They are
+// These tests drive the REAL Tuya source and the REAL HLS pipeline. They are
 // opt-in because they need the camera's saved session and consume Tuya cloud
 // WebRTC capacity.
 //
+// They run against the DEFAULT in-process backend: no engine binary is
+// required, and TUYA_ENGINE_BIN is not consulted any more.
+//
 //	TUYA_ENGINE_INTEGRATION=1 \
-//	TUYA_ENGINE_BIN=/path/to/go2rtc \
 //	TUYA_ENGINE_SESSION_FILE=$HOME/tuya-es06/.tuya-data/<account>.json \
 //	go test -run Integration -v -timeout 15m ./internal/tuyaengine/
 //
@@ -29,6 +31,8 @@ import (
 //
 //	TUYA_ENGINE_DEVICE_ID  camera device id (defaults to the bring-up ES06)
 //	TUYA_ENGINE_TEST_HLS   keep HLS output in this directory instead of a temp dir
+//	TUYA_ENGINE_MODE=external + TUYA_ENGINE_BIN=<path>  drive the opt-in
+//	                       external-binary backend instead
 
 const (
 	envIntegration = "TUYA_ENGINE_INTEGRATION"
@@ -102,8 +106,8 @@ func startLiveStack(t *testing.T) *liveStack {
 	if err != nil {
 		t.Fatalf("Bridge.StartStream: %v", err)
 	}
-	t.Logf("streamID=%s profileToken=%s hlsURL=%s status=%s engineRTSP=%s enginePID=%d engineRestarts=%d",
-		info.ID, info.ProfileToken, info.HlsURL, info.Status, engine.RTSPURL(), engine.PID(), engine.Restarts())
+	t.Logf("streamID=%s profileToken=%s hlsURL=%s status=%s engineRTSP=%s enginePID=%d engineRestarts=%d localRunning=%t",
+		info.ID, info.ProfileToken, info.HlsURL, info.Status, engine.RTSPURL(), engine.PID(), engine.Restarts(), engine.LocalRunning())
 
 	stack := &liveStack{
 		engine:    engine,
@@ -243,12 +247,20 @@ func (s *liveStack) decodeFrames(t *testing.T, n int) (int, string) {
 
 // TestIntegrationTuyaFramesReachHLSThroughExistingPipeline is the end-to-end
 // proof: one Bridge call turns a Tuya device into HLS served by the viewer's
-// normal ffmpeg pipeline, and real frames can be decoded out of it.
+// normal ffmpeg pipeline, and real frames can be decoded out of it. It runs
+// against the default in-process backend, so no external engine binary is
+// involved.
 func TestIntegrationTuyaFramesReachHLSThroughExistingPipeline(t *testing.T) {
 	stack := startLiveStack(t)
 
 	if !IsTuyaProfileToken(stack.info.ProfileToken) {
 		t.Fatalf("profile token %q is not namespaced", stack.info.ProfileToken)
+	}
+	if !stack.engine.LocalRunning() {
+		t.Fatal("the in-process RTSP server is not running")
+	}
+	if stack.engine.PID() != 0 {
+		t.Fatalf("in-process backend has child pid %d", stack.engine.PID())
 	}
 	elapsed := stack.waitForSegments(t, 3, 3*time.Minute)
 	t.Logf("first 3 segments after %s", elapsed.Round(time.Second))
@@ -272,17 +284,21 @@ func TestIntegrationTuyaFramesReachHLSThroughExistingPipeline(t *testing.T) {
 
 // TestIntegrationEngineRestartRecoversStream kills the engine child process and
 // proves the supervisor respawns it and the HLS output advances again.
+//
+// This test is meaningful only for the opt-in external-binary backend: the
+// default in-process server is the viewer's own process and has no child to
+// kill, so it skips there rather than pretending to exercise something.
 func TestIntegrationEngineRestartRecoversStream(t *testing.T) {
 	stack := startLiveStack(t)
 	stack.waitForSegments(t, 3, 3*time.Minute)
 
 	beforePID := stack.engine.PID()
+	if beforePID <= 0 {
+		t.Skip("in-process backend has no child process to kill; set TUYA_ENGINE_MODE=external to exercise supervision")
+	}
 	beforeSegments := len(stack.segments())
 	beforeFrames, beforeDir := stack.decodeFrames(t, decodeFramesTarget)
 	t.Logf("BEFORE: pid=%d segments=%d frames=%d dir=%s", beforePID, beforeSegments, beforeFrames, beforeDir)
-	if beforePID <= 0 {
-		t.Fatal("engine has no pid before the kill")
-	}
 
 	// Kill exactly the child the supervisor is watching.
 	process, err := os.FindProcess(beforePID)
