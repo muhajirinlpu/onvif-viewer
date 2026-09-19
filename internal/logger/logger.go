@@ -33,6 +33,12 @@ type StreamLog struct {
 	Message   string    `json:"message"`
 }
 
+// StreamConfig is the minimal persisted configuration needed to restore a stream.
+type StreamConfig struct {
+	ProfileToken string
+	RTSPURL      string
+}
+
 // Logger handles database logging
 type Logger struct {
 	db            *sql.DB
@@ -64,6 +70,11 @@ func newLogger(dbPath string, maxRows, pruneInterval int) (*Logger, error) {
         level INTEGER,
         source TEXT,
         message TEXT
+    );
+    CREATE TABLE IF NOT EXISTS stream_configs (
+        profile_token TEXT PRIMARY KEY,
+        rtsp_url TEXT NOT NULL,
+        updated_at DATETIME NOT NULL
     );`
 	if _, err := db.Exec(query); err != nil {
 		db.Close()
@@ -90,6 +101,35 @@ func newLogger(dbPath string, maxRows, pruneInterval int) (*Logger, error) {
 		return nil, fmt.Errorf("failed to create log time index: %w", err)
 	}
 	return &Logger{db: db, maxRows: maxRows, pruneInterval: pruneInterval}, nil
+}
+
+// UpsertStreamConfig persists only a profile token and RTSP URL.
+func (l *Logger) UpsertStreamConfig(profileToken, rtspURL string) error {
+	_, err := l.db.Exec(`INSERT INTO stream_configs(profile_token, rtsp_url, updated_at) VALUES(?,?,?)
+		ON CONFLICT(profile_token) DO UPDATE SET rtsp_url=excluded.rtsp_url, updated_at=excluded.updated_at`, profileToken, rtspURL, time.Now())
+	return err
+}
+
+func (l *Logger) DeleteStreamConfig(profileToken string) error {
+	_, err := l.db.Exec(`DELETE FROM stream_configs WHERE profile_token=?`, profileToken)
+	return err
+}
+
+func (l *Logger) ListStreamConfigs() ([]StreamConfig, error) {
+	rows, err := l.db.Query(`SELECT profile_token, rtsp_url FROM stream_configs ORDER BY profile_token`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []StreamConfig
+	for rows.Next() {
+		var config StreamConfig
+		if err := rows.Scan(&config.ProfileToken, &config.RTSPURL); err != nil {
+			return nil, err
+		}
+		result = append(result, config)
+	}
+	return result, rows.Err()
 }
 
 // Close closes the database connection
