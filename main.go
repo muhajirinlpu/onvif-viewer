@@ -13,6 +13,7 @@ import (
 	"dengan.dev/camera-streamer/internal/logger"
 	"dengan.dev/camera-streamer/internal/onvif"
 	"dengan.dev/camera-streamer/internal/stream"
+	"dengan.dev/camera-streamer/internal/tuyaengine"
 )
 
 //go:embed static
@@ -48,6 +49,17 @@ func main() {
 	streamManager := stream.NewManager(hlsBaseDir, dbLogger)
 	streamManager.RestoreStreams()
 	go streamManager.CleanupInactiveClients()
+
+	// Tuya bridge: the engine is a supervised child process, started lazily on
+	// the first Tuya stream. It stays off entirely until TUYA_ENGINE_SESSION_FILE
+	// is configured, so an ONVIF-only install is unchanged.
+	tuyaBridge, err := tuyaengine.NewBridgeFromEnv(streamManager, dbLogger)
+	if err != nil {
+		log.Printf("Tuya bridge disabled: %v", err)
+	}
+	if tuyaBridge != nil {
+		defer tuyaBridge.Stop()
+	}
 
 	// Initialize HTTP handlers
 	apiHandler := handlers.New(streamManager, onvifClient, dbLogger)
