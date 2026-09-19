@@ -49,12 +49,13 @@ const (
 )
 
 // DefaultBinCandidates is the search order used when Config.BinPath is empty.
-// The first candidate that resolves is used; the temp path is last because it is
-// the already-proven build during bring-up, not a packaging location.
+// The first candidate that resolves is used. The durable ~/.local/bin path comes
+// first; /tmp is kept last only as a bring-up fallback, since a /tmp wipe would
+// otherwise break Tuya streaming.
 var DefaultBinCandidates = []string{
-	"go2rtc-qr",
-	"/usr/local/bin/go2rtc-qr",
-	"/usr/local/bin/go2rtc",
+	"go2rtc-tuyaqr",
+	"/home/muhajirin/.local/bin/go2rtc-tuyaqr",
+	"/usr/local/bin/go2rtc-tuyaqr",
 	"/tmp/go2rtc-qr",
 }
 
