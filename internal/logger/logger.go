@@ -24,6 +24,12 @@ const (
 
 	defaultMaxRows       = 100000
 	defaultPruneInterval = 1000
+
+	// tuyaProvider names the Tuya provider for the one query that must not
+	// filter Tuya rows out. It duplicates models.ProviderTuya deliberately:
+	// internal/logger sits BELOW internal/models, and importing upward for a
+	// single string would invert the layering for no benefit.
+	tuyaProvider = "tuya"
 )
 
 // StreamLog represents a log entry in the database
@@ -360,7 +366,15 @@ func (l *Logger) ListStreamConfigs() ([]StreamConfig, error) {
 	// because ONVIF was the only provider when they were written. The
 	// resolution is defaulted the same way, for the same reason: a row that
 	// predates the column reads back as the SD the product was running.
-	rows, err := l.db.Query(`SELECT profile_token, rtsp_url, COALESCE(NULLIF(provider, ''), '` + defaultProvider + `'), COALESCE(NULLIF(resolution, ''), '` + DefaultResolution + `') FROM stream_configs WHERE rtsp_url <> '' ORDER BY profile_token`)
+	//
+	// The URL filter exists so a PLACEHOLDER row -- one written when a camera's
+	// resolution is chosen before its first start -- is never replayed as a
+	// start. Tuya is exempt because a Tuya stream's URL is a loopback address on
+	// our own engine whose port changes every run, so it is stored empty BY
+	// DESIGN. A Tuya placeholder is still safe to return: the restore path asks
+	// the engine for the live address and skips anything the engine is not
+	// actually running, which is exactly what a never-started camera is.
+	rows, err := l.db.Query(`SELECT profile_token, rtsp_url, COALESCE(NULLIF(provider, ''), '` + defaultProvider + `'), COALESCE(NULLIF(resolution, ''), '` + DefaultResolution + `') FROM stream_configs WHERE rtsp_url <> '' OR provider = '` + tuyaProvider + `' ORDER BY profile_token`)
 	if err != nil {
 		return nil, err
 	}

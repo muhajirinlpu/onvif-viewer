@@ -50,6 +50,14 @@ func (b *Bridge) StartStream(spec DeviceSpec) (*models.StreamInfo, error) {
 // Resolve returns the RTSP URL currently served for a device id.
 func (b *Bridge) Resolve(deviceID string) (string, error) { return b.engine.Resolve(deviceID) }
 
+// ResolveProfileToken returns the RTSP URL currently served for a namespaced
+// profile token ("tuya:<deviceID>"). The stream manager needs this at restore
+// time, because the loopback port changes on every start and a stored URL would
+// otherwise point at a port the engine no longer owns.
+func (b *Bridge) ResolveProfileToken(profileToken string) (string, error) {
+	return b.engine.ResolveStream(profileToken)
+}
+
 // Engine exposes the supervised engine (ports, events, config paths).
 func (b *Bridge) Engine() *Engine { return b.engine }
 

@@ -183,6 +183,13 @@ type Manager struct {
 	// is what every production call site has always used; it is a field purely so
 	// a test can substitute a stub instead of spawning a real encoder.
 	ffmpegBin string
+	// tuyaRTSPURL resolves the CURRENT loopback RTSP URL for a Tuya profile
+	// token. It exists because a Tuya stream's URL points at our own in-process
+	// engine, which binds an EPHEMERAL port (127.0.0.1:0) that changes on every
+	// start. Persisting that URL would freeze a port the engine no longer owns,
+	// so a restored Tuya stream would retry a dead address forever. Nil means
+	// "this manager has no Tuya engine", and Tuya URLs then behave as opaque.
+	tuyaRTSPURL func(profileToken string) (string, error)
 }
 
 // NewManager creates a new stream manager
@@ -198,6 +205,34 @@ func NewManager(hlsBaseDir string, logger *logger.Logger) *Manager {
 	}
 }
 
+// SetTuyaURLResolver installs the resolver used to obtain a Tuya stream's
+// current loopback RTSP URL. It is separate from NewManager so existing callers
+// and tests keep working unchanged; a manager with no resolver treats Tuya URLs
+// as opaque and never re-resolves them.
+func (sm *Manager) SetTuyaURLResolver(resolve func(profileToken string) (string, error)) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+	sm.tuyaRTSPURL = resolve
+}
+
+// resolveTuyaURL returns the live loopback URL for a Tuya profile token.
+// An unset resolver, or a token that is not a Tuya stream, is not an error: the
+// caller keeps whatever URL it had.
+func (sm *Manager) resolveTuyaURL(profileToken string) (string, bool) {
+	sm.mutex.RLock()
+	resolve := sm.tuyaRTSPURL
+	sm.mutex.RUnlock()
+	if resolve == nil {
+		return "", false
+	}
+	url, err := resolve(profileToken)
+	if err != nil || url == "" {
+		return "", false
+	}
+	return url, true
+}
+
+// newStreamID returns a unique stream id.
 func newStreamID() string {
 	return fmt.Sprintf("stream_%d", time.Now().UnixNano())
 }
@@ -300,7 +335,17 @@ func (sm *Manager) startStreamWithOptions(profileToken, rtspURL string, provider
 		return nil, fmt.Errorf("failed to create HLS directory: %v", err)
 	}
 	if persist {
-		if err := sm.logger.UpsertStreamConfig(profileToken, rtspURL, string(provider)); err != nil {
+		// A Tuya stream's URL points at our own in-process engine, which binds
+		// an ephemeral loopback port that changes every start. Persisting it
+		// would freeze a port the engine will not own again, so a restored Tuya
+		// stream would retry a dead address forever (observed live: 17 attempts
+		// with the backoff grown to a minute). Store it empty and resolve the
+		// live address at restore time instead.
+		persistedRTSPURL := rtspURL
+		if provider == models.ProviderTuya {
+			persistedRTSPURL = ""
+		}
+		if err := sm.logger.UpsertStreamConfig(profileToken, persistedRTSPURL, string(provider)); err != nil {
 			_ = os.RemoveAll(hlsDir)
 			return nil, fmt.Errorf("persist stream configuration: %w", err)
 		}
@@ -361,9 +406,28 @@ func (sm *Manager) RestoreStreams() {
 		}
 		for _, config := range configs {
 			provider := models.ProviderKind(config.Provider).OrDefault()
+			rtspURL := config.RTSPURL
+			// A Tuya stream stores no URL, because its URL is a loopback address
+			// on our own engine whose port changes every start. Ask the engine
+			// for the address it actually owns right now; replaying a stored one
+			// would retry a port that no longer exists, forever.
+			if provider == models.ProviderTuya {
+				resolved, ok := sm.resolveTuyaURL(config.ProfileToken)
+				if !ok {
+					sm.logger.LogWarn("", "restore", fmt.Sprintf(
+						"Tuya stream %s is not running in the engine; not restoring", config.ProfileToken))
+					continue
+				}
+				rtspURL = resolved
+			}
+			if rtspURL == "" {
+				sm.logger.LogWarn("", "restore", fmt.Sprintf(
+					"no RTSP URL available for profile %s; not restoring", config.ProfileToken))
+				continue
+			}
 			// The persisted resolution is replayed on restore, which is what
 			// makes a per-camera HD choice survive a server restart.
-			if _, err := sm.startStreamWithOptions(config.ProfileToken, config.RTSPURL, provider, config.Resolution, false); err != nil {
+			if _, err := sm.startStreamWithOptions(config.ProfileToken, rtspURL, provider, config.Resolution, false); err != nil {
 				sm.logger.LogError("", "restore", fmt.Sprintf("Failed to restore profile %s: %v", config.ProfileToken, err))
 			}
 		}

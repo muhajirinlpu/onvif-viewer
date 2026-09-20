@@ -230,6 +230,12 @@ func main() {
 	}
 	if tuyaBridge != nil {
 		defer tuyaBridge.Stop()
+		// A Tuya stream's RTSP URL is a loopback address on this in-process
+		// engine, and the engine binds an ephemeral port that changes every
+		// start. Give the manager a way to ask for the CURRENT address, so a
+		// restored Tuya stream reconnects to the live port instead of replaying
+		// a frozen one that no longer exists.
+		streamManager.SetTuyaURLResolver(tuyaBridge.ResolveProfileToken)
 	}
 
 	// Provider seam. The ONVIF provider is always present and is registered
