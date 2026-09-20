@@ -400,8 +400,80 @@
                   </div>
                 </div>
 
+                  <!-- M6: an honest session panel. The three questions are shown
+                       separately because collapsing them is what made the old
+                       copy misleading: a file being present is not the same as
+                       the cloud accepting it, and neither is the same as
+                       knowing when the cookies expire. -->
+                  <div v-if="tuyaSession.valid" class="p-4 rounded-lg bg-emerald-50 dark:bg-emerald-500/10 text-emerald-800 dark:text-emerald-300">
+                    <div class="flex items-start">
+                      <i class="fas fa-circle-check mr-2 mt-0.5"></i>
+                      <span class="text-sm">
+                        <span class="tuya-session-verified">Verified with the Tuya cloud</span>
+                        <span v-if="tuyaSession.email"> &middot; {{ tuyaSession.email }}</span>
+                        <span v-if="tuyaSession.region"> &middot; {{ tuyaSession.region }}</span>
+                        <span class="block text-xs mt-1">
+                          <span class="tuya-session-axes">
+                            file {{ tuyaSession.filePresent ? 'present' : 'absent' }} &middot;
+                            cloud {{ tuyaSession.cloudVerified ? 'verified' : 'not verified' }} &middot;
+                            expiry {{ tuyaSession.expiryKnown ? 'known' : 'unknown' }}
+                          </span>
+                          <span v-if="tuyaSession.checkedSecondsAgo !== undefined">
+                            &middot; last checked {{ tuyaSession.checkedSecondsAgo }}s ago
+                            <span v-if="tuyaSession.cacheTtlSeconds"> (cached for {{ tuyaSession.cacheTtlSeconds }}s)</span>
+                          </span>
+                        </span>
+                      </span>
+                    </div>
+                  </div>
+                  <!-- The expiry: a countdown ONLY when the cloud stated a
+                       deadline. Otherwise it says so, and never invents one. -->
+                  <div class="p-4 rounded-lg" :class="tuyaSession.expiryKnown ? 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300' : 'bg-amber-100 dark:bg-amber-500/20 text-amber-800 dark:text-amber-300'">
+                    <div class="flex items-start">
+                      <i class="fas mr-2 mt-0.5" :class="tuyaSession.expiryKnown ? 'fa-clock' : 'fa-circle-question'"></i>
+                      <span class="text-sm">
+                        <template v-if="tuyaSession.expiryKnown">
+                          <span class="tuya-expiry-known">Session expires {{ tuyaExpiryLabel }}</span>
+                          <span class="block text-xs mt-1">
+                            source: {{ tuyaSession.expirySource }}
+                            <span v-if="tuyaSession.cookiesWithExpiry !== undefined">
+                              &middot; {{ tuyaSession.cookiesWithExpiry }} of {{ tuyaSession.cookieCount }} cookies declare a deadline
+                            </span>
+                          </span>
+                        </template>
+                        <template v-else>
+                          <span class="tuya-expiry-unknown">Expiry unknown</span>
+                          <span class="block text-xs mt-1">
+                            The Tuya cloud did not state when this session expires, so no countdown can be shown.
+                            The session is verified live right now — re-login any time to capture a dated expiry.
+                          </span>
+                        </template>
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
                 <!-- Step: signed in, pick a camera -->
                 <div v-else class="space-y-4">
+                  <!-- M6: THE RE-LOGIN ACTION. When the session is dead this is
+                       the first thing in the panel, and it resumes the cameras
+                       that were running before. -->
+                  <div v-if="tuyaSession.reloginRequired"
+                    class="p-4 rounded-lg bg-amber-100 dark:bg-amber-500/20 text-amber-800 dark:text-amber-300">
+                    <div class="flex items-start">
+                      <i class="fas fa-triangle-exclamation mr-2 mt-0.5"></i>
+                      <span class="text-sm">
+                        <span class="tuya-relogin-required">The Tuya session has ended and the cameras were stopped</span>
+                        <span class="block text-xs mt-1" v-if="tuyaSession.expiredStreamsStopped">
+                          {{ tuyaSession.expiredStreamsStopped }} running stream(s) were stood down so nothing keeps
+                          retrying a dead source. Signing in again brings the same cameras straight back.
+                        </span>
+                        <span class="block text-xs mt-1" v-else>
+                          Signing in again brings the same cameras straight back — no need to re-add them.
+                        </span>
+                      </span>
+                    </div>
+                  </div>
                   <div>
                     <h3 class="text-sm font-medium mb-4 text-slate-500 dark:text-slate-400">TUYA CAMERAS</h3>
                     <p class="text-sm text-slate-600 dark:text-slate-300">
@@ -435,8 +507,13 @@
                     <i class="fas fa-rotate mr-2"></i>Reload camera list
                   </button>
                   <button type="button" class="provider-option w-full" @click="signOutTuya">
-                    <i class="fas fa-right-from-bracket mr-2"></i>Use a different Tuya account
+                    <i class="fas fa-right-from-bracket mr-2"></i>Sign out on this device
                   </button>
+                  <p class="text-xs text-slate-500 dark:text-slate-400">
+                    Tuya has no server-side logout: signing out removes the stored session from this device only,
+                    and the old cookies stay valid at the cloud until they expire. Your cameras keep their place and
+                    come back after the next sign-in.
+                  </p>
                 </div>
               </template>
 
@@ -508,6 +585,24 @@
                   <p v-if="stream.detail" class="text-sm mt-1 text-slate-600 dark:text-slate-300">{{ stream.detail }}</p>
                   <p v-if="stream.reconnectCount" class="text-xs mt-1 text-amber-600 dark:text-amber-400">Reconnect attempt {{ stream.reconnectCount }}<span v-if="stream.reconnectDelay"> · retry in {{ stream.reconnectDelay }}</span></p>
                   <p v-if="stream.lastHlsAdvance" class="text-xs mt-1 text-slate-500 dark:text-slate-400">Last video segment: {{ new Date(stream.lastHlsAdvance).toLocaleString() }}</p>
+                  <!-- M6: a stream whose Tuya session died says so on the card
+                       and offers the one action that fixes it. It is NOT a
+                       silently broken video element. -->
+                  <div v-if="stream.suspended || stream.status === 'needs_relogin'"
+                    class="tuya-card-relogin mt-2 p-3 rounded-lg bg-amber-100 dark:bg-amber-500/20 text-amber-800 dark:text-amber-300">
+                    <div class="flex items-start">
+                      <i class="fas fa-right-to-bracket mr-2 mt-0.5"></i>
+                      <span class="text-xs">
+                        <span class="block font-semibold">Re-login required</span>
+                        <span class="block">This camera's Tuya session ended, so its stream was stopped cleanly
+                          instead of retrying forever.</span>
+                      </span>
+                    </div>
+                    <button type="button" class="tuya-card-relogin-action mt-2 w-full bg-amber-600 hover:bg-amber-500 text-white px-3 py-2 rounded-lg text-xs font-medium"
+                      @click="beginTuyaRelogin">
+                      <i class="fas fa-qrcode mr-1"></i>Sign in again and resume this camera
+                    </button>
+                  </div>
                 </div>
                 <div class="stream-actions">
                   <!-- Video Size Selector -->
@@ -767,6 +862,25 @@
           return `${minutes}:${String(seconds).padStart(2, '0')} remaining`;
         });
 
+        // tuyaExpiryLabel renders the session cookie deadline. It is ONLY ever
+        // called when tuyaSession.expiryKnown is true, i.e. when the cloud
+        // itself stated the deadline. When the expiry is unknown the template
+        // shows "Expiry unknown" instead: computing a fake countdown from the
+        // file's age would be inventing a number the server never sent.
+        const tuyaExpiryLabel = computed(() => {
+          const raw = tuyaSession.value && tuyaSession.value.expiresAt;
+          if (!raw) return 'at an unknown time';
+          const when = new Date(raw);
+          if (Number.isNaN(when.getTime())) return 'at an unknown time';
+          const remaining = Number(tuyaSession.value.remainingSeconds || 0);
+          const hours = Math.floor(remaining / 3600);
+          const minutes = Math.floor((remaining % 3600) / 60);
+          const countdown = remaining > 0
+            ? `${hours}h ${String(minutes).padStart(2, '0')}m from now`
+            : 'now';
+          return `${when.toLocaleString()} (${countdown})`;
+        });
+
         const stopTuyaTimers = () => {
           if (tuyaPollTimer) { clearInterval(tuyaPollTimer); tuyaPollTimer = null; }
           if (tuyaCountdownTimer) { clearInterval(tuyaCountdownTimer); tuyaCountdownTimer = null; }
@@ -909,10 +1023,19 @@
               stopTuyaTimers();
               tuyaToken.value = '';
               tuyaQrExpired.value = false;
-              tuyaLoginMessage.value = 'Signed in. Loading your Tuya cameras...';
+              // M6: the scan that fixed the credential also brought the cameras
+              // back. The server resumes them, and says how many.
+              const resumed = Number(data.resumedStreams || 0);
+              tuyaLoginMessage.value = resumed > 0
+                ? `Signed in. ${resumed} camera stream(s) resumed — no device needed re-adding.`
+                : 'Signed in. Loading your Tuya cameras...';
               tuyaSession.value = { valid: true, ...(data.session || {}) };
               await refreshTuyaCameras();
-              if (!tuyaCameras.value.length) {
+              await loadStreams();
+              // The server may have stopped streams it could not restart; make
+              // sure the grid reflects reality rather than a stale card.
+              loadTuyaSession();
+              if (!tuyaCameras.value.length && resumed === 0) {
                 tuyaLoginMessage.value = 'Signed in, but this account has no Tuya cameras.';
               }
             }
@@ -921,13 +1044,38 @@
           }
         };
 
-        const signOutTuya = () => {
-          // Local-only: the stored session file is owned by the server and is
-          // never deleted from the browser.
-          resetTuyaLogin();
-          tuyaSession.value = { valid: false };
-          tuyaCameras.value = [];
-          tuyaLoginMessage.value = 'Scan a QR code to sign in to a Tuya account.';
+        const signOutTuya = async () => {
+          // M6: this is now a REAL local logout. It removes the stored session
+          // file from the server (Tuya exposes no server-side logout, so the
+          // cookies themselves stay valid at the cloud until they expire) and
+          // stands the Tuya streams down, keeping their place so a re-login
+          // resumes the same cameras.
+          try {
+            const resp = await fetch('/api/tuya/logout', { method: 'POST' });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              throw new Error(data.detail || 'Could not remove the stored Tuya session');
+            }
+            resetTuyaLogin();
+            tuyaSession.value = { valid: false, reloginRequired: true };
+            tuyaCameras.value = [];
+            tuyaLoginMessage.value = 'The stored Tuya session was removed from this device. '
+              + 'Tuya has no server-side logout, so the old cookies stay valid at the cloud until they expire. '
+              + 'Scan a QR code to sign in again — the same cameras come straight back.';
+            await loadStreams();
+          } catch (err) {
+            error.value = err.message;
+          }
+        };
+
+        // beginTuyaRelogin is THE ONE-CLICK RECOVERY, reachable from a stream
+        // card or the Tuya panel: open the modal on the Tuya tab and show a
+        // fresh QR immediately. The server resumes the stopped cameras as soon
+        // as the scan completes, so nothing has to be re-added.
+        const beginTuyaRelogin = async () => {
+          providerChoice.value = 'tuya';
+          configCollapsed.value = false;
+          await beginTuyaLogin();
         };
 
         // loadAvailableProviders asks the server which providers it has. A
@@ -1578,7 +1726,9 @@
           tuyaCamerasLoading,
           tuyaStarting,
           tuyaCountdownLabel,
+          tuyaExpiryLabel,
           beginTuyaLogin,
+          beginTuyaRelogin,
           refreshTuyaCameras,
           signOutTuya,
           startTuyaCamera,

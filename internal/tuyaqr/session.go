@@ -195,6 +195,59 @@ func (s *Session) AuthCookieStatus() (fastSID, sSID bool, count int) {
 	return fastSID, sSID, count
 }
 
+// EarliestCookieExpiry returns the soonest non-zero cookie expiry together with
+// the name of the cookie that carries it.
+//
+// MEASURED on the user's stored session: all four cookies have a ZERO expiry,
+// so `ok` is false and the caller MUST report the expiry as unknown rather than
+// guessing one. A session written after the real expiry was captured (see
+// applyReportedExpiry in login.go) does report one, and that value is the
+// cloud's own, not a client-side estimate.
+//
+// The name is returned so the API can say WHERE the number came from: a
+// deadline attributed to fast-sid (the cookie the cloud actually re-issues with
+// an `expires` attribute) is evidence; a deadline attributed to nothing is a
+// fabrication.
+func (s *Session) EarliestCookieExpiry() (time.Time, string, bool) {
+	if s == nil {
+		return time.Time{}, "", false
+	}
+	var earliest time.Time
+	name := ""
+	for _, c := range s.SessionData.Cookies {
+		if c == nil || c.Expires.IsZero() {
+			continue
+		}
+		if earliest.IsZero() || c.Expires.Before(earliest) {
+			earliest = c.Expires
+			name = c.Name
+		}
+	}
+	if earliest.IsZero() {
+		return time.Time{}, "", false
+	}
+	return earliest, name, true
+}
+
+// CookiesWithExpiry reports how many stored cookies declare an expiry. Used by
+// the API and the tests to distinguish "the cloud told us" from "we have no
+// idea", which is the whole point of the M6 honesty rule.
+func (s *Session) CookiesWithExpiry() (with, total int) {
+	if s == nil {
+		return 0, 0
+	}
+	for _, c := range s.SessionData.Cookies {
+		if c == nil {
+			continue
+		}
+		total++
+		if !c.Expires.IsZero() {
+			with++
+		}
+	}
+	return with, total
+}
+
 // CookieJar builds an http.CookieJar seeded with the stored cookies. The
 // cookies are registered for the session's server host. An error is returned
 // when the session lacks fast-sid or s-sid, because every authenticated

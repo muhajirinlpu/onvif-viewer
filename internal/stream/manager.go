@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -51,6 +52,12 @@ const (
 	playlistFirstSegmentGrace = 120 * time.Second
 )
 
+// StatusNeedsRelogin is the stream status used when a provider's stored session
+// was rejected by its cloud. The stream is deliberately stopped (so an HLS
+// watchdog cannot hot-loop ffmpeg against a dead source) but its card stays
+// visible and asks for a re-login.
+const StatusNeedsRelogin = "needs_relogin"
+
 // Process represents a single FFmpeg stream process
 type Process struct {
 	Info            models.StreamInfo
@@ -61,6 +68,11 @@ type Process struct {
 	logger          *logger.Logger
 	reconnectCount  int
 	shouldReconnect bool
+	// suspended marks a stream that was deliberately stood down while its
+	// registered state is kept, so the card stays visible and a resume can
+	// restart it later. Used by the M6 Tuya session-loss degradation.
+	suspended       bool
+	suspendedReason string
 	mutex           sync.RWMutex
 }
 
@@ -74,6 +86,10 @@ type Manager struct {
 	hlsBaseDir    string
 	logger        *logger.Logger
 	snapshotSem   chan struct{}
+	// ffmpegBin is the ffmpeg executable. Empty means "ffmpeg" from PATH, which
+	// is what every production call site has always used; it is a field purely so
+	// a test can substitute a stub instead of spawning a real encoder.
+	ffmpegBin string
 }
 
 // NewManager creates a new stream manager
@@ -115,14 +131,27 @@ func (sm *Manager) startStreamWithProvider(profileToken, rtspURL string, provide
 		return nil, fmt.Errorf("profile token and RTSP URL are required")
 	}
 	sm.mutex.Lock()
-	defer sm.mutex.Unlock()
 
 	// Check if stream already exists for this profile
 	for _, stream := range sm.streams {
 		stream.mutex.RLock()
 		if stream.Info.ProfileToken == profileToken {
+			suspended := stream.suspended
+			id := stream.Info.ID
 			info := stream.Info
 			stream.mutex.RUnlock()
+			if suspended {
+				// A suspended stream (Tuya session loss) is resumed in place
+				// with the URL the caller just resolved, so the card, the
+				// profile token and the persisted config are all reused and no
+				// device has to be re-selected.
+				//
+				// The manager lock MUST be dropped first: publishState
+				// broadcasts to SSE clients and re-takes sm.mutex as a reader,
+				// and Go's RWMutex is not reentrant.
+				sm.mutex.Unlock()
+				return sm.ResumeSuspended(id, rtspURL, provider)
+			}
 			if info.RtspURL != rtspURL {
 				return nil, fmt.Errorf("profile %s is already running with a different RTSP URL; stop it before starting the new URL", profileToken)
 			}
@@ -170,8 +199,12 @@ func (sm *Manager) startStreamWithProvider(profileToken, rtspURL string, provide
 
 	info := streamProcess.Info
 	sm.streams[streamID] = streamProcess
+	sm.mutex.Unlock()
 
 	// Monitor process only after the initial response snapshot is complete.
+	// The lock is released first: the monitor publishes state immediately, and
+	// publishState re-takes sm.mutex as a reader (Go's RWMutex is not
+	// reentrant).
 	go sm.monitorStreamWithReconnect(streamProcess, hlsDir)
 	return &info, nil
 }
@@ -440,7 +473,7 @@ func (sm *Manager) createFFmpegCommand(rtspURL string, hlsDir string) *exec.Cmd 
 		filepath.Join(hlsDir, "stream.m3u8"),
 	}
 
-	cmd := exec.Command("ffmpeg", args...)
+	cmd := exec.Command(ffmpegExecutable(sm.ffmpegBin), args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
@@ -448,10 +481,27 @@ func (sm *Manager) createFFmpegCommand(rtspURL string, hlsDir string) *exec.Cmd 
 	return cmd
 }
 
+// ffmpegExecutable resolves the encoder binary. Empty means the PATH's ffmpeg,
+// which is the only value any production caller produces.
+func ffmpegExecutable(override string) string {
+	if strings.TrimSpace(override) == "" {
+		return "ffmpeg"
+	}
+	return override
+}
+
 // monitorStreamWithReconnect monitors a stream and handles reconnection
 func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
-	defer close(process.Exited)
-	defer process.closed.Do(func() { close(process.Done) })
+	// Capture the channels THIS run owns. A resumed stream is given fresh Done
+	// and Exited channels, so a late-deferring previous run must close its own
+	// and never whatever the field happens to point at later.
+	process.mutex.RLock()
+	done := process.Done
+	exited := process.Exited
+	process.mutex.RUnlock()
+
+	defer close(exited)
+	defer process.closed.Do(func() { close(done) })
 
 	for {
 		startedAt := time.Now()
@@ -548,7 +598,7 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 			timer := time.NewTimer(sessionTableBackoff)
 			select {
 			case <-timer.C:
-			case <-process.Done:
+			case <-done:
 				timer.Stop()
 				return
 			}
@@ -568,7 +618,11 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 		timer := time.NewTimer(delay)
 		select {
 		case <-timer.C:
-		case <-process.Done:
+		case <-done:
+			// done is the channel THIS run owns. A resume replaces the process's
+			// Done/Exited with fresh ones, so waiting on the field would let an
+			// old, superseded monitor wake up after the resume and spawn a
+			// SECOND ffmpeg for the same stream.
 			timer.Stop()
 			return
 		}
@@ -903,6 +957,343 @@ func (sm *Manager) stopStream(streamID string, removeConfig bool) error {
 	}()
 
 	return nil
+}
+
+// SuspendStreamsForProvider stands down every stream of one provider without
+// forgetting it, and reports how many were suspended.
+//
+// This is the stream manager's half of the M6 Tuya session-loss degradation: a
+// Tuya stream whose cloud session is dead has no source, and the HLS watchdog
+// would otherwise restart ffmpeg against it forever. Only the named provider is
+// touched, so an ONVIF stream can never be stopped by a Tuya session expiring.
+//
+// A per-stream failure is collected and returned rather than aborting the sweep:
+// leaving the remaining streams running would be worse than a partial failure.
+func (sm *Manager) SuspendStreamsForProvider(provider models.ProviderKind, reason string) (int, error) {
+	provider = provider.OrDefault()
+	var ids []string
+	sm.mutex.RLock()
+	for id, process := range sm.streams {
+		process.mutex.RLock()
+		match := process.Info.Provider.OrDefault() == provider && !process.suspended
+		process.mutex.RUnlock()
+		if match {
+			ids = append(ids, id)
+		}
+	}
+	sm.mutex.RUnlock()
+
+	suspended := 0
+	var failures []string
+	for _, id := range ids {
+		if err := sm.SuspendStreamForSessionLoss(id, reason); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", id, err))
+			continue
+		}
+		suspended++
+	}
+	if len(failures) > 0 {
+		return suspended, fmt.Errorf("failed to suspend %d stream(s): %s", len(failures), strings.Join(failures, "; "))
+	}
+	return suspended, nil
+}
+
+// StopStreamsForProvider stops every running stream of one provider and reports
+// how many it stopped. Unlike SuspendStreamsForProvider it removes them, so
+// they are not resumable.
+func (sm *Manager) StopStreamsForProvider(provider models.ProviderKind) (int, error) {
+	provider = provider.OrDefault()
+	type target struct{ id, rtspURL string }
+	var targets []target
+	sm.mutex.RLock()
+	for id, process := range sm.streams {
+		process.mutex.RLock()
+		match := process.Info.Provider.OrDefault() == provider
+		rtspURL := process.Info.RtspURL
+		process.mutex.RUnlock()
+		if match {
+			targets = append(targets, target{id: id, rtspURL: rtspURL})
+		}
+	}
+	sm.mutex.RUnlock()
+
+	stopped := 0
+	var failures []string
+	for _, t := range targets {
+		if err := sm.StopStream(t.id); err != nil {
+			failures = append(failures, fmt.Sprintf("%s: %v", t.id, err))
+			continue
+		}
+		// The stop must be ASSERTED, not assumed: StopStream removes the stream
+		// from the registry, and a leaked ffmpeg from a superseded monitor would
+		// otherwise keep retrying a dead source invisibly. The URL was captured
+		// before the stop because the registry entry is gone by now. A freshly
+		// killed process needs a moment to leave /proc, hence the bounded wait.
+		if n := waitForNoFFmpegReader(sm, t.rtspURL, 3*time.Second); n > 0 {
+			failures = append(failures, fmt.Sprintf("%s: %d ffmpeg process(es) survived the stop", t.id, n))
+			continue
+		}
+		stopped++
+	}
+	if len(failures) > 0 {
+		return stopped, fmt.Errorf("failed to stop %d stream(s): %s", len(failures), strings.Join(failures, "; "))
+	}
+	return stopped, nil
+}
+
+// countFFmpegProcessesFor counts live ffmpeg processes reading the given RTSP URL
+// whose process GROUP this manager owns. It exists so a stop can be ASSERTED
+// rather than assumed: the whole point of the M6 degradation is that no ffmpeg is
+// left retrying a dead source, and a leaked process from a superseded monitor
+// would silently defeat it.
+//
+// Ownership is checked by process group, not by URL alone. An RTSP URL is only
+// unique within one engine instance — two viewer processes (or two test runs) on
+// the same host can legitimately hold the same loopback URL — so a URL-only scan
+// would report a foreign process as a leak. Every ffmpeg this manager spawns is
+// put in its own process group (Setpgid), which makes the pgid the honest owner.
+func countFFmpegProcessesFor(rtspURL string, ownedPGIDs map[int]bool) int {
+	if rtspURL == "" || len(ownedPGIDs) == 0 {
+		return 0
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name()[0] < '0' || entry.Name()[0] > '9' {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		if pgid, err := syscall.Getpgid(pid); err != nil || !ownedPGIDs[pgid] {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err != nil {
+			continue
+		}
+		// The URL field is NUL-separated in /proc/<pid>/cmdline.
+		if strings.Contains(string(raw), rtspURL) {
+			n++
+		}
+	}
+	return n
+}
+
+// ownedProcessGroups collects the process groups of the ffmpeg children this
+// manager currently tracks. A stream whose ffmpeg has already exited contributes
+// nothing, which is the correct reading: there is no process to leak.
+func (sm *Manager) ownedProcessGroups(rtspURL string) map[int]bool {
+	owned := map[int]bool{}
+	sm.mutex.RLock()
+	processes := make([]*Process, 0, len(sm.streams))
+	for _, p := range sm.streams {
+		processes = append(processes, p)
+	}
+	sm.mutex.RUnlock()
+	for _, process := range processes {
+		process.mutex.RLock()
+		cmd := process.Command
+		url := process.Info.RtspURL
+		process.mutex.RUnlock()
+		if rtspURL != "" && url != rtspURL {
+			continue
+		}
+		if cmd != nil && cmd.Process != nil {
+			if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil {
+				owned[pgid] = true
+			}
+		}
+	}
+	return owned
+}
+
+// SuspendStreamForSessionLoss stands a stream down WITHOUT forgetting it.
+//
+// Unlike StopStream it leaves the stream in the registry and leaves its
+// persisted stream_configs row alone, so:
+//   - /api/stream/list still reports it, with status "needs_relogin", which is
+//     how the card stays on screen and says why instead of silently vanishing;
+//   - ResumeSuspended can restart exactly the same profile token with the RTSP
+//     URL the engine hands back after a fresh login.
+//
+// This is what makes "one-click re-login resumes the same cameras" possible
+// without the user re-picking anything.
+func (sm *Manager) SuspendStreamForSessionLoss(streamID, reason string) error {
+	sm.mutex.RLock()
+	process, ok := sm.streams[streamID]
+	sm.mutex.RUnlock()
+	if !ok {
+		return fmt.Errorf("stream not found")
+	}
+	process.mutex.Lock()
+	process.shouldReconnect = false
+	process.suspended = true
+	process.suspendedReason = redactSensitiveText(reason)
+	cmd := process.Command
+	process.Info.Status = StatusNeedsRelogin
+	process.Info.Detail = redactSensitiveText(reason)
+	process.Info.Suspended = true
+	process.Info.SuspendedReason = process.suspendedReason
+	process.mutex.Unlock()
+
+	sm.logger.LogWarn(streamID, "system", fmt.Sprintf("Suspending stream: %s", reason))
+	sm.publishState(process, StatusNeedsRelogin, reason)
+
+	// Capture the channels and URL THIS process owns before terminating.
+	process.mutex.RLock()
+	rtspURL := process.Info.RtspURL
+	currentCmd := process.Command
+	process.mutex.RUnlock()
+	if currentCmd == nil {
+		currentCmd = cmd
+	}
+	// The previous monitor's Done: awaiting it proves that loop has returned and
+	// cannot spawn another ffmpeg afterwards.
+	process.mutex.RLock()
+	previousDone := process.Done
+	process.mutex.RUnlock()
+
+	// Terminate the process group, then wait for the monitor to confirm exit so
+	// no ffmpeg can be left reading a dead source.
+	if currentCmd != nil && currentCmd.Process != nil {
+		if pgid, err := syscall.Getpgid(currentCmd.Process.Pid); err == nil {
+			_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		} else {
+			_ = currentCmd.Process.Signal(syscall.SIGTERM)
+		}
+	}
+	grace := time.NewTimer(streamStopTimeout)
+	select {
+	case <-previousDone:
+		grace.Stop()
+	case <-grace.C:
+		if currentCmd != nil && currentCmd.Process != nil {
+			if pgid, err := syscall.Getpgid(currentCmd.Process.Pid); err == nil {
+				_ = syscall.Kill(-pgid, syscall.SIGKILL)
+			} else {
+				_ = currentCmd.Process.Kill()
+			}
+		}
+	}
+
+	// ASSERT the bleed is really stopped. If an ffmpeg is still reading this
+	// stream's URL, say so loudly instead of reporting a clean degradation:
+	// leaving one alive is exactly the endless-retry failure M6 exists to end.
+	// A just-SIGKILLed process can need a moment to disappear from /proc, so the
+	// check retries briefly rather than crying wolf.
+	if n := waitForNoFFmpegReader(sm, rtspURL, 3*time.Second); n > 0 {
+		msg := fmt.Sprintf("stream suspended but %d ffmpeg process(es) are still reading %s", n, rtspURL)
+		sm.logger.LogError(streamID, "system", msg)
+		return fmt.Errorf("%s", msg)
+	}
+	return nil
+}
+
+// waitForNoFFmpegReader waits briefly for every ffmpeg reading rtspURL to be
+// gone, then reports how many are left (0 = all clear).
+func waitForNoFFmpegReader(sm *Manager, rtspURL string, timeout time.Duration) int {
+	deadline := time.Now().Add(timeout)
+	for {
+		n := countFFmpegProcessesFor(rtspURL, sm.ownedProcessGroups(rtspURL))
+		if n == 0 || !time.Now().Before(deadline) {
+			return n
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// SuspendedStreams returns the suspended streams of a provider, in profile-token
+// order so a resume is deterministic.
+func (sm *Manager) SuspendedStreams(provider models.ProviderKind) []models.StreamInfo {
+	provider = provider.OrDefault()
+	var out []models.StreamInfo
+	sm.mutex.RLock()
+	defer sm.mutex.RUnlock()
+	for _, process := range sm.streams {
+		process.mutex.RLock()
+		if process.suspended && process.Info.Provider.OrDefault() == provider {
+			out = append(out, process.Info)
+		}
+		process.mutex.RUnlock()
+	}
+	return out
+}
+
+// ResumeSuspended restarts a suspended stream with a (possibly new) RTSP URL.
+//
+// It is the recovery half of SuspendStreamForSessionLoss. The process registry
+// entry and the persisted config are reused, so the same card, the same profile
+// token and the same provider survive; only the RTSP URL changes, because the
+// engine allocates a fresh loopback endpoint after a re-login.
+func (sm *Manager) ResumeSuspended(streamID, rtspURL string, provider models.ProviderKind) (*models.StreamInfo, error) {
+	sm.mutex.RLock()
+	process, ok := sm.streams[streamID]
+	sm.mutex.RUnlock()
+	if !ok {
+		return nil, fmt.Errorf("stream not found")
+	}
+	// The write lock is held only for the registry mutation; publishState
+	// broadcasts to SSE clients, which re-takes sm.mutex as a reader, so it must
+	// run after the unlock (Go's RWMutex is not reentrant).
+	info, err := sm.resumeSuspendedProcess(process, rtspURL, provider)
+	if err != nil {
+		return nil, err
+	}
+	sm.publishState(process, "starting", "stream resumed after a successful Tuya re-login")
+	return info, nil
+}
+
+// resumeSuspendedProcess performs the resume. It takes only the per-process lock
+// (the process pointer is already resolved by the caller), so callers must NOT
+// hold sm.mutex: publishState re-takes it as a reader and Go's RWMutex is not
+// reentrant.
+func (sm *Manager) resumeSuspendedProcess(process *Process, rtspURL string, provider models.ProviderKind) (*models.StreamInfo, error) {
+	if process == nil {
+		return nil, fmt.Errorf("stream not found")
+	}
+	process.mutex.Lock()
+	if !process.suspended {
+		streamID := process.Info.ID
+		process.mutex.Unlock()
+		return nil, fmt.Errorf("stream %s is not suspended", streamID)
+	}
+	if rtspURL == "" {
+		process.mutex.Unlock()
+		return nil, fmt.Errorf("an RTSP URL is required to resume a stream")
+	}
+	streamID := process.Info.ID
+	process.Info.RtspURL = rtspURL
+	process.Info.Provider = provider.OrDefault()
+	process.reconnectCount = 0
+	process.suspended = false
+	process.suspendedReason = ""
+	process.shouldReconnect = true
+	process.Info.Status = "starting"
+	process.Info.Suspended = false
+	process.Info.SuspendedReason = ""
+	// Done and Exited are single-use: the previous monitor closed them on its
+	// way out. A resumed stream needs FRESH ones, or the new monitor would
+	// close an already-closed channel and the stop path would return instantly.
+	process.Done = make(chan bool)
+	process.Exited = make(chan struct{})
+	process.closed = sync.Once{}
+	process.Info.ReconnectDelay = ""
+	profileToken := process.Info.ProfileToken
+	info := process.Info
+	process.mutex.Unlock()
+
+	if err := sm.logger.UpsertStreamConfig(profileToken, rtspURL, string(provider.OrDefault())); err != nil {
+		return nil, fmt.Errorf("persist stream configuration: %w", err)
+	}
+	// A fresh monitor owns the ffmpeg lifecycle from here. The previous one has
+	// already returned (the suspend path waited for Exited).
+	go sm.monitorStreamWithReconnect(process, filepath.Join(sm.hlsBaseDir, streamID))
+	return &info, nil
 }
 
 // ListStreams returns information about all active streams

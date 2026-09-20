@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"embed"
+	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
@@ -9,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"dengan.dev/camera-streamer/internal/handlers"
 	"dengan.dev/camera-streamer/internal/logger"
@@ -44,6 +47,44 @@ type providerStarter struct {
 
 func (s providerStarter) StartStream(profileToken, rtspURL string) (*models.StreamInfo, error) {
 	return s.manager.StartStreamForProvider(profileToken, rtspURL, s.provider)
+}
+
+// tuyaSessionCheckInterval is how often the Tuya session is probed while the
+// process is idle. It is deliberately far longer than the provider's own
+// validation cache: the point is to notice a session that dies while nothing is
+// being started, not to poll the cloud.
+const tuyaSessionCheckInterval = 3 * time.Minute
+
+// tuyaSessionWatchdog probes the Tuya session periodically so a session that
+// dies while the user is not touching anything is noticed, and the Tuya streams
+// are stood down, instead of being left for the HLS watchdog to restart against
+// a dead source.
+//
+// It is read-mostly and cheap: the provider caches the verdict for its own
+// validateTTL, and the check itself is one authenticated call.
+func tuyaSessionWatchdog(t *provider.Tuya, log *logger.Logger) {
+	ticker := time.NewTicker(tuyaSessionCheckInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !t.Configured() {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		status, err := t.Session(ctx)
+		cancel()
+		if err != nil {
+			log.LogWarn("tuya", "tuya", "periodic Tuya session check failed: "+err.Error())
+			continue
+		}
+		if status == nil || status.Valid {
+			continue
+		}
+		// Session(), not this loop, is what stands the streams down; log only
+		// the transition-worthy fact, never cookie material.
+		log.LogWarn("tuya", "tuya", fmt.Sprintf(
+			"periodic Tuya session check: session invalid (filePresent=%t cloudVerified=%t); streams stood down until a new QR scan",
+			status.FilePresent, status.CloudVerified))
+	}
 }
 
 func main() {
@@ -101,6 +142,7 @@ func main() {
 		}
 		tuyaProvider = provider.NewTuya(sessionFile,
 			provider.WithTuyaBridge(streaming),
+			provider.WithTuyaStreamStopper(streamManager),
 			provider.WithTuyaHost(tuyaengine.DefaultTuyaHost),
 			provider.WithTuyaLogger(dbLogger),
 		)
@@ -154,6 +196,16 @@ func main() {
 	http.HandleFunc("/api/tuya/login/begin", apiHandler.TuyaLoginBegin)
 	http.HandleFunc("/api/tuya/login/poll", apiHandler.TuyaLoginPoll)
 	http.HandleFunc("/api/tuya/session", apiHandler.TuyaSession)
+	http.HandleFunc("/api/tuya/logout", apiHandler.TuyaLogout)
+	http.HandleFunc("/api/tuya/resume", apiHandler.TuyaResume)
+
+	// M6: a periodic session watchdog. Without it, a session that dies while
+	// nothing is being started would only be noticed the next time the user
+	// opened the Tuya panel, and the running streams would keep their ffmpeg
+	// pointed at a dead source until the HLS watchdog began restarting it.
+	if tuyaProvider != nil {
+		go tuyaSessionWatchdog(tuyaProvider, dbLogger)
+	}
 
 	// Setup signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)

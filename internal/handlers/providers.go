@@ -211,24 +211,67 @@ func (h *Handler) TuyaLoginPoll(w http.ResponseWriter, r *http.Request) {
 		if h.onTuyaSession != nil && h.tuyaProvider != nil {
 			h.onTuyaSession()
 		}
+		// ...and the cameras that were stood down when the old session died
+		// must come back WITHOUT the user re-selecting them. This is the
+		// one-click recovery: the same scan that fixes the credential also
+		// restarts the same streams, because their profile tokens were kept.
+		if h.tuyaProvider != nil {
+			resumed, failures, err := h.tuyaProvider.ResumeStreams(r.Context())
+			result.ResumedStreams = resumed
+			result.ResumeFailures = failures
+			if resumed > 0 {
+				h.logger.LogInfo("", "tuya", fmt.Sprintf("resumed %d Tuya stream(s) after the re-login; no device was re-selected", resumed))
+			}
+			if err != nil {
+				h.logger.LogWarn("", "tuya", fmt.Sprintf("some Tuya streams could not be resumed: %v", err))
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, result)
 }
 
 // TuyaSession serves GET /api/tuya/session.
 //
-// Response 200 (never contains a cookie value or an sid):
+// The response answers FOUR independent questions instead of collapsing them
+// into one misleading "valid" flag:
 //
-//	{"configured":true,"valid":true,"expiresAt":null,"remainingSeconds":0,
-//	 "lastRefresh":"...","cookieNames":["gTyPlatLang","locale","fast-sid","s-sid"],
-//	 "detail":"accepted by the cloud; the stored cookies declare no expiry"}
+//	configured      - is a Tuya session file wired up in this process?
+//	filePresent     - does it load and carry fast-sid/s-sid?
+//	cloudVerified   - did an ACTUAL authenticated call to the cloud succeed?
+//	expiryKnown     - did the cloud ever state when the cookies expire?
+//
+// `expiryKnown:false` is an honest answer, not a failure: MEASURED, the user's
+// stored session has a ZERO expiry on all four cookies, so no truthful
+// countdown exists for it. `expiresAt` is then null, `remainingSeconds` is 0 and
+// `expirySource` is "unknown". A countdown is only ever shown for a value the
+// cloud itself reported (`expirySource: "cookie:fast-sid"`).
+//
+// Response 200 (valid, expiry known):
+//
+//	{"configured":true,"filePresent":true,"cloudVerified":true,"valid":true,
+//	 "expiresAt":"2026-09-22T12:56:20Z","remainingSeconds":214000,"expiryKnown":true,
+//	 "expirySource":"cookie:fast-sid","cookiesWithExpiry":3,"cookieCount":4,
+//	 "checkedSecondsAgo":0,"cacheTtlSeconds":30,"reloginRequired":false,"detail":"..."}
+//
+// Response 200 (valid, expiry UNKNOWN — the honest case today):
+//
+//	{"configured":true,"filePresent":true,"cloudVerified":true,"valid":true,
+//	 "expiresAt":null,"remainingSeconds":0,"expiryKnown":false,
+//	 "expirySource":"unknown","cookiesWithExpiry":0,"cookieCount":4,
+//	 "detail":"accepted by the cloud; the stored cookies declare no expiry, so no countdown can be shown"}
+//
+// Response 200 (session dead — cloud-verified, not merely absent):
+//
+//	{"configured":true,"filePresent":true,"cloudVerified":false,"valid":false,
+//	 "reloginRequired":true,"expiredStreamsStopped":1,
+//	 "detail":"the stored Tuya session was rejected by the cloud; scan a new QR code"}
 func (h *Handler) TuyaSession(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	if h.tuyaProvider == nil {
-		writeJSON(w, http.StatusOK, &provider.SessionStatus{Configured: false, Valid: false, Detail: "Tuya is not configured in this process"})
+		writeJSON(w, http.StatusOK, &provider.SessionStatus{Configured: false, Detail: "Tuya is not configured in this process"})
 		return
 	}
 	status, err := h.tuyaProvider.Session(r.Context())
@@ -237,6 +280,111 @@ func (h *Handler) TuyaSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, status)
+}
+
+// TuyaLogout serves POST /api/tuya/logout.
+//
+// It removes the stored session file from this host. HONESTY: Tuya exposes NO
+// server-side logout endpoint for these cookies, so this is local credential
+// removal — the cookies would still be accepted by the cloud until they expire.
+// Removing the file is nevertheless the right local action: it is what makes the
+// UI stop using a credential the user asked to be rid of, and it is what forces
+// the one-click QR flow.
+//
+// Response 200:
+//
+//	{"removed":true,"sessionFile":"/path/...","serverSideLogout":false,
+//	 "detail":"the stored Tuya session file was removed from this host; Tuya has no server-side logout, so the cookies remain valid at the cloud until they expire"}
+type TuyaLogoutResponse struct {
+	Removed           bool   `json:"removed"`
+	SessionFile       string `json:"sessionFile,omitempty"`
+	ServerSideLogout  bool   `json:"serverSideLogout"`
+	ReloginRequired   bool   `json:"reloginRequired"`
+	StreamsStopped    int    `json:"streamsStopped"`
+	Detail            string `json:"detail"`
+}
+
+func (h *Handler) TuyaLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.logins == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "Tuya login is not configured in this process"})
+		return
+	}
+	removed, err := h.logins.Logout()
+	if err != nil {
+		h.logger.LogError("", "tuya", fmt.Sprintf("Tuya logout could not remove the stored session: %v", err))
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "the stored Tuya session file could not be removed"})
+		return
+	}
+
+	// A logout invalidates the credentials this process holds. The streams
+	// cannot survive it, and stopping them here is the same "stop the bleed"
+	// rule as a cloud rejection: after a deliberate logout the user IS going to
+	// re-login, so the streams keep their place and can be resumed.
+	stopped := 0
+	if h.tuyaProvider != nil {
+		h.tuyaProvider.Invalidate()
+		if n, err := h.tuyaProvider.SuspendStreams(); err != nil {
+			h.logger.LogWarn("", "tuya", fmt.Sprintf("logout: standing down Tuya streams: %v", err))
+			stopped = n
+		} else {
+			stopped = n
+		}
+	}
+	h.logger.LogWarn("", "tuya", "stored Tuya session removed locally (no server-side logout exists); a new QR scan is required")
+
+	writeJSON(w, http.StatusOK, &TuyaLogoutResponse{
+		Removed:          removed,
+		ServerSideLogout: false,
+		ReloginRequired:  true,
+		StreamsStopped:   stopped,
+		Detail: "the stored Tuya session file was removed from this host; Tuya has no server-side logout, " +
+			"so the cookies remain valid at the cloud until they expire",
+	})
+}
+
+// TuyaResume serves POST /api/tuya/resume.
+//
+// It restarts the Tuya streams that were stood down when the session died (or
+// when the user logged out), using whatever session file is on disk now. It is
+// the second half of the one-click re-login: the UI calls this right after a
+// successful scan, and the SAME cameras come back without the user re-picking
+// anything, because the suspended streams kept their profile tokens.
+//
+// It is safe to call when nothing is suspended: it then reports resumed=0.
+//
+// Response 200:
+//
+//	{"resumed":1,"failures":[],"detail":"1 Tuya stream resumed without re-selecting a device"}
+func (h *Handler) TuyaResume(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.tuyaProvider == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "Tuya streaming is not configured in this process"})
+		return
+	}
+	resumed, failures, err := h.tuyaProvider.ResumeStreams(r.Context())
+	if err != nil && resumed == 0 && len(failures) == 0 {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"detail": err.Error(), "resumed": 0})
+		return
+	}
+	detail := fmt.Sprintf("%d Tuya stream(s) resumed without re-selecting a device", resumed)
+	if len(failures) > 0 {
+		detail = fmt.Sprintf("%d resumed, %d could not be resumed", resumed, len(failures))
+	}
+	if err != nil {
+		h.logger.LogWarn("", "tuya", fmt.Sprintf("Tuya resume: %v (failures: %s)", err, strings.Join(failures, "; ")))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"resumed":  resumed,
+		"failures": failures,
+		"detail":   detail,
+	})
 }
 
 // respondProviderError maps a discovery failure onto a status the UI can act on:

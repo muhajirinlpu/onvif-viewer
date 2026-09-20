@@ -281,7 +281,7 @@ func (c *Client) PollLogin(ctx context.Context, login *Login) (*Session, bool, e
 	}
 	hc := c.httpWithJar(jar)
 
-	body, status, err := c.postWith(ctx, hc, pathPoll, payload)
+	body, status, setCookies, err := c.postWithHeaders(ctx, hc, pathPoll, payload)
 	if err != nil {
 		return nil, false, err
 	}
@@ -315,32 +315,128 @@ func (c *Client) PollLogin(ctx context.Context, login *Login) (*Session, bool, e
 		if err := json.Unmarshal(r.Result, &lr); err != nil {
 			return nil, false, fmt.Errorf("tuyaqr: poll: cannot decode login result: %w", err)
 		}
-		sess, err := c.sessionFrom(lr, jar)
+		sess, err := c.sessionFrom(lr, jar, setCookies)
 		if err != nil {
 			return nil, false, err
+		}
+		// The poll's own Set-Cookie is a SESSION cookie on the real cloud: it
+		// carries no Expires, so nothing truthful can be persisted from it.
+		// One authenticated call with the freshly captured credentials fixes
+		// that: MEASURED, the cloud re-emits `fast-sid` WITH the real expiry
+		// (~2.5 days out) on every authenticated response. Whatever the cloud
+		// reports is stored verbatim; when it reports nothing, the stored
+		// expiry stays zero and the API keeps saying "unknown" rather than
+		// inventing a deadline.
+		if _, _, probeSet, probeErr := c.postWithHeaders(ctx, hc, pathHomeList, nil); probeErr == nil {
+			sess.applyReportedExpiry(probeSet, time.Now())
 		}
 		return sess, true, nil
 	}
 	return nil, false, nil
 }
 
-// sessionFrom assembles a Session from a completed login + the jar that
-// captured the cookies.
-func (c *Client) sessionFrom(lr LoginResult, jar http.CookieJar) (*Session, error) {
+// applyReportedExpiry copies server-reported expiries onto the cookies of s,
+// matching by name. It only ever moves a stored expiry from zero to a real
+// future value: a response that declares no expiry (the common case for the
+// session cookies) leaves the stored value untouched, and a value in the past
+// is never persisted. Returns the number of cookies that gained an expiry.
+func (s *Session) applyReportedExpiry(setCookies []string, now time.Time) int {
+	if s == nil || len(setCookies) == 0 {
+		return 0
+	}
+	reported := capturedCookies(setCookies, now)
+	if len(reported) == 0 {
+		return 0
+	}
+	byName := make(map[string]time.Time, len(reported))
+	for _, c := range reported {
+		if c != nil && !c.Expires.IsZero() {
+			byName[c.Name] = c.Expires
+		}
+	}
+	applied := 0
+	for _, stored := range s.SessionData.Cookies {
+		if stored == nil {
+			continue
+		}
+		expiry, ok := byName[stored.Name]
+		if !ok {
+			continue
+		}
+		if stored.Expires.Equal(expiry) {
+			continue
+		}
+		stored.Expires = expiry
+		applied++
+	}
+	return applied
+}
+
+// capturedCookies converts the Set-Cookie headers of a response into stored
+// cookies, keeping the server-reported Expires.
+//
+// This is how a REAL cookie expiry enters the session file. The response's
+// cookie jar cannot be used for this: on a host-only cookie (no Domain
+// attribute, which is what the Tuya cloud sends) Go's cookiejar stores an empty
+// Domain, and http.Cookie.String() then renders the cookie as "Domain=", which
+// net/http parses back as a DOMAIN=NULL COOKIE with a DEFAULT PATH. Both are
+// then dropped by the jar, so the capture silently loses the credential.
+//
+// Reading the headers directly sidesteps that entirely: the Expires the cloud
+// actually sent is preserved verbatim.
+//
+// A past expiry is DROPPED rather than stored. Go's http.ParseCookie turns a
+// Set-Cookie with no Max-Age/Expires into "Expires=<year 1>; Max-Age=0", i.e.
+// the session cookie the QR login actually sets arrives as an expiry in the
+// year 1. Persisting that would make the API report a deadline in the past for
+// a session that works, which is exactly the kind of invented countdown this
+// milestone exists to prevent. Zero therefore means "the cloud declared none",
+// and the caller must report expiry as unknown.
+func capturedCookies(setCookies []string, now time.Time) []*Cookie {
+	out := make([]*Cookie, 0, len(setCookies))
+	for _, raw := range setCookies {
+		parsed, err := http.ParseSetCookie(raw)
+		if err != nil || parsed == nil || parsed.Name == "" {
+			continue
+		}
+		c := &Cookie{
+			Name:     parsed.Name,
+			Value:    parsed.Value,
+			Domain:   parsed.Domain,
+			Path:     parsed.Path,
+			Secure:   parsed.Secure,
+			HttpOnly: parsed.HttpOnly,
+		}
+		if !parsed.Expires.IsZero() && parsed.Expires.After(now) {
+			c.Expires = parsed.Expires
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// sessionFrom assembles a Session from a completed login, preferring the
+// Set-Cookie headers of the completing poll (which carry the server's real
+// expiry) and falling back to the jar when no headers were observed.
+func (c *Client) sessionFrom(lr LoginResult, jar http.CookieJar, setCookies []string) (*Session, error) {
 	origin := c.origin()
+	now := time.Now()
 	var cookies []*Cookie
-	for _, ck := range jar.Cookies(origin) {
-		cookies = append(cookies, &Cookie{
-			Name: ck.Name, Value: ck.Value, Domain: ck.Domain, Path: ck.Path,
-			Expires: ck.Expires, Secure: ck.Secure, HttpOnly: ck.HttpOnly,
-		})
+	if captured := capturedCookies(setCookies, now); len(captured) > 0 {
+		cookies = captured
+	} else {
+		for _, ck := range jar.Cookies(origin) {
+			cookies = append(cookies, &Cookie{
+				Name: ck.Name, Value: ck.Value, Domain: ck.Domain, Path: ck.Path,
+				Expires: ck.Expires, Secure: ck.Secure, HttpOnly: ck.HttpOnly,
+			})
+		}
 	}
 	if len(cookies) == 0 {
 		// The login succeeded but no cookies were captured: discovery would
 		// fail with USER_SESSION_LOSS. Fail loudly rather than persist junk.
 		return nil, errors.New("tuyaqr: login succeeded but no session cookies were set by the cloud")
 	}
-	now := time.Now()
 	s := &Session{
 		Region:      DefaultRegion,
 		Email:       lr.Email,
@@ -401,6 +497,28 @@ func NewClientForSessionFile(path string, opts ...Option) (*Client, *Session, er
 		return nil, nil, err
 	}
 	return c, s, nil
+}
+
+// RefreshExpiry performs ONE authenticated probe and folds any expiry the cloud
+// reports back into the session, updating LastValidated when the probe says the
+// session is still live. It returns ErrSessionExpired (wrapped) when the cloud
+// rejects the cookies, so the caller can both mark the session dead and stop the
+// streams it is feeding.
+//
+// This is the only way a stored expiry can legitimately appear for a session
+// that was captured before M6: the cloud re-issues fast-sid WITH its real expiry
+// on an authenticated call. Nothing here invents a value — if the cloud reports
+// none, the stored expiry stays zero and the API keeps saying "unknown".
+func (c *Client) RefreshExpiry(ctx context.Context, s *Session) error {
+	_, _, setCookies, err := c.postWithHeaders(ctx, c.http, pathHomeList, nil)
+	if err != nil {
+		return err
+	}
+	if s != nil {
+		s.applyReportedExpiry(setCookies, time.Now())
+		s.SessionData.LastValidated = time.Now()
+	}
+	return nil
 }
 
 // Validate checks the stored session against the cloud with a cheap
@@ -582,40 +700,53 @@ func (c *Client) httpWithJar(jar http.CookieJar) *http.Client {
 }
 
 func (c *Client) post(ctx context.Context, path string, body []byte) ([]byte, int, error) {
-	return c.postWith(ctx, c.http, path, body)
+	raw, status, _, err := c.postWithHeaders(ctx, c.http, path, body)
+	return raw, status, err
 }
 
+// postWith is postWithHeaders without the response headers.
 func (c *Client) postWith(ctx context.Context, hc *http.Client, path string, body []byte) ([]byte, int, error) {
+	raw, status, _, err := c.postWithHeaders(ctx, hc, path, body)
+	return raw, status, err
+}
+
+// postWithHeaders performs the request and also returns the raw Set-Cookie
+// headers. The QR-login poll needs them: they are the only place the cloud's
+// real cookie Expires is visible, and the cookie jar cannot carry it (a
+// host-only Set-Cookie round-tripped through Cookie.String() is re-parsed as a
+// domain=NULL cookie with a default path and then rejected by the jar).
+func (c *Client) postWithHeaders(ctx context.Context, hc *http.Client, path string, body []byte) ([]byte, int, []string, error) {
 	if body == nil {
 		body = []byte{}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(body))
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	c.applyHeaders(req, path)
 	resp, err := hc.Do(req)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if err != nil {
-		return nil, resp.StatusCode, err
+		return nil, resp.StatusCode, nil, err
 	}
+	setCookies := resp.Header.Values("Set-Cookie")
 	if resp.StatusCode == http.StatusUnauthorized {
 		var e apiEnvelope
 		_ = json.Unmarshal(raw, &e)
-		return raw, resp.StatusCode, &SessionExpiredError{
+		return raw, resp.StatusCode, setCookies, &SessionExpiredError{
 			StatusCode: resp.StatusCode, ErrorCode: firstNonEmpty(e.ErrCode, "USER_SESSION_LOSS"), ErrorMsg: e.ErrMsg,
 		}
 	}
 	if resp.StatusCode != http.StatusOK {
 		var e apiEnvelope
 		_ = json.Unmarshal(raw, &e)
-		return raw, resp.StatusCode, &APIError{StatusCode: resp.StatusCode, ErrorCode: e.ErrCode, ErrorMsg: firstNonEmpty(e.ErrMsg, strings.TrimSpace(string(raw)))}
+		return raw, resp.StatusCode, setCookies, &APIError{StatusCode: resp.StatusCode, ErrorCode: e.ErrCode, ErrorMsg: firstNonEmpty(e.ErrMsg, strings.TrimSpace(string(raw)))}
 	}
-	return raw, resp.StatusCode, nil
+	return raw, resp.StatusCode, setCookies, nil
 }
 
 // postInto posts and decodes the envelope's result into out, translating cloud

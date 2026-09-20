@@ -244,3 +244,133 @@ func TestFrontendOmitsONVIFOnlyControlsForTuyaCards(t *testing.T) {
 	}
 }
 
+// --- M6: session lifecycle --------------------------------------------------
+//
+// Again ADDITIVE. Every assertion above this line still guards the same token.
+
+func TestFrontendShowsExpiryOnlyWhenTheCloudStatedIt(t *testing.T) {
+	html := readIndexHTML(t)
+	for _, token := range []string{
+		// The three axes must be surfaced separately, because the whole point of
+		// M6 is that "a file exists" is not "the cloud accepted it".
+		"tuyaSession.filePresent",
+		"tuyaSession.cloudVerified",
+		"tuyaSession.expiryKnown",
+		"tuyaExpiryLabel",
+		"tuya-expiry-known",
+		"tuya-expiry-unknown",
+		"tuyaSession.expirySource",
+		// The honest absence of a number.
+		"Expiry unknown",
+		"no countdown can be shown",
+	} {
+		if !strings.Contains(html, token) {
+			t.Errorf("missing honest-expiry token %q", token)
+		}
+	}
+	// The countdown must be gated on expiryKnown, never rendered unconditionally.
+	if !strings.Contains(html, `v-if="tuyaSession.expiryKnown"`) {
+		t.Error("the expiry countdown must be gated on tuyaSession.expiryKnown")
+	}
+	if !strings.Contains(html, `v-else`) {
+		t.Error("expiryKnown=false must have its own honest branch")
+	}
+	// The label must never be derived from the file's age or a hardcoded TTL.
+	for _, forbidden := range []string{"SESSION_TTL", "sessionTtl", "LAST_REFRESH_TTL"} {
+		if strings.Contains(html, forbidden) {
+			t.Errorf("a fabricated client-side TTL appeared in the UI: %q", forbidden)
+		}
+	}
+}
+
+func TestFrontendOffersReLoginOnAffectedCards(t *testing.T) {
+	html := readIndexHTML(t)
+	for _, token := range []string{
+		"tuya-card-relogin",
+		"tuya-card-relogin-action",
+		"beginTuyaRelogin",
+		"Re-login required",
+		"Sign in again and resume this camera",
+		// The card must key off the suspended/needs_relogin state the server
+		// reports, not off a local guess.
+		"stream.suspended || stream.status === 'needs_relogin'",
+	} {
+		if !strings.Contains(html, token) {
+			t.Errorf("missing re-login token %q", token)
+		}
+	}
+	// The server-reported status string must match the Go constant exactly.
+	if !strings.Contains(html, "'needs_relogin'") {
+		t.Error("the card must recognise the needs_relogin status the server emits")
+	}
+	// The re-login action must live INSIDE the per-stream card.
+	loop := strings.Index(html, "v-for=\"stream in streams\" :key=\"stream.id\"")
+	if loop < 0 {
+		t.Fatal("the stream card loop is missing")
+	}
+	gridEnd := strings.Index(html[loop:], "<!-- Logs Panel -->")
+	if gridEnd < 0 {
+		t.Fatal("could not find the end of the card grid")
+	}
+	card := html[loop : loop+gridEnd]
+	if !strings.Contains(card, "beginTuyaRelogin") {
+		t.Error("the one-click re-login action must be inside the per-stream card")
+	}
+}
+
+func TestFrontendExplainsThatLogoutIsLocalOnly(t *testing.T) {
+	html := readIndexHTML(t)
+	for _, token := range []string{
+		"fetch('/api/tuya/logout'",
+		"Sign out on this device",
+		// The honesty note: no server-side logout exists.
+		"Tuya has no server-side logout",
+	} {
+		if !strings.Contains(html, token) {
+			t.Errorf("missing logout token %q", token)
+		}
+	}
+	// Signing out must NOT be described as revoking the account.
+	if strings.Contains(html, "Use a different Tuya account") &&
+		!strings.Contains(html, "emoves the stored session from this device only") {
+		t.Error("sign-out must be described as local credential removal, not as an account switch")
+	}
+}
+
+func TestFrontendResumesCamerasAfterAScanWithoutReselecting(t *testing.T) {
+	html := readIndexHTML(t)
+	for _, token := range []string{
+		// The server reports how many streams came back; the UI must say so.
+		"data.resumedStreams",
+		"resumed — no device needed re-adding",
+		// The grid must be refreshed so a stream that could NOT be resumed is
+		// not left as a stale card.
+		"await loadStreams()",
+	} {
+		if !strings.Contains(html, token) {
+			t.Errorf("missing resume-after-scan token %q", token)
+		}
+	}
+}
+
+func TestFrontendDoesNotRenderADeadVideoElementForADeadSession(t *testing.T) {
+	html := readIndexHTML(t)
+	// The re-login banner must be paired with the card, and the video element
+	// must not be the only thing shown.
+	loop := strings.Index(html, "v-for=\"stream in streams\" :key=\"stream.id\"")
+	if loop < 0 {
+		t.Fatal("the stream card loop is missing")
+	}
+	gridEnd := strings.Index(html[loop:], "<!-- Logs Panel -->")
+	if gridEnd < 0 {
+		t.Fatal("could not find the end of the card grid")
+	}
+	card := html[loop : loop+gridEnd]
+	if !strings.Contains(card, "Re-login required") {
+		t.Error("an affected card must say why it is not playing")
+	}
+	if !strings.Contains(card, "stopped cleanly") {
+		t.Error("an affected card must say the stream was stopped deliberately, not that it failed")
+	}
+}
+

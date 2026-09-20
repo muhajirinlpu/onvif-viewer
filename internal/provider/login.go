@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +43,13 @@ type PollResult struct {
 	Status           LoginStatus `json:"status"`
 	RemainingSeconds int         `json:"remainingSeconds"`
 	Session          *Session    `json:"session,omitempty"`
+	// ResumedStreams is how many Tuya streams came back automatically after a
+	// successful scan, with no device re-selected. This is the observable proof
+	// of the one-click recovery path.
+	ResumedStreams int `json:"resumedStreams,omitempty"`
+	// ResumeFailures names the devices whose streams could not be restarted
+	// (device ids only: never a credential).
+	ResumeFailures []string `json:"resumeFailures,omitempty"`
 }
 
 // Session is the secret-free summary of a freshly captured login.
@@ -234,6 +242,45 @@ func (m *LoginManager) Poll(ctx context.Context, token string) (*PollResult, err
 	summary.SavedAt = m.sessionFile
 	return &PollResult{Status: StatusDone, Session: summary}, nil
 }
+
+// Logout removes the stored session locally.
+//
+// HONEST NOTE: the Tuya protect cloud exposes NO server-side logout endpoint for
+// these cookies — there is no call that invalidates a fast-sid/s-sid pair. So
+// this is LOCAL credential removal and nothing else: the file is gone from this
+// host, but the cookies themselves would still be accepted by the cloud until
+// they expire. That is why the UI words it as "sign out on this device" rather
+// than pretending the session was revoked server-side.
+//
+// The file is removed with os.Remove, not emptied, so no truncated credential
+// can be left behind. An already-absent file is not an error: the caller asked
+// for "no session", and that is the state.
+func (m *LoginManager) Logout() (removed bool, err error) {
+	m.mu.Lock()
+	// In-flight handshakes belong to the old account; drop them so a scan
+	// started before the logout cannot resurrect it.
+	cleared := len(m.pending)
+	m.pending = map[string]*pendingLogin{}
+	m.mu.Unlock()
+	_ = cleared
+
+	if strings.TrimSpace(m.sessionFile) == "" {
+		return false, nil
+	}
+	if _, statErr := os.Stat(m.sessionFile); statErr != nil {
+		if os.IsNotExist(statErr) {
+			return false, nil
+		}
+		return false, statErr
+	}
+	if err := os.Remove(m.sessionFile); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// SessionFilePath reports where a captured session is persisted (diagnostics).
+func (m *LoginManager) SessionFilePath() string { return m.sessionFile }
 
 // Pending reports how many handshakes are alive (diagnostics only).
 func (m *LoginManager) Pending() int {

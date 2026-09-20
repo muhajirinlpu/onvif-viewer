@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -68,7 +69,7 @@ func (h *Handler) StartStream(w http.ResponseWriter, r *http.Request) {
 	// Tuya path: only taken when the caller actually says provider=tuya (or
 	// names a deviceId without an rtspUrl), so ONVIF requests cannot regress.
 	if models.ProviderKind(req.Provider).OrDefault() == models.ProviderTuya || (req.DeviceID != "" && req.RtspURL == "") {
-		h.startTuyaStream(w, req.DeviceID)
+		h.startTuyaStream(w, r, req.DeviceID)
 		return
 	}
 
@@ -90,7 +91,11 @@ func (h *Handler) StartStream(w http.ResponseWriter, r *http.Request) {
 // startTuyaStream routes a Tuya device through the in-process bridge. The
 // response body is the same models.StreamInfo shape the ONVIF path returns, with
 // provider="tuya".
-func (h *Handler) startTuyaStream(w http.ResponseWriter, deviceID string) {
+//
+// A Tuya stream that cannot start because the stored session is dead answers 401
+// with `reloginRequired:true` rather than an opaque 502, because the only way out
+// is a fresh QR scan and the UI must be able to say so.
+func (h *Handler) startTuyaStream(w http.ResponseWriter, r *http.Request, deviceID string) {
 	deviceID = strings.TrimSpace(deviceID)
 	if deviceID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "deviceId is required for provider=tuya"})
@@ -102,6 +107,24 @@ func (h *Handler) startTuyaStream(w http.ResponseWriter, deviceID string) {
 	}
 	info, err := h.tuyaProvider.StartStream(deviceID)
 	if err != nil {
+		if errors.Is(err, provider.ErrSessionReloginRequired) {
+			// The cloud rejected the stored session: any Tuya stream already
+			// running has just been stood down for the same reason.
+			h.logger.LogWarn("", "tuya", "Tuya stream start refused: the stored session is dead; a new QR scan is required")
+			stopped := 0
+			// The cached status is populated by the degradation above, so this
+			// is a cache read rather than a second cloud call.
+			if status, serr := h.tuyaProvider.Session(r.Context()); serr == nil && status != nil {
+				stopped = status.ExpiredStreamsStopped
+			}
+			writeJSON(w, http.StatusUnauthorized, map[string]any{
+				"detail":          "the stored Tuya session is no longer valid; scan a new QR code",
+				"status":          "session_expired",
+				"reloginRequired": true,
+				"streamsStopped":  stopped,
+			})
+			return
+		}
 		h.logger.LogError("", "tuya", fmt.Sprintf("Failed to start Tuya stream: %v", err))
 		writeJSON(w, http.StatusBadGateway, map[string]any{"detail": "could not start the Tuya stream"})
 		return

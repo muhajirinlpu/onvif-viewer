@@ -65,6 +65,12 @@ type StreamInfo struct {
 	ReconnectDelay string       `json:"reconnectDelay,omitempty"`
 	LastHLSAdvance *time.Time   `json:"lastHlsAdvance,omitempty"`
 	Detail         string       `json:"detail,omitempty"`
+	// Suspended is true when the stream was deliberately stood down and can be
+	// resumed by a re-login (Tuya session loss). A suspended stream is still
+	// listed so its card stays visible and explains itself.
+	Suspended bool `json:"suspended,omitempty"`
+	// SuspendedReason is a secret-free explanation of why it was suspended.
+	SuspendedReason string `json:"suspendedReason,omitempty"`
 }
 
 // ClientConnection represents a connection for a Server-Sent Events (SSE) client.
