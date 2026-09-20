@@ -46,7 +46,18 @@ type providerStarter struct {
 	provider models.ProviderKind
 }
 
+// StartStream is the shared StreamStarter signature (profileToken, rtspURL),
+// which every provider uses and which ONVIF must keep exactly.
+//
+// The Tuya resolution is NOT carried here, because this signature has nowhere to
+// put it and changing it would touch the ONVIF path. The Tuya provider instead
+// PERSISTS the resolved choice before asking the bridge to start the stream, so
+// the manager reads it back from the store at this point. That keeps one source
+// of truth (the stream_configs row) for both a fresh start and a restart.
 func (s providerStarter) StartStream(profileToken, rtspURL string) (*models.StreamInfo, error) {
+	if s.provider == models.ProviderTuya {
+		return s.manager.StartStreamWithResolution(profileToken, rtspURL, s.provider, "")
+	}
 	return s.manager.StartStreamForProvider(profileToken, rtspURL, s.provider)
 }
 
@@ -249,6 +260,10 @@ func main() {
 			provider.WithTuyaStreamStopper(streamManager),
 			provider.WithTuyaHost(tuyaengine.DefaultTuyaHost),
 			provider.WithTuyaLogger(dbLogger),
+			// The per-camera sd|hd choice lives in the same stream_configs rows the
+			// provider tags with its provider kind, so it is restored by the normal
+			// RestoreStreams path without a second store.
+			provider.WithTuyaResolutionStore(dbLogger),
 		)
 		providerSet = provider.NewSet(onvifProvider, tuyaProvider)
 		loginManager = provider.NewLoginManager(
@@ -295,8 +310,9 @@ func main() {
 	http.HandleFunc("/api/datetime", apiHandler.GetSystemDateAndTime)
 
 	// Multi-provider routes. /api/stream/start above is unchanged for ONVIF and
-	// additionally accepts {"provider":"tuya","deviceId":...}.
+	// additionally accepts {"provider":"tuya","deviceId":...,"resolution":"sd|hd"}.
 	http.HandleFunc("/api/providers/cameras", apiHandler.ProviderCameras)
+	http.HandleFunc("/api/tuya/resolution", apiHandler.SetTuyaResolution)
 	http.HandleFunc("/api/tuya/login/begin", apiHandler.TuyaLoginBegin)
 	http.HandleFunc("/api/tuya/login/poll", apiHandler.TuyaLoginPoll)
 	http.HandleFunc("/api/tuya/session", apiHandler.TuyaSession)

@@ -57,6 +57,7 @@ type StreamInfo struct {
 	ID             string       `json:"id"`
 	ProfileToken   string       `json:"profileToken"`
 	Provider       ProviderKind `json:"provider"`
+	Resolution     string       `json:"resolution"`
 	RtspURL        string       `json:"-"`
 	HlsURL         string       `json:"hlsUrl"`
 	StartedAt      time.Time    `json:"startedAt"`
@@ -65,6 +66,16 @@ type StreamInfo struct {
 	ReconnectDelay string       `json:"reconnectDelay,omitempty"`
 	LastHLSAdvance *time.Time   `json:"lastHlsAdvance,omitempty"`
 	Detail         string       `json:"detail,omitempty"`
+	// Output reports which video output path this stream's ffmpeg is on:
+	// "copy_mpegts" (the original, only path for ONVIF and Tuya SD) or
+	// "transcode_h264" (Tuya HD). It is reported so the UI can say what is
+	// actually running rather than what was requested.
+	Output string `json:"output,omitempty"`
+	// Transcoding is true when this stream is re-encoding video in software.
+	// HD is the only case today, and it costs real CPU on this 4-core host, so
+	// the fact is reported explicitly instead of being inferred from the
+	// resolution by every consumer.
+	Transcoding bool `json:"transcoding"`
 	// Suspended is true when the stream was deliberately stood down and can be
 	// resumed by a re-login (Tuya session loss). A suspended stream is still
 	// listed so its card stays visible and explains itself.

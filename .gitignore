@@ -12,3 +12,8 @@ onvif-debug
 *.db-journal
 *.db-wal
 *.db-shm
+# Verification evidence captured from milestone runs (screenshots, logs)
+.evidence/
+# Build artifacts accidentally produced at the repo root
+/m7sdp
+/mp-verify

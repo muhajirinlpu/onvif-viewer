@@ -14,6 +14,7 @@ import (
 	"dengan.dev/camera-streamer/internal/onvif"
 	"dengan.dev/camera-streamer/internal/provider"
 	"dengan.dev/camera-streamer/internal/stream"
+	"dengan.dev/camera-streamer/internal/tuyaengine"
 )
 
 // Handler contains all the HTTP handlers and their dependencies
@@ -44,19 +45,26 @@ func New(streamManager *stream.Manager, onvifClient *onvif.Client, logger *logge
 // StartStream handles stream start requests.
 //
 // The ONVIF contract is unchanged: {profileToken, rtspUrl} starts the URL
-// directly, exactly as before. The two additive fields are OPTIONAL and only
-// used for the Tuya path:
+// directly, exactly as before. The additive fields are OPTIONAL and only used
+// for the Tuya path:
 //
 //	{"provider":"tuya","deviceId":"eb9f1d6e677b1b39f222ag"}
+//	{"provider":"tuya","deviceId":"...","resolution":"hd"}
 //
 // A Tuya request carries no rtspUrl on purpose: the RTSP endpoint is allocated
 // by the in-process engine and must not be spoofed by the browser.
+//
+// `resolution` is the only field that changes what the pipeline emits. Omitting
+// it means "the resolution already stored for this camera", so the existing UI
+// call above keeps producing SD and nothing changes for a user who does not opt
+// in.
 func (h *Handler) StartStream(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ProfileToken string `json:"profileToken"`
 		RtspURL      string `json:"rtspUrl"`
 		Provider     string `json:"provider"`
 		DeviceID     string `json:"deviceId"`
+		Resolution   string `json:"resolution"`
 	}
 
 	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
@@ -69,7 +77,7 @@ func (h *Handler) StartStream(w http.ResponseWriter, r *http.Request) {
 	// Tuya path: only taken when the caller actually says provider=tuya (or
 	// names a deviceId without an rtspUrl), so ONVIF requests cannot regress.
 	if models.ProviderKind(req.Provider).OrDefault() == models.ProviderTuya || (req.DeviceID != "" && req.RtspURL == "") {
-		h.startTuyaStream(w, r, req.DeviceID)
+		h.startTuyaStream(w, r, req.DeviceID, req.Resolution)
 		return
 	}
 
@@ -95,7 +103,10 @@ func (h *Handler) StartStream(w http.ResponseWriter, r *http.Request) {
 // A Tuya stream that cannot start because the stored session is dead answers 401
 // with `reloginRequired:true` rather than an opaque 502, because the only way out
 // is a fresh QR scan and the UI must be able to say so.
-func (h *Handler) startTuyaStream(w http.ResponseWriter, r *http.Request, deviceID string) {
+//
+// An unparseable resolution is a 400 and NOTHING is started: silently falling
+// back to SD would make a typo look like a successful switch to HD.
+func (h *Handler) startTuyaStream(w http.ResponseWriter, r *http.Request, deviceID string, resolution string) {
 	deviceID = strings.TrimSpace(deviceID)
 	if deviceID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "deviceId is required for provider=tuya"})
@@ -105,7 +116,11 @@ func (h *Handler) startTuyaStream(w http.ResponseWriter, r *http.Request, device
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "Tuya streaming is not configured in this process"})
 		return
 	}
-	info, err := h.tuyaProvider.StartStream(deviceID)
+	if err := logger.ValidateResolution(resolution); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	info, err := h.tuyaProvider.StartStreamAt(deviceID, resolution)
 	if err != nil {
 		if errors.Is(err, provider.ErrSessionReloginRequired) {
 			// The cloud rejected the stored session: any Tuya stream already
@@ -129,11 +144,89 @@ func (h *Handler) startTuyaStream(w http.ResponseWriter, r *http.Request, device
 		writeJSON(w, http.StatusBadGateway, map[string]any{"detail": "could not start the Tuya stream"})
 		return
 	}
-	h.logger.LogInfo(info.ID, "tuya", "Tuya stream started through the shared HLS pipeline")
+	h.logger.LogInfo(info.ID, "tuya", fmt.Sprintf("Tuya stream started through the shared HLS pipeline (resolution=%s)", info.Resolution))
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(info); err != nil {
 		h.logger.LogError(info.ID, "http", fmt.Sprintf("Failed to encode response: %v", err))
 	}
+}
+
+// SetTuyaResolution serves POST /api/tuya/resolution.
+//
+// Body: {"deviceId":"eb9f1d6e677b1b39f222ag","resolution":"hd"}
+//
+// It records the per-camera choice WITHOUT starting or restarting anything, so
+// the UI can persist a preference and say honestly that it applies to the next
+// start. Switching a RUNNING stream's resolution is deliberately not done here:
+// that is a stop+start, which the UI performs explicitly so the user sees the
+// stream drop rather than a silent restart.
+//
+// Response 200:
+//
+//	{"deviceId":"...","resolution":"hd","appliesTo":"the next start of this camera",
+//	 "cpuCost":"...","restartRequired":true}
+func (h *Handler) SetTuyaResolution(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if h.tuyaProvider == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "Tuya streaming is not configured in this process"})
+		return
+	}
+	var req struct {
+		DeviceID   string `json:"deviceId"`
+		Resolution string `json:"resolution"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8*1024)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "invalid request"})
+		return
+	}
+	resolved, err := h.tuyaProvider.SetResolution(req.DeviceID, req.Resolution)
+	if err != nil {
+		h.logger.LogWarn("", "tuya", fmt.Sprintf("resolution change rejected: %v", err))
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	// Say whether this needs a restart, and report the CPU cost truthfully
+	// rather than describing HD as free.
+	//
+	// "Restart required" means a Tuya stream for this camera is ALREADY running
+	// at a different resolution: the persisted choice cannot take effect on a
+	// live ffmpeg, because switching the output path means replacing the process.
+	// Saying so is the difference between a preference and a silent no-op.
+	restartRequired := false
+	token, tokenErr := tuyaengine.ProfileTokenFor(req.DeviceID)
+	if tokenErr == nil {
+		for _, s := range h.streamManager.ListStreams() {
+			if s.ProfileToken == token && s.Resolution != resolved {
+				restartRequired = true
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"deviceId":        req.DeviceID,
+		"resolution":      resolved,
+		"profileToken":    token,
+		"appliesTo":       "the next start of this camera",
+		"restartRequired": restartRequired,
+		"cpuCost":         hdCPUWarning(resolved),
+	})
+}
+
+// hdCPUWarning is the honest cost statement attached to a resolution, in the
+// same words the UI shows. HD is a SOFTWARE libx264 transcode of a 1440p HEVC
+// source on a 4-core host; it is not free and it competes with every other
+// stream for the same cores, so it is described as such rather than as
+// "higher quality".
+func hdCPUWarning(resolution string) string {
+	if logger.NormalizeResolution(resolution) == "hd" {
+		return "HD re-encodes 2560x1440 HEVC to H.264 1280x720 in SOFTWARE (the video decoder " +
+			"is not available to this user). It will use a large share of this 4-core host's CPU " +
+			"and can affect other streams. 1440p is NOT offered because it does not keep up."
+	}
+	return "SD copies the camera's H.264 stream without re-encoding: no transcoding CPU cost."
 }
 
 // Snapshot returns one current JPEG frame from an active HLS stream.

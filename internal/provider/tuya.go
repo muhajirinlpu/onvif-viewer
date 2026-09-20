@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"dengan.dev/camera-streamer/internal/logger"
 	"dengan.dev/camera-streamer/internal/models"
 	"dengan.dev/camera-streamer/internal/tuyaengine"
 	"dengan.dev/camera-streamer/internal/tuyaqr"
@@ -59,6 +60,18 @@ type TuyaStreaming interface {
 	Resolve(deviceID string) (string, error)
 }
 
+// TuyaResolutionStore persists and reads back the per-camera resolution choice.
+// It is the *logger.Logger in production; declaring the sliver here keeps the
+// provider testable without a database.
+//
+// Both methods are needed, not just the writer: StartStream must apply the
+// STORED value so a camera that was switched to HD comes back on HD after a
+// restart without the browser re-sending anything.
+type TuyaResolutionStore interface {
+	StreamResolution(profileToken string) (string, error)
+	SetStreamResolution(profileToken, resolution string) error
+}
+
 // TuyaList is the slice of *tuyaqr.Client this package needs.
 type TuyaList interface {
 	Cameras(ctx context.Context) ([]tuyaqr.Device, error)
@@ -107,6 +120,10 @@ type Tuya struct {
 	materialized string
 	resolution   string
 	host         string
+	// resolutions is the per-camera resolution store. When it is nil the
+	// provider keeps the single process-wide default in `resolution`, so an
+	// embedder that does not wire persistence still works exactly as before.
+	resolutions TuyaResolutionStore
 
 	bridge  TuyaStreaming
 	stopper TuyaStreamStopper
@@ -153,7 +170,17 @@ type TuyaOption func(*Tuya)
 func WithTuyaBridge(b TuyaStreaming) TuyaOption { return func(t *Tuya) { t.bridge = b } }
 
 // WithTuyaResolution overrides the engine stream resolution ("sd" default).
+//
+// It is now the process-wide DEFAULT, not the answer: once a per-camera store is
+// attached, each camera's own stored choice wins, and this value is what a camera
+// with no stored choice runs at.
 func WithTuyaResolution(r string) TuyaOption { return func(t *Tuya) { t.resolution = r } }
+
+// WithTuyaResolutionStore attaches the per-camera resolution store, so the user's
+// sd|hd choice is persisted per device id and survives a restart.
+func WithTuyaResolutionStore(s TuyaResolutionStore) TuyaOption {
+	return func(t *Tuya) { t.resolutions = s }
+}
 
 // WithTuyaHost overrides the Tuya region host.
 func WithTuyaHost(h string) TuyaOption { return func(t *Tuya) { t.host = h } }
@@ -296,6 +323,11 @@ var ErrSessionReloginRequired = errors.New("provider: tuya session expired; a ne
 // StartStream turns a Tuya device id into a running HLS stream through the
 // existing pipeline. This is the only Tuya-specific step in the seam.
 //
+// It uses the resolution STORED for this camera, falling back to the provider's
+// process-wide default (SD). Callers that want to change it call SetResolution
+// first, which persists the choice — that is what makes resolution survive a
+// restart.
+//
 // The session is checked BEFORE the stream is registered, and checked again when
 // the engine refuses. That order matters and was measured: the Tuya engine will
 // happily register a stream whose session is dead and only fail on connect, which
@@ -304,12 +336,28 @@ var ErrSessionReloginRequired = errors.New("provider: tuya session expired; a ne
 // every ~40s and not one segment). Probing first turns that storm into a single
 // clean 401 plus a visible re-login prompt.
 func (t *Tuya) StartStream(deviceID string) (*models.StreamInfo, error) {
+	return t.StartStreamAt(deviceID, "")
+}
+
+// StartStreamAt starts a Tuya stream at an explicit resolution. An empty
+// resolution means "the stored one, else the provider default".
+//
+// An explicit resolution is persisted FIRST, so the stream that starts and the
+// row that will restore it can never disagree: a start that fails after
+// persisting leaves the camera on the requested resolution, which is the
+// user's stated intent and is visible in the UI.
+func (t *Tuya) StartStreamAt(deviceID string, resolution string) (*models.StreamInfo, error) {
 	if t.bridge == nil {
 		return nil, fmt.Errorf("provider: tuya streaming is not configured in this process")
 	}
 	deviceID = strings.TrimSpace(deviceID)
 	if deviceID == "" {
 		return nil, fmt.Errorf("provider: tuya device id is required")
+	}
+
+	resolved, err := t.resolveStartResolution(deviceID, resolution)
+	if err != nil {
+		return nil, err
 	}
 
 	// Liveness checkpoint BEFORE anything is started. The verdict is cached by
@@ -335,12 +383,12 @@ func (t *Tuya) StartStream(deviceID string) (*models.StreamInfo, error) {
 	spec := tuyaengine.DeviceSpec{
 		DeviceID:    deviceID,
 		SessionFile: sessionPath,
-		Resolution:  t.resolution,
+		Resolution:  resolved,
 		Host:        t.host,
 	}
 	if t.log != nil {
 		// Device id and resolution only: no session file contents, no config.
-		t.log.LogInfo("tuya:"+deviceID, "tuya", "starting Tuya stream (resolution="+t.resolution+")")
+		t.log.LogInfo("tuya:"+deviceID, "tuya", "starting Tuya stream (resolution="+resolved+")")
 	}
 	info, err := t.bridge.StartStream(spec)
 	if err != nil {
@@ -359,8 +407,91 @@ func (t *Tuya) StartStream(deviceID string) (*models.StreamInfo, error) {
 		// creation time). Setting it here too keeps the response honest for any
 		// other StreamStarter implementation passed to the bridge.
 		info.Provider = KindTuya
+		info.Resolution = resolved
 	}
 	return info, nil
+}
+
+// resolveStartResolution decides which resolution a start should use and, when
+// the caller named one explicitly, persists it.
+//
+// The order is deliberate: the store is consulted for a camera whose choice was
+// made in an earlier session, so restarting the server (or re-logging in) brings
+// the camera back at the resolution the user picked, while a camera nobody has
+// chosen for stays on SD.
+func (t *Tuya) resolveStartResolution(deviceID string, requested string) (string, error) {
+	t.mu.Lock()
+	store := t.resolutions
+	fallback := t.resolution
+	t.mu.Unlock()
+	if fallback == "" {
+		fallback = tuyaengine.DefaultResolution
+	}
+	if store == nil {
+		// No persistence wired: honour an explicit request (validated by the
+		// engine's own DeviceSpec.Validate) and otherwise keep the default.
+		if strings.TrimSpace(requested) == "" {
+			return fallback, nil
+		}
+		return strings.ToLower(strings.TrimSpace(requested)), nil
+	}
+	token, err := tuyaengine.ProfileTokenFor(deviceID)
+	if err != nil {
+		return "", fmt.Errorf("provider: %w", err)
+	}
+	if strings.TrimSpace(requested) != "" {
+		if err := store.SetStreamResolution(token, requested); err != nil {
+			return "", fmt.Errorf("provider: cannot store the resolution for camera %s: %w", deviceID, err)
+		}
+		return logger.NormalizeResolution(requested), nil
+	}
+	stored, err := store.StreamResolution(token)
+	if err != nil {
+		if t.log != nil {
+			t.log.LogWarn("tuya:"+deviceID, "tuya", fmt.Sprintf("could not read the stored resolution (%v); using %s", err, fallback))
+		}
+		return fallback, nil
+	}
+	return logger.NormalizeResolution(stored), nil
+}
+
+// ResolutionFor reports the resolution a camera would start at right now, and
+// whether it differs from the SD default. It is what GET /api/providers/cameras
+// uses so the UI can show a camera's stored choice before it is started.
+func (t *Tuya) ResolutionFor(deviceID string) (string, error) {
+	return t.resolveStartResolution(deviceID, "")
+}
+
+// SetResolution persists the resolution for one camera WITHOUT starting it, so
+// the UI can record the choice and the next start applies it.
+func (t *Tuya) SetResolution(deviceID, resolution string) (string, error) {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return "", fmt.Errorf("provider: tuya device id is required")
+	}
+	if err := logger.ValidateResolution(resolution); err != nil {
+		return "", err
+	}
+	t.mu.Lock()
+	store := t.resolutions
+	t.mu.Unlock()
+	normalized := logger.NormalizeResolution(resolution)
+	if store == nil {
+		// Nothing to persist, but the process-wide default is still honoured so
+		// an embedder without a store sees the choice take effect.
+		t.mu.Lock()
+		t.resolution = normalized
+		t.mu.Unlock()
+		return normalized, nil
+	}
+	token, err := tuyaengine.ProfileTokenFor(deviceID)
+	if err != nil {
+		return "", fmt.Errorf("provider: %w", err)
+	}
+	if err := store.SetStreamResolution(token, normalized); err != nil {
+		return "", err
+	}
+	return normalized, nil
 }
 
 // sessionRejected reports whether the stored session is dead, using the cached
@@ -427,7 +558,17 @@ func (t *Tuya) Cameras(ctx context.Context) ([]Camera, error) {
 			skipped = append(skipped, d.DeviceID)
 			continue
 		}
-		out = append(out, cameraFromTuyaDevice(d))
+		cam := cameraFromTuyaDevice(d)
+		// The stored resolution is reported per camera so the UI can show the
+		// choice before the stream is started. A read failure degrades to the
+		// SD default rather than dropping the camera from the list.
+		if stored, resErr := t.ResolutionFor(d.DeviceID); resErr == nil {
+			cam.Resolution = stored
+		} else {
+			cam.Resolution = tuyaengine.DefaultResolution
+		}
+		cam.ResolutionOptions = tuyaengine.Resolutions()
+		out = append(out, cam)
 	}
 	if t.log != nil {
 		t.log.LogInfo("tuya", "tuya", fmt.Sprintf("discovery: %d camera(s) after filtering, %d non-camera device(s) excluded", len(out), len(skipped)))

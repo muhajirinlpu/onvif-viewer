@@ -22,6 +22,14 @@ const (
 	ResolutionHD = "hd"
 )
 
+// Resolutions returns the accepted resolutions in the order the UI should offer
+// them, with the cheap one first. It is a function rather than an exported slice
+// so a caller cannot mutate the set the engine validates against.
+//
+// SD comes first deliberately: SD is the default and the only value that costs
+// no transcoding CPU on this host.
+func Resolutions() []string { return []string{ResolutionSD, ResolutionHD} }
+
 var (
 	deviceIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 	hostPattern     = regexp.MustCompile(`^[A-Za-z0-9.-]{1,253}$`)

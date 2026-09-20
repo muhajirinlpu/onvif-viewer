@@ -58,6 +58,94 @@ const (
 // visible and asks for a re-login.
 const StatusNeedsRelogin = "needs_relogin"
 
+// ---------------------------------------------------------------------------
+// Video output paths (M7)
+// ---------------------------------------------------------------------------
+//
+// There are exactly two, selected per stream and never mixed.
+//
+//   - OutputCopyMPEGTS is the ORIGINAL path and is byte-for-byte unchanged:
+//     `-c:v copy` into MPEG-TS segments. It is the only path ever used for
+//     ONVIF, and the only one used for a Tuya SD (H.264) camera. MEASURED on
+//     the ES06: SD is H.264 640x360 which every browser plays inside MPEG-TS.
+//
+//   - OutputTranscodeH264 is the HD path. MEASURED on the ES06: HD is HEVC
+//     2560x1440 and NO browser decodes it in either container, so HD MUST be
+//     transcoded to H.264. Two further facts are baked into this path and were
+//     each measured, not guessed:
+//
+//   - `-r 20` on the INPUT. The HD stream's SDP carries no framerate and no
+//     fmtp (MEASURED: only `a=rtpmap:96 H265/90000` + `a=control:trackID=0`),
+//     so ffmpeg falls back to the H.265 RTP clock's 200 tbr and then invents
+//     frames to fill the timeline it believes it has. MEASURED without it:
+//     `frame=1362 dup=1207` — 89% duplicated frames — and HLS segments whose
+//     declared duration implied 200 fps against a real 20 fps source. With
+//     `-r 20` on the input the same measurement shows implied_fps=20.0.
+//
+//   - `-an`. The HD stream carries NO audio track (the engine logs
+//     `no audio track in source`), so the original `-c:a aac` has nothing to
+//     encode. HD output drops audio deliberately rather than letting ffmpeg
+//     fail or emit an empty stream.
+//
+// The scaled size and encoded frame rate are chosen to keep up on 4 cores; see
+// hdScaleWidth / hdScaleHeight / HDOutputFPS and the measurement in the report.
+type VideoOutputPath int
+
+const (
+	// OutputCopyMPEGTS: `-c:v copy` + MPEG-TS. The original behaviour.
+	OutputCopyMPEGTS VideoOutputPath = iota
+	// OutputTranscodeH264: software libx264 transcode to H.264 720p, MPEG-TS.
+	OutputTranscodeH264
+)
+
+// HD output geometry, rate and encoder settings. These are the shipped HD
+// defaults, and every one of them was CHOSEN FROM A MEASUREMENT, not guessed.
+//
+// The decisive measurement (a reproducible 2560x1440 20fps HEVC file fed at real
+// time, 22s each, counted frames, 4 cores):
+//
+//	scale=1280:720  veryfast  -> realtime 0.83x   load 4.85   DOES NOT KEEP UP
+//	scale=1280:720  ultrafast -> realtime 0.98x   load 2.79   keeps up, headroom
+//	full 2560x1440  veryfast  -> realtime 0.39x   load 4.85   DOES NOT KEEP UP
+//	scale=640:360   veryfast  -> realtime 0.96x   load 6.45   keeps up, no headroom
+//	scale=1280:720,fps=15     -> realtime 0.75x               DOES NOT KEEP UP
+//
+// So: 720p, `ultrafast`, 20 fps. 1440p is NOT offered because it cannot keep up
+// (0.39x realtime). The cost is dominated by HEVC DECODE, which is why a lower
+// output frame rate did not help — the decode has to happen for every source
+// frame regardless.
+//
+// 0.98x is not 2x. HD on this host runs close to its limit and has little
+// headroom for a second HD stream, which is exactly why the UI says so.
+const (
+	hdScaleWidth  = 1280
+	hdScaleHeight = 720
+	// HDOutputFPS is the output frame rate cap. The source delivers 20 fps;
+	// encoding at exactly 20 keeps real time without spending CPU on frames the
+	// camera never produced.
+	HDOutputFPS = 20
+	// HDInputFPS is forced on the RTSP INPUT and is what stops the duplicate
+	// frame storm described above. It is the source's real rate.
+	HDInputFPS = 20
+	// HDH264Preset / HDH264CRF are the libx264 settings the measurement used.
+	// `ultrafast` is not a quality preference: `veryfast` measured 0.83x and
+	// could not keep up, and the difference at 720p from a 1440p source is not
+	// what the user would notice — falling permanently behind is.
+	HDH264Preset = "ultrafast"
+	HDH264CRF    = 26
+)
+
+// ResolutionHD is the persisted resolution value that selects the transcoding
+// path for a Tuya camera. It is duplicated here rather than imported so
+// internal/stream stays free of an import of internal/tuyaengine (the engine
+// imports this package's Manager through a seam, and a cycle would be a hard
+// build failure).
+const ResolutionHD = "hd"
+
+// defaultStreamResolution is what a stream runs at when nothing else is known.
+// It is SD, so an install that never opts into HD is unaffected.
+const defaultStreamResolution = "sd"
+
 // Process represents a single FFmpeg stream process
 type Process struct {
 	Info            models.StreamInfo
@@ -68,6 +156,11 @@ type Process struct {
 	logger          *logger.Logger
 	reconnectCount  int
 	shouldReconnect bool
+	// outputPath is the encoder argument shape THIS stream runs. It is captured
+	// per process (from the stream's resolution) rather than passed down through
+	// the monitor, so a restart lands on the same args the stream was started
+	// with, and an SD stream can never inherit HD flags.
+	outputPath VideoOutputPath
 	// suspended marks a stream that was deliberately stood down while its
 	// registered state is kept, so the card stays visible and a resume can
 	// restart it later. Used by the M6 Tuya session-loss degradation.
@@ -118,18 +211,55 @@ func (sm *Manager) StartStream(profileToken, rtspURL string) (*models.StreamInfo
 // StartStreamForProvider starts (and persists) a stream tagged with the provider
 // that owns it, so a Tuya stream is restored as Tuya across restarts.
 func (sm *Manager) StartStreamForProvider(profileToken, rtspURL string, provider models.ProviderKind) (*models.StreamInfo, error) {
-	return sm.startStreamWithProvider(profileToken, rtspURL, provider, true)
+	return sm.startStreamWithOptions(profileToken, rtspURL, provider, "", true)
+}
+
+// StartStreamWithResolution starts a stream at an explicit video resolution and
+// persists it per camera. An empty resolution means "whatever is already stored
+// for this profile", which is what makes a reconnect or a resume keep the user's
+// choice instead of silently reverting to SD.
+func (sm *Manager) StartStreamWithResolution(profileToken, rtspURL string, provider models.ProviderKind, resolution string) (*models.StreamInfo, error) {
+	return sm.startStreamWithOptions(profileToken, rtspURL, provider, resolution, true)
 }
 
 func (sm *Manager) startStream(profileToken, rtspURL string, persist bool) (*models.StreamInfo, error) {
-	return sm.startStreamWithProvider(profileToken, rtspURL, models.ProviderONVIF, persist)
+	return sm.startStreamWithOptions(profileToken, rtspURL, models.ProviderONVIF, "", persist)
 }
 
 func (sm *Manager) startStreamWithProvider(profileToken, rtspURL string, provider models.ProviderKind, persist bool) (*models.StreamInfo, error) {
+	return sm.startStreamWithOptions(profileToken, rtspURL, provider, "", persist)
+}
+
+// storedResolution returns the resolution already recorded for a profile, or the
+// SD default. A read failure is reported but never fatal: falling back to SD is
+// the safe direction (it is the path that has always worked), and the stream is
+// still started.
+func (sm *Manager) storedResolution(profileToken string) string {
+	if sm.logger == nil {
+		return defaultStreamResolution
+	}
+	stored, err := sm.logger.StreamResolution(profileToken)
+	if err != nil {
+		sm.logger.LogWarn("", "system", fmt.Sprintf("could not read the stored resolution for %s: %v; using %s", profileToken, err, defaultStreamResolution))
+		return defaultStreamResolution
+	}
+	return stored
+}
+
+func (sm *Manager) startStreamWithOptions(profileToken, rtspURL string, provider models.ProviderKind, resolution string, persist bool) (*models.StreamInfo, error) {
 	provider = provider.OrDefault()
 	if profileToken == "" || rtspURL == "" {
 		return nil, fmt.Errorf("profile token and RTSP URL are required")
 	}
+	// Resolve the resolution BEFORE taking the manager lock: an explicit value
+	// wins, otherwise the persisted one is reused so a restart or a reconnect
+	// cannot quietly drop the user back to SD.
+	if strings.TrimSpace(resolution) == "" {
+		resolution = sm.storedResolution(profileToken)
+	} else if err := logger.ValidateResolution(resolution); err != nil {
+		return nil, err
+	}
+	resolution = logger.NormalizeResolution(resolution)
 	sm.mutex.Lock()
 
 	// Check if stream already exists for this profile
@@ -174,6 +304,14 @@ func (sm *Manager) startStreamWithProvider(profileToken, rtspURL string, provide
 			_ = os.RemoveAll(hlsDir)
 			return nil, fmt.Errorf("persist stream configuration: %w", err)
 		}
+		// The resolution is written separately because the upsert must not be
+		// able to blank a choice it does not know about, and because flipping a
+		// resolution must not require knowing the engine's current RTSP URL.
+		if err := sm.logger.SetStreamResolution(profileToken, resolution); err != nil {
+			// Not fatal: the stream itself is fine on the SD default, and a
+			// failed preference write must not stop a camera from running.
+			sm.logger.LogWarn(streamID, "system", fmt.Sprintf("could not persist resolution %s for %s: %v", resolution, profileToken, err))
+		}
 	}
 
 	streamProcess := &Process{
@@ -181,6 +319,9 @@ func (sm *Manager) startStreamWithProvider(profileToken, rtspURL string, provide
 			ID:           streamID,
 			ProfileToken: profileToken,
 			Provider:     provider,
+			Resolution:   resolution,
+			Output:       outputPathName(videoOutputPathFor(resolution)),
+			Transcoding:  videoOutputPathFor(resolution) == OutputTranscodeH264,
 			RtspURL:      rtspURL,
 			HlsURL:       fmt.Sprintf("/hls/%s/stream.m3u8", streamID),
 			StartedAt:    time.Now(),
@@ -190,11 +331,12 @@ func (sm *Manager) startStreamWithProvider(profileToken, rtspURL string, provide
 		Done:            make(chan bool),
 		Exited:          make(chan struct{}),
 		logger:          sm.logger,
+		outputPath:      videoOutputPathFor(resolution),
 		shouldReconnect: true,
 		reconnectCount:  0,
 	}
 
-	sm.logger.LogInfo(streamID, "system", "Initializing stream monitoring and connection")
+	sm.logger.LogInfo(streamID, "system", fmt.Sprintf("Initializing stream monitoring and connection (resolution=%s, output=%s)", resolution, outputPathName(videoOutputPathFor(resolution))))
 	log.Printf("Initializing stream %s", streamID)
 
 	info := streamProcess.Info
@@ -219,7 +361,9 @@ func (sm *Manager) RestoreStreams() {
 		}
 		for _, config := range configs {
 			provider := models.ProviderKind(config.Provider).OrDefault()
-			if _, err := sm.startStreamWithProvider(config.ProfileToken, config.RTSPURL, provider, false); err != nil {
+			// The persisted resolution is replayed on restore, which is what
+			// makes a per-camera HD choice survive a server restart.
+			if _, err := sm.startStreamWithOptions(config.ProfileToken, config.RTSPURL, provider, config.Resolution, false); err != nil {
 				sm.logger.LogError("", "restore", fmt.Sprintf("Failed to restore profile %s: %v", config.ProfileToken, err))
 			}
 		}
@@ -444,9 +588,48 @@ func sanitizeFFmpegArgs(args []string) []string {
 	return sanitized
 }
 
-// createFFmpegCommand creates a new FFmpeg command for the given stream
+// createFFmpegCommand creates a new FFmpeg command for the given stream.
+//
+// The SD/ONVIF argument list is UNCHANGED from before this milestone: the same
+// flags in the same order. HD takes the separate transcoding branch below, and
+// the two never share a list, so an SD stream cannot pick up an HD flag.
 func (sm *Manager) createFFmpegCommand(rtspURL string, hlsDir string) *exec.Cmd {
-	// Prepare FFmpeg command with improved settings for stability
+	return sm.createFFmpegCommandFor(rtspURL, hlsDir, OutputCopyMPEGTS)
+}
+
+// videoOutputPathFor maps a stream's persisted resolution onto its output path.
+//
+// Anything that is not exactly "hd" — empty, "sd", or a value written by some
+// future build — is the ORIGINAL copy path, which is what makes SD (and ONVIF,
+// which never sets a resolution at all) provably unchanged.
+func videoOutputPathFor(resolution string) VideoOutputPath {
+	if strings.EqualFold(strings.TrimSpace(resolution), ResolutionHD) {
+		return OutputTranscodeH264
+	}
+	return OutputCopyMPEGTS
+}
+
+// outputPathName is the wire/debug name of an output path. It is what
+// models.StreamInfo.Output reports, so the UI states the path that is running.
+func outputPathName(path VideoOutputPath) string {
+	if path == OutputTranscodeH264 {
+		return "transcode_h264"
+	}
+	return "copy_mpegts"
+}
+
+// createFFmpegCommandFor builds the arg list for one output path.
+func (sm *Manager) createFFmpegCommandFor(rtspURL string, hlsDir string, path VideoOutputPath) *exec.Cmd {
+	args := sm.ffmpegArgsFor(rtspURL, hlsDir, path)
+	cmd := exec.Command(ffmpegExecutable(sm.ffmpegBin), args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
+	return cmd
+}
+
+// ffmpegArgsFor is the single place the encoder argument list is built.
+func (sm *Manager) ffmpegArgsFor(rtspURL string, hlsDir string, path VideoOutputPath) []string {
 	args := []string{
 		"-y", // Overwrite output files
 		// +genpts generates missing timestamps; +igndts discards the camera's
@@ -455,13 +638,47 @@ func (sm *Manager) createFFmpegCommand(rtspURL string, hlsDir string) *exec.Cmd 
 		"-fflags", "+genpts+igndts",
 		"-rtsp_transport", "tcp", // Use TCP for RTSP (more reliable)
 		"-rtsp_flags", "prefer_tcp", // Prefer TCP
+	}
+
+	if path == OutputTranscodeH264 {
+		// MEASURED, and it must come BEFORE -i to act as an input option: the HD
+		// SDP advertises no framerate, so ffmpeg otherwise adopts the H.265 RTP
+		// clock's 200 tbr and duplicates ~89% of frames to fill that phantom
+		// timeline (frame=1362 dup=1207). 20 is the source's real rate.
+		args = append(args, "-r", strconv.Itoa(HDInputFPS))
+	}
+
+	args = append(args,
 		// RTSP demuxer -timeout is an I/O timeout in microseconds; it bounds both
 		// the connection and reads on an established session. (ffmpeg has no
 		// -rw_timeout CLI option - that name exists only at the AVIO level.)
 		"-timeout", "5000000", // 5s socket I/O timeout
 		"-i", rtspURL,
-		"-c:v", "copy", // Copy video codec (no transcoding)
-		"-c:a", "aac", // Audio codec
+	)
+
+	if path == OutputTranscodeH264 {
+		// HD: HEVC is not decodable by any browser, so transcode to H.264.
+		// -an is deliberate: the HD stream has NO audio track, so `-c:a aac`
+		// would have nothing to encode.
+		args = append(args,
+			"-an",
+			"-c:v", "libx264",
+			"-preset", HDH264Preset,
+			"-crf", strconv.Itoa(HDH264CRF),
+			// Downscale. The measurement in this milestone's report is for
+			// 1280x720; 2560x1440 was not proven to keep up on 4 cores.
+			"-vf", fmt.Sprintf("scale=%d:%d", hdScaleWidth, hdScaleHeight),
+			// Output frame-rate cap: real time at the source's own rate.
+			"-r", strconv.Itoa(HDOutputFPS),
+		)
+	} else {
+		args = append(args,
+			"-c:v", "copy", // Copy video codec (no transcoding)
+			"-c:a", "aac", // Audio codec
+		)
+	}
+
+	args = append(args,
 		"-avoid_negative_ts", "make_zero", // Handle negative timestamps
 		"-max_interleave_delta", "0", // Do not buffer to re-order; keep latency low
 		"-hls_time", "2", // 2 second segments
@@ -471,14 +688,8 @@ func (sm *Manager) createFFmpegCommand(rtspURL string, hlsDir string) *exec.Cmd 
 		"-hls_segment_type", "mpegts", // Use MPEG-TS segments
 		"-f", "hls", // Output format
 		filepath.Join(hlsDir, "stream.m3u8"),
-	}
-
-	cmd := exec.Command(ffmpegExecutable(sm.ffmpegBin), args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
-
-	return cmd
+	)
+	return args
 }
 
 // ffmpegExecutable resolves the encoder binary. Empty means the PATH's ffmpeg,
@@ -781,7 +992,11 @@ func (sm *Manager) startFFmpegProcess(process *Process, hlsDir string) (*exec.Cm
 		return nil, fmt.Errorf("stream is stopping")
 	}
 
-	cmd := sm.createFFmpegCommand(process.Info.RtspURL, hlsDir)
+	// createFFmpegCommandFor is called with process.mutex ALREADY held for
+	// writing, so outputPath and Info are read WITHOUT re-locking: taking the
+	// process lock again here self-deadlocks (Go's RWMutex is not reentrant).
+	outputPath := process.outputPath
+	cmd := sm.createFFmpegCommandFor(process.Info.RtspURL, hlsDir, outputPath)
 	args := sanitizeFFmpegArgs(cmd.Args[1:])
 	cmdStr := fmt.Sprintf("ffmpeg %s", strings.Join(args, " "))
 	sm.logger.LogInfo(process.Info.ID, "system", fmt.Sprintf("Starting FFmpeg: %s", cmdStr))
@@ -1269,6 +1484,12 @@ func (sm *Manager) resumeSuspendedProcess(process *Process, rtspURL string, prov
 	streamID := process.Info.ID
 	process.Info.RtspURL = rtspURL
 	process.Info.Provider = provider.OrDefault()
+	// A resume reuses the stream's own resolution, so a camera that came back
+	// after a re-login runs the same output path it had before the session died.
+	process.Info.Resolution = logger.NormalizeResolution(process.Info.Resolution)
+	process.outputPath = videoOutputPathFor(process.Info.Resolution)
+	process.Info.Output = outputPathName(process.outputPath)
+	process.Info.Transcoding = process.outputPath == OutputTranscodeH264
 	process.reconnectCount = 0
 	process.suspended = false
 	process.suspendedReason = ""

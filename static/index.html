@@ -494,16 +494,43 @@
                   </div>
 
                   <div v-else-if="tuyaCameras.length" class="device-pick">
-                    <button type="button" class="device-pick-item" v-for="camera in tuyaCameras" :key="camera.id"
-                      @click="startTuyaCamera(camera)" :disabled="tuyaStarting">
-                      <span class="min-w-0">
+                    <!-- M7: each Tuya camera carries a per-camera resolution
+                         choice. SD stays the default and costs no transcoding;
+                         HD is labelled with its real cost rather than being
+                         sold as "better". -->
+                    <div class="device-pick-item" v-for="camera in tuyaCameras" :key="camera.id">
+                      <span class="min-w-0 flex-1">
                         <span class="block font-semibold truncate">{{ camera.name || camera.id }}</span>
                         <span class="block text-xs text-slate-500 dark:text-slate-400 truncate">{{ camera.detail }}</span>
+                        <span v-if="cameraResolutionOptions(camera).length" class="mt-2 flex flex-wrap items-center gap-2">
+                          <span class="text-xs uppercase tracking-wide text-slate-500 dark:text-slate-400">Resolution</span>
+                          <span class="resolution-choice flex gap-1 bg-slate-100 dark:bg-slate-800 rounded-lg p-1 border border-slate-200 dark:border-slate-700"
+                            role="group" :aria-label="'Video resolution for ' + (camera.name || camera.id)">
+                            <button type="button" v-for="option in cameraResolutionOptions(camera)" :key="option"
+                              class="resolution-option px-2 py-1 rounded text-xs font-medium"
+                              :class="(cameraResolution(camera) === option)
+                                ? (option === 'hd' ? 'bg-amber-600 text-white' : 'bg-blue-500 text-white')
+                                : 'text-slate-500 dark:text-slate-400'"
+                              :data-resolution="option"
+                              :aria-pressed="cameraResolution(camera) === option"
+                              :disabled="tuyaResolutionSaving === camera.id"
+                              @click.stop="setCameraResolution(camera, option)">
+                              {{ option.toUpperCase() }}
+                            </button>
+                          </span>
+                          <span v-if="cameraResolution(camera) === 'hd'" class="resolution-cost text-xs text-amber-700 dark:text-amber-400">
+                            <i class="fas fa-triangle-exclamation mr-1"></i>{{ hdCostNote }}
+                          </span>
+                          <span v-else class="resolution-cost text-xs text-slate-500 dark:text-slate-400">
+                            Copied as-is: no transcoding CPU.
+                          </span>
+                        </span>
                       </span>
-                      <span class="provider-badge" :class="camera.online ? 'provider-badge-tuya' : 'provider-badge-onvif'">
-                        {{ camera.online ? 'Online' : 'Offline' }}
-                      </span>
-                    </button>
+                      <button type="button" class="device-pick-start provider-option px-3"
+                        @click="startTuyaCamera(camera)" :disabled="tuyaStarting">
+                        <i class="fas fa-play mr-1"></i>Start
+                      </button>
+                    </div>
                   </div>
 
                   <div v-else class="p-4 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
@@ -513,6 +540,13 @@
                   <button type="button" class="provider-option w-full" @click="refreshTuyaCameras" :disabled="tuyaCamerasLoading">
                     <i class="fas fa-rotate mr-2"></i>Reload camera list
                   </button>
+                  <!-- M7: the answer to a resolution change. It says whether the
+                       choice took effect on a running stream or only applies
+                       from the next start, instead of letting the user believe
+                       a live HD stream switched silently. -->
+                  <div v-if="resolutionNotice" class="resolution-notice p-3 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
+                    <span class="text-sm"><i class="fas fa-circle-info mr-2"></i>{{ resolutionNotice }}</span>
+                  </div>
                   <button type="button" class="provider-option w-full" @click="signOutTuya">
                     <i class="fas fa-right-from-bracket mr-2"></i>Sign out on this device
                   </button>
@@ -592,6 +626,20 @@
                   <p v-if="stream.detail" class="text-sm mt-1 text-slate-600 dark:text-slate-300">{{ stream.detail }}</p>
                   <p v-if="stream.reconnectCount" class="text-xs mt-1 text-amber-600 dark:text-amber-400">Reconnect attempt {{ stream.reconnectCount }}<span v-if="stream.reconnectDelay"> · retry in {{ stream.reconnectDelay }}</span></p>
                   <p v-if="stream.lastHlsAdvance" class="text-xs mt-1 text-slate-500 dark:text-slate-400">Last video segment: {{ new Date(stream.lastHlsAdvance).toLocaleString() }}</p>
+                  <!-- M7: which resolution is LIVE on this stream, and whether
+                       it is costing CPU. Read from the server's own state, not
+                       from the last thing the user clicked. -->
+                  <p v-if="streamProvider(stream) === 'tuya'" class="stream-resolution text-xs mt-1"
+                    :class="streamResolutionIsHD(stream) ? 'text-amber-700 dark:text-amber-400' : 'text-slate-500 dark:text-slate-400'">
+                    <span class="stream-resolution-value">{{ streamResolutionLabel(stream) }}</span>
+                    <span v-if="streamResolutionIsHD(stream)" class="stream-resolution-cost">
+                      &middot; <i class="fas fa-microchip mr-1"></i>software transcode to 1280x720{{ stream.transcoding ? '' : ' (not transcoding)' }}
+                    </span>
+                    <span v-else-if="stream.resolution">&middot; copied, no transcode CPU</span>
+                  </p>
+                  <p v-if="streamResolutionIsHD(stream)" class="stream-resolution-warning text-xs mt-1 text-amber-700 dark:text-amber-400">
+                    <i class="fas fa-triangle-exclamation mr-1"></i>HD uses a large share of this 4-core host's CPU and can affect other streams.
+                  </p>
                   <!-- M6: a stream whose Tuya session died says so on the card
                        and offers the one action that fixes it. It is NOT a
                        silently broken video element. -->
@@ -858,6 +906,81 @@
         // state channel without it, is ONVIF.
         const streamProvider = (stream) => (stream && stream.provider === 'tuya' ? 'tuya' : 'onvif');
 
+        // --- M7: per-camera resolution ---------------------------------------
+        // HD re-encodes 2560x1440 HEVC to H.264 1280x720 in SOFTWARE on this
+        // 4-core host: the hardware decoder is not available to this user, so
+        // there is no cheap HD. This sentence is the honest cost, and it is the
+        // same one the server returns as cpuCost.
+        const hdCostNote = 'Re-encoded in software to 720p: heavy CPU use on this 4-core host, and may affect other streams.';
+        // The resolution being saved, keyed by device id, so the control can
+        // disable itself while the choice is being persisted.
+        const tuyaResolutionSaving = ref('');
+        // Per-camera resolution, seeded from the server's camera list and
+        // updated from the server's answer. It is never assumed locally: a
+        // failed save must not leave the UI claiming a resolution that was not
+        // stored.
+        const tuyaResolutions = ref({});
+
+        // cameraResolutionOptions is driven by the SERVER: the camera list
+        // carries resolutionOptions, so the page never hardcodes which
+        // resolutions a camera supports. ONVIF cameras carry none and get no
+        // control at all.
+        const cameraResolutionOptions = (camera) =>
+          (camera && Array.isArray(camera.resolutionOptions)) ? camera.resolutionOptions : [];
+
+        // cameraResolution is the stored choice, defaulting to the server's own
+        // value and then to SD. It NEVER invents 'hd'.
+        const cameraResolution = (camera) => {
+          if (!camera) return 'sd';
+          return tuyaResolutions.value[camera.id] || camera.resolution || 'sd';
+        };
+
+        // setCameraResolution persists the per-camera choice WITHOUT starting or
+        // restarting the stream, because switching a live stream's resolution
+        // means replacing its ffmpeg. The UI says so when a stream for that
+        // camera is already running.
+        const setCameraResolution = async (camera, resolution) => {
+          if (!camera || tuyaResolutionSaving.value) return;
+          const previous = cameraResolution(camera);
+          if (previous === resolution) return;
+          tuyaResolutionSaving.value = camera.id;
+          error.value = '';
+          try {
+            const resp = await fetch('/api/tuya/resolution', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ deviceId: camera.id, resolution }),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              throw new Error(data.detail || 'Could not save the resolution');
+            }
+            // Trust the server's echoed value, not the click.
+            tuyaResolutions.value = { ...tuyaResolutions.value, [camera.id]: data.resolution };
+            camera.resolution = data.resolution;
+            resolutionNotice.value = data.restartRequired
+              ? `${camera.name || camera.id} will run at ${String(data.resolution).toUpperCase()} from the next start: a running ${String(previous).toUpperCase()} stream is not switched in place.`
+              : `${camera.name || camera.id} will start at ${String(data.resolution).toUpperCase()}.`;
+          } catch (err) {
+            error.value = err.message;
+          } finally {
+            tuyaResolutionSaving.value = '';
+          }
+        };
+
+        const resolutionNotice = ref('');
+
+        // streamResolutionLabel / streamResolutionIsHD describe a RUNNING
+        // stream. The value comes from the server's /api/stream/list, so the
+        // card reports what is actually encoding, not what was requested: a
+        // stream that failed to start reports no resolution and says so.
+        const streamResolutionLabel = (stream) => {
+          if (!stream || !stream.resolution) return 'Resolution: not reported yet';
+          return `Resolution: ${String(stream.resolution).toUpperCase()}`;
+        };
+        const streamResolutionIsHD = (stream) =>
+          !!stream && String(stream.resolution || '').toLowerCase() === 'hd';
+
         // A computed ref, not a plain function: a bare function interpolated as
         // {{ tuyaCountdownLabel }} would render the function's source text.
         const tuyaCountdownLabel = computed(() => {
@@ -1102,11 +1225,36 @@
         };
 
         // --- Starting a Tuya stream ------------------------------------------
+        // The per-camera resolution is PERSISTED FIRST, through
+        // /api/tuya/resolution, and the start call then runs at whatever is
+        // stored for the camera. That keeps the choice and the stream on one
+        // source of truth (the stream_configs row) instead of duplicating the
+        // value across two requests that could disagree, and it means the start
+        // body below is exactly the contract it always was.
+        const persistCameraResolution = async (camera) => {
+          const resolution = cameraResolution(camera);
+          const resp = await fetch('/api/tuya/resolution', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceId: camera.id, resolution }),
+          });
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok) {
+            throw new Error(data.detail || 'Could not save the resolution');
+          }
+          tuyaResolutions.value = { ...tuyaResolutions.value, [camera.id]: data.resolution };
+          camera.resolution = data.resolution;
+          return data;
+        };
+
         const startTuyaCamera = async (camera) => {
           if (tuyaStarting.value) return;
           tuyaStarting.value = true;
           error.value = '';
           try {
+            // Persist the resolution before starting, so the stream that starts
+            // and the row that will restore it cannot disagree.
+            await persistCameraResolution(camera);
             const resp = await fetch('/api/stream/start', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
@@ -1722,6 +1870,15 @@
           availableProviders,
           selectProvider,
           streamProvider,
+          // M7: per-camera resolution
+          hdCostNote,
+          resolutionNotice,
+          tuyaResolutionSaving,
+          cameraResolution,
+          cameraResolutionOptions,
+          setCameraResolution,
+          streamResolutionLabel,
+          streamResolutionIsHD,
           tuyaQr,
           tuyaQrExpired,
           tuyaQrRemaining,

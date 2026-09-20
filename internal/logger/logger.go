@@ -37,15 +37,55 @@ type StreamLog struct {
 }
 
 // StreamConfig is the minimal persisted configuration needed to restore a stream.
+//
+// Resolution is the per-camera video resolution the user chose for a Tuya
+// camera ("sd" or "hd"). It is ADDITIVE: every row written before it existed —
+// and every ONVIF row, and every request that does not name one — reads back as
+// "sd", which is the only value the product ever used before this column
+// existed. ONVIF streams ignore it entirely.
 type StreamConfig struct {
 	ProfileToken string
 	RTSPURL      string
 	Provider     string
+	Resolution   string
 }
 
 // defaultProvider is the provider value applied to legacy rows and used when a
 // caller does not name one.
 const defaultProvider = "onvif"
+
+// DefaultResolution is the resolution applied to legacy rows and to any caller
+// that does not name one. It MUST stay "sd": SD is what every existing install
+// is running, and HD costs real CPU.
+const DefaultResolution = "sd"
+
+// ValidResolutions are the resolutions a stream config may carry. Validation
+// lives here (rather than in the provider) because this is the last place before
+// a value is written to the database, so an invalid resolution can never be
+// persisted and later replayed into a stream start.
+var ValidResolutions = []string{"sd", "hd"}
+
+// NormalizeResolution lower-cases a resolution and returns DefaultResolution
+// when it is empty. An UNRECOGNISED non-empty value is returned unchanged so
+// ValidateResolution can reject it rather than silently substituting SD — a
+// typo must be an error, not a silent downgrade.
+func NormalizeResolution(r string) string {
+	r = strings.ToLower(strings.TrimSpace(r))
+	if r == "" {
+		return DefaultResolution
+	}
+	return r
+}
+
+// ValidateResolution reports whether a resolution is one this build accepts.
+func ValidateResolution(r string) error {
+	for _, want := range ValidResolutions {
+		if NormalizeResolution(r) == want {
+			return nil
+		}
+	}
+	return fmt.Errorf("invalid resolution %q (want %s or %s)", r, ValidResolutions[0], ValidResolutions[1])
+}
 
 // Logger handles database logging
 type Logger struct {
@@ -189,6 +229,15 @@ func newLogger(dbPath string, maxRows, pruneInterval int) (*Logger, error) {
 		db.Close()
 		return nil, err
 	}
+	// Additive, idempotent resolution column, same three deployment cases as the
+	// provider column: a fresh database, an already-populated one (the constant
+	// default backfills every row in place), and a repeat run (the PRAGMA check
+	// skips the DDL). The default is "sd" so an install that never opts into HD
+	// restores exactly the streams it had.
+	if err := ensureResolutionColumn(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Logger{db: db, path: dbPath, maxRows: maxRows, pruneInterval: pruneInterval}, nil
 }
 
@@ -217,15 +266,80 @@ func ensureProviderColumn(db *sql.DB) error {
 	return nil
 }
 
+// ensureResolutionColumn adds stream_configs.resolution when it is missing.
+//
+// Same inspect-then-alter shape as ensureProviderColumn, for the same reason: a
+// swallowed ALTER error would also hide a genuinely broken database. The constant
+// default backfills existing rows without a table rewrite, so a populated
+// production onvif_logs.db gains the column in place and every pre-existing
+// stream reads back as "sd".
+func ensureResolutionColumn(db *sql.DB) error {
+	var present bool
+	if err := db.QueryRow(
+		`SELECT COUNT(*) > 0 FROM pragma_table_info('stream_configs') WHERE name = 'resolution'`,
+	).Scan(&present); err != nil {
+		return fmt.Errorf("failed to inspect stream_configs schema: %w", err)
+	}
+	if present {
+		return nil
+	}
+	if _, err := db.Exec(
+		`ALTER TABLE stream_configs ADD COLUMN resolution TEXT NOT NULL DEFAULT '` + DefaultResolution + `'`,
+	); err != nil {
+		return fmt.Errorf("failed to add stream_configs.resolution: %w", err)
+	}
+	return nil
+}
+
 // UpsertStreamConfig persists a profile token, its RTSP URL and the provider it
 // belongs to. The provider is normalised to "onvif" when empty, so existing
 // call sites keep working unchanged and never write a blank provider.
+//
+// The resolution is left exactly as stored, which is what makes an upsert that
+// does NOT mention one (every ONVIF call site, and every resume path) harmless:
+// the column already holds either the user's choice or the "sd" default, and
+// overwriting it with a caller's zero value would silently drop an HD pick on
+// the next reconnect. Use SetStreamResolution to change it.
 func (l *Logger) UpsertStreamConfig(profileToken, rtspURL, provider string) error {
 	if provider == "" {
 		provider = defaultProvider
 	}
-	_, err := l.db.Exec(`INSERT INTO stream_configs(profile_token, rtsp_url, provider, updated_at) VALUES(?,?,?,?)
-		ON CONFLICT(profile_token) DO UPDATE SET rtsp_url=excluded.rtsp_url, provider=excluded.provider, updated_at=excluded.updated_at`, profileToken, rtspURL, provider, time.Now())
+	_, err := l.db.Exec(`INSERT INTO stream_configs(profile_token, rtsp_url, provider, resolution, updated_at) VALUES(?,?,?,?,?)
+		ON CONFLICT(profile_token) DO UPDATE SET rtsp_url=excluded.rtsp_url, provider=excluded.provider, updated_at=excluded.updated_at`,
+		profileToken, rtspURL, provider, DefaultResolution, time.Now())
+	return err
+}
+
+// SetStreamResolution records the user's per-camera resolution choice.
+//
+// It is a separate statement from UpsertStreamConfig on purpose. Upserting also
+// rewrites the RTSP URL, and the URL is engine-allocated and changes on every
+// reconnect, so flipping a resolution must not require knowing it.
+//
+// MEASURED DEFECT this fixes: an UPDATE is a no-op when the camera has no
+// stream_configs row YET, which is the normal case for choosing a resolution
+// BEFORE starting the camera for the first time. The choice was silently
+// dropped and the stream then came up on SD. It now INSERTs a placeholder row
+// carrying the resolution and an EMPTY rtsp_url, and ListStreamConfigs skips
+// those: a placeholder is a recorded preference, not a stream to run, so it
+// must never be replayed as a start with an empty URL.
+//
+// An unrecognised resolution is REJECTED rather than coerced, so a typo cannot
+// silently park a camera on SD and look like it worked.
+func (l *Logger) SetStreamResolution(profileToken, resolution string) error {
+	if profileToken == "" {
+		return fmt.Errorf("profile token is required")
+	}
+	if err := ValidateResolution(resolution); err != nil {
+		return err
+	}
+	now := time.Now()
+	// The DO UPDATE clause deliberately does NOT touch provider or rtsp_url: a
+	// placeholder row has neither, and an existing row's engine URL must
+	// survive a preference change.
+	_, err := l.db.Exec(`INSERT INTO stream_configs(profile_token, rtsp_url, provider, resolution, updated_at) VALUES(?,?,?,?,?)
+		ON CONFLICT(profile_token) DO UPDATE SET resolution=excluded.resolution, updated_at=excluded.updated_at`,
+		profileToken, "", defaultProvider, NormalizeResolution(resolution), now)
 	return err
 }
 
@@ -234,11 +348,19 @@ func (l *Logger) DeleteStreamConfig(profileToken string) error {
 	return err
 }
 
+// ListStreamConfigs returns the stream configs that describe a stream to RESTORE.
+//
+// Placeholder rows are excluded: SetStreamResolution writes one to hold a
+// per-camera resolution chosen before the camera was ever started, and it has an
+// empty rtsp_url by construction. Returning it would make RestoreStreams attempt
+// a start with an empty URL on every boot.
 func (l *Logger) ListStreamConfigs() ([]StreamConfig, error) {
 	// COALESCE + NULLIF keeps a row that somehow holds NULL or an empty
 	// provider from surfacing as "unknown": such rows are ONVIF by definition,
-	// because ONVIF was the only provider when they were written.
-	rows, err := l.db.Query(`SELECT profile_token, rtsp_url, COALESCE(NULLIF(provider, ''), '` + defaultProvider + `') FROM stream_configs ORDER BY profile_token`)
+	// because ONVIF was the only provider when they were written. The
+	// resolution is defaulted the same way, for the same reason: a row that
+	// predates the column reads back as the SD the product was running.
+	rows, err := l.db.Query(`SELECT profile_token, rtsp_url, COALESCE(NULLIF(provider, ''), '` + defaultProvider + `'), COALESCE(NULLIF(resolution, ''), '` + DefaultResolution + `') FROM stream_configs WHERE rtsp_url <> '' ORDER BY profile_token`)
 	if err != nil {
 		return nil, err
 	}
@@ -246,12 +368,32 @@ func (l *Logger) ListStreamConfigs() ([]StreamConfig, error) {
 	var result []StreamConfig
 	for rows.Next() {
 		var config StreamConfig
-		if err := rows.Scan(&config.ProfileToken, &config.RTSPURL, &config.Provider); err != nil {
+		if err := rows.Scan(&config.ProfileToken, &config.RTSPURL, &config.Provider, &config.Resolution); err != nil {
 			return nil, err
 		}
 		result = append(result, config)
 	}
 	return result, rows.Err()
+}
+
+// StreamResolution reads back the persisted resolution for one camera, or
+// DefaultResolution when the camera has no stored row yet. It is what the
+// stream start path consults so a per-camera choice survives a restart.
+func (l *Logger) StreamResolution(profileToken string) (string, error) {
+	if profileToken == "" {
+		return DefaultResolution, nil
+	}
+	var stored string
+	err := l.db.QueryRow(
+		`SELECT COALESCE(NULLIF(resolution, ''), '`+DefaultResolution+`') FROM stream_configs WHERE profile_token=?`,
+		profileToken).Scan(&stored)
+	if err == sql.ErrNoRows {
+		return DefaultResolution, nil
+	}
+	if err != nil {
+		return DefaultResolution, err
+	}
+	return NormalizeResolution(stored), nil
 }
 
 // Close closes the database connection

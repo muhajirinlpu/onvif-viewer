@@ -62,6 +62,15 @@ type Camera struct {
 	// online when the profile call succeeded; Tuya cameras report the cloud's
 	// own online flag.
 	Online bool `json:"online"`
+	// Resolution is the camera's STORED video resolution ("sd" or "hd"), so the
+	// UI can show the per-camera choice before the camera is started instead of
+	// guessing it from a running stream. Empty means the provider does not model
+	// resolutions (every ONVIF camera), and the UI then renders no note.
+	Resolution string `json:"resolution,omitempty"`
+	// ResolutionOptions are the values this camera's provider accepts, so the
+	// control is driven by the server rather than by a hardcoded list in the
+	// page. Empty means "no resolution choice applies".
+	ResolutionOptions []string `json:"resolutionOptions,omitempty"`
 }
 
 // Provider lists the cameras of one ecosystem.
