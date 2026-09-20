@@ -418,6 +418,13 @@
                             cloud {{ tuyaSession.cloudVerified ? 'verified' : 'not verified' }} &middot;
                             expiry {{ tuyaSession.expiryKnown ? 'known' : 'unknown' }}
                           </span>
+                          <!-- M8: WHERE the credential is kept. A credential in
+                               the project's own database is still a stored
+                               credential, and the panel says so instead of
+                               implying a file that may no longer exist. -->
+                          <span v-if="tuyaSession.storeKind" class="tuya-session-store">
+                            &middot; stored in the {{ tuyaSession.storeLocation }}, never in a world-readable file
+                          </span>
                           <span v-if="tuyaSession.checkedSecondsAgo !== undefined">
                             &middot; last checked {{ tuyaSession.checkedSecondsAgo }}s ago
                             <span v-if="tuyaSession.cacheTtlSeconds"> (cached for {{ tuyaSession.cacheTtlSeconds }}s)</span>

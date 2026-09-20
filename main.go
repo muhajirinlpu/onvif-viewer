@@ -20,6 +20,7 @@ import (
 	"dengan.dev/camera-streamer/internal/provider"
 	"dengan.dev/camera-streamer/internal/stream"
 	"dengan.dev/camera-streamer/internal/tuyaengine"
+	"dengan.dev/camera-streamer/internal/tuyaqr"
 )
 
 //go:embed static
@@ -87,6 +88,22 @@ func tuyaSessionWatchdog(t *provider.Tuya, log *logger.Logger) {
 	}
 }
 
+// tuyaStoreReason explains, in one operator-facing sentence, where the Tuya
+// session is kept and what the legacy file is for now.
+//
+// It is a function rather than an inline format because the sentence has two
+// shapes: an install that still points at a legacy file (which is read once and
+// then left alone) and a fully migrated install that does not (so there is no
+// file to name, and saying "the legacy file at " with an empty path would be
+// nonsense). The reason is surfaced verbatim by GET /api/tuya/session.
+func tuyaStoreReason(dbPath, legacyFile string) string {
+	base := fmt.Sprintf("the session is kept in the project database %s, alongside the stream configs and logs", dbPath)
+	if strings.TrimSpace(legacyFile) == "" {
+		return base + "; no legacy session file is configured, so nothing is read from the filesystem"
+	}
+	return base + fmt.Sprintf("; the legacy file at %s is imported once at start-up and never written", legacyFile)
+}
+
 func main() {
 	// Create a temporary directory for HLS files
 	hlsBaseDir, err := os.MkdirTemp("", "onvif-hls")
@@ -103,6 +120,85 @@ func main() {
 	}
 	defer dbLogger.Close()
 
+	// M8: the Tuya session lives in the same database as the stream configs and
+	// logs, through the SAME connection the logger opened, so the process has
+	// one writer and one place where the database's 0600 permissions are
+	// enforced. This is what makes the credential a first-class part of the
+	// project's own store instead of a side-car JSON file.
+	//
+	// The selection is still made by tuyaqr.ResolveSessionStore, so
+	// TUYA_SESSION_STORE=file genuinely escapes back to the legacy file store
+	// (and TUYA_SESSION_DB retargets the database). The database handle opened
+	// above is handed in, so the resolved store shares this process's one writer
+	// rather than opening a second pool at the same file.
+	//
+	// The legacy file path is taken from TUYA_ENGINE_SESSION_FILE - the variable
+	// this project has always used for it, and the one the UI and the CLI tools
+	// set - rather than from tuyaqr's own TUYA_SESSION_FILE. They name the same
+	// thing, but only one of them is what an existing install actually exports,
+	// and reading the wrong one silently skipped the migration import.
+	legacySessionFile := strings.TrimSpace(os.Getenv(tuyaengine.EnvSessionFile))
+	sessionCfg := tuyaqr.StoreConfigFromEnv()
+	if strings.TrimSpace(sessionCfg.FilePath) == "" {
+		sessionCfg.FilePath = legacySessionFile
+	}
+	sessionCfg.OpenDB = func(path string) (*tuyaqr.SQLiteSessionStore, error) {
+		if path == dbLogger.Path() {
+			return tuyaqr.NewSQLiteSessionStoreFromDB(dbLogger.DB(), dbLogger.Path())
+		}
+		return tuyaqr.NewSQLiteSessionStore(path)
+	}
+	resolved, err := tuyaqr.ResolveSessionStore(sessionCfg)
+	if err != nil {
+		log.Fatalf("Failed to initialize the Tuya session store: %v", err)
+	}
+	sessionStore := resolved.Store
+	log.Printf("Tuya session store: %s (%s) - %s", resolved.Kind, resolved.Location, resolved.Reason)
+	if resolved.Kind == tuyaqr.StoreKindSQLite {
+		log.Printf("Tuya session database and its -wal/-shm are held at 0600 (mode reported by GET /api/tuya/session)")
+	}
+	if resolved.FallbackFrom != "" {
+		log.Printf("WARNING: the Tuya session store fell back from %q, so the session is NOT in the database", resolved.FallbackFrom)
+	}
+
+	// The legacy session file is now an IMPORT SOURCE and a read-only fallback,
+	// never a write target: importing copies it and leaves it exactly as it was.
+	// It is only meaningful when the destination is the database; a file store
+	// already IS that file.
+	if resolved.Kind == tuyaqr.StoreKindSQLite {
+		if importSource := resolved.ImportSource; importSource != "" {
+			result, importErr := tuyaqr.ImportSessionFile(sessionStore, importSource)
+			switch {
+			case importErr != nil:
+				log.Printf("Legacy Tuya session import skipped: %v", importErr)
+			case result.Imported:
+				log.Printf("Imported the legacy Tuya session for %s into %s (%d cookie(s)); the source file was read only",
+					result.Region+"/"+result.Email, result.DestLocation, result.CookieCount)
+			case result.AlreadyStored:
+				log.Printf("The Tuya session store already holds %s; the legacy file was left untouched", result.Region+"/"+result.Email)
+			default:
+				log.Printf("Legacy Tuya session import: %s", result.Detail)
+			}
+		}
+	}
+
+	// tuyaConfigured answers "is Tuya part of this install at all?" BEFORE the
+	// bridge is built, and it is deliberately independent of HOW the session is
+	// stored: a migrated install may have TUYA_ENGINE_SESSION_FILE unset while
+	// its credential sits in the database, and gating on the env var alone would
+	// silently disable Tuya streaming on a working install.
+	tuyaConfigured := legacySessionFile != ""
+	if !tuyaConfigured {
+		if accts, listErr := sessionStore.Accounts(); listErr == nil && len(accts) > 0 {
+			tuyaConfigured = true
+		}
+	}
+	// A FILE store with a configured path is configured by definition, even if
+	// the file cannot be read yet (the user has not scanned a QR).
+	if !tuyaConfigured && resolved.Kind == tuyaqr.StoreKindFile && resolved.Location != "" {
+		tuyaConfigured = true
+	}
+
 	// Initialize ONVIF client
 	onvifClient := onvif.NewClient()
 
@@ -117,7 +213,7 @@ func main() {
 	// engine binary are involved, and it stays off entirely until
 	// TUYA_ENGINE_SESSION_FILE is configured, so an ONVIF-only install is
 	// unchanged.
-	tuyaBridge, err := tuyaengine.NewBridgeFromEnv(providerStarter{manager: streamManager, provider: models.ProviderTuya}, dbLogger)
+	tuyaBridge, err := tuyaengine.NewBridgeForSession(providerStarter{manager: streamManager, provider: models.ProviderTuya}, dbLogger, tuyaConfigured)
 	if err != nil {
 		log.Printf("Tuya bridge disabled: %v", err)
 	}
@@ -131,16 +227,24 @@ func main() {
 	onvifProvider := provider.NewONVIF(onvifClient)
 	providerSet := provider.NewSet(onvifProvider)
 
-	// Tuya is added only when a session file is configured. Everything it does
-	// is read-only against that file until a QR scan deliberately replaces it.
+	// Tuya is added only when a session is configured. Everything it does is
+	// read-only against the store until a QR scan deliberately replaces it. The
+	// legacy session FILE is now an import source and a fallback, so an install
+	// that has already migrated keeps working with the file gone.
 	var tuyaProvider *provider.Tuya
 	var loginManager *provider.LoginManager
-	if sessionFile := strings.TrimSpace(os.Getenv(tuyaengine.EnvSessionFile)); sessionFile != "" {
+	if legacySessionFile != "" || sessionStore != nil {
 		var streaming provider.TuyaStreaming
 		if tuyaBridge != nil {
 			streaming = tuyaBridge
 		}
-		tuyaProvider = provider.NewTuya(sessionFile,
+		tuyaProvider = provider.NewTuya("",
+			provider.WithTuyaResolvedStore(&tuyaqr.ResolvedStore{
+				Store:    sessionStore,
+				Kind:     sessionStore.Kind(),
+				Location: sessionStore.Location(),
+				Reason:   tuyaStoreReason(sessionStore.Location(), legacySessionFile),
+			}),
 			provider.WithTuyaBridge(streaming),
 			provider.WithTuyaStreamStopper(streamManager),
 			provider.WithTuyaHost(tuyaengine.DefaultTuyaHost),
@@ -148,10 +252,10 @@ func main() {
 		)
 		providerSet = provider.NewSet(onvifProvider, tuyaProvider)
 		loginManager = provider.NewLoginManager(
-			provider.WithLoginSessionFile(sessionFile),
+			provider.WithLoginStore(sessionStore),
 			provider.WithLoginHost(tuyaengine.DefaultTuyaHost),
 		)
-		log.Printf("Tuya provider enabled (session file configured, streaming=%t)", tuyaBridge != nil)
+		log.Printf("Tuya provider enabled (session store=sqlite, legacy file=%t, streaming=%t)", legacySessionFile != "", tuyaBridge != nil)
 	}
 
 	// Initialize HTTP handlers

@@ -4,6 +4,9 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -47,10 +50,75 @@ const defaultProvider = "onvif"
 // Logger handles database logging
 type Logger struct {
 	db            *sql.DB
+	path          string
 	mutex         sync.Mutex
 	maxRows       int
 	pruneInterval int
 	writes        int
+}
+
+// FileMode is the observed permission of one file the database consists of.
+// It is a label for an operator, never a secret.
+type FileMode struct {
+	Path string `json:"path"`
+	Mode string `json:"mode"`
+}
+
+// HardenDatabaseFiles tightens a SQLite database and its -wal/-shm companions to
+// 0600, creating the parent directory 0700 if needed.
+//
+// WHY THIS EXISTS, MEASURED: the shipped database was
+// `-rw-r--r-- ... onvif_logs.db` — mode 0644, i.e. readable by every local
+// account. That was harmless while the database held only logs and stream
+// configs, and it stops being harmless the moment session cookies live in it.
+// Rather than making the whole database secret-by-obscurity (the logs are not
+// secret, and denying them to a co-operating local admin is not the goal), the
+// file is tightened to owner-only, which is exactly the protection the session
+// had as a 0600 JSON file and no more.
+//
+// ORDER MATTERS and was MEASURED: libsqlite3 creates the journal and the
+// shared-memory file with the DATABASE's permission bits. Tightening the
+// database first therefore makes -wal and -shm come out 0600 from birth. The
+// explicit chmod of the siblings afterwards is the belt to that braces, because
+// a database left 0644 by an older build already HAS 0644 siblings on disk, and
+// this is what fixes those in place without a checkpoint or a restart.
+//
+// Returning the observed modes lets the caller report what is actually on disk
+// rather than what was intended.
+func HardenDatabaseFiles(dbPath string) ([]FileMode, error) {
+	if strings.TrimSpace(dbPath) == "" {
+		return nil, nil
+	}
+	if dir := filepath.Dir(dbPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("create database directory: %w", err)
+		}
+	}
+	// A database that does not exist yet must be CREATED 0600, not created by
+	// SQLite under the process umask and then tightened: between those two
+	// moments the file would be world-readable with the session already in it.
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		f, createErr := os.OpenFile(dbPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0o600)
+		if createErr != nil && !os.IsExist(createErr) {
+			return nil, fmt.Errorf("create database %s: %w", dbPath, createErr)
+		}
+		if createErr == nil {
+			f.Close()
+		}
+	}
+	var observed []FileMode
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("tighten %s: %w", p, err)
+		}
+		if fi, statErr := os.Stat(p); statErr == nil {
+			observed = append(observed, FileMode{Path: p, Mode: fmt.Sprintf("%04o", fi.Mode().Perm())})
+		}
+	}
+	return observed, nil
 }
 
 // NewLogger creates a new logger and initializes the database.
@@ -59,6 +127,13 @@ func NewLogger(dbPath string) (*Logger, error) {
 }
 
 func newLogger(dbPath string, maxRows, pruneInterval int) (*Logger, error) {
+	// The database is a credential-bearing store now (internal/tuyaqr keeps Tuya
+	// sessions in it), so it and its journal siblings are held at 0600 BEFORE
+	// anything opens them. This is also what fixes an already-deployed 0644
+	// onvif_logs.db: the next restart tightens it in place.
+	if _, err := HardenDatabaseFiles(dbPath); err != nil {
+		return nil, fmt.Errorf("failed to secure the database file: %w", err)
+	}
 	// Enable WAL mode and shared cache to massively accelerate concurrent read/writes
 	dsn := fmt.Sprintf("%s?cache=shared&mode=rwc&_journal_mode=WAL&_busy_timeout=5000", dbPath)
 	db, err := sql.Open("sqlite3", dsn)
@@ -114,7 +189,7 @@ func newLogger(dbPath string, maxRows, pruneInterval int) (*Logger, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Logger{db: db, maxRows: maxRows, pruneInterval: pruneInterval}, nil
+	return &Logger{db: db, path: dbPath, maxRows: maxRows, pruneInterval: pruneInterval}, nil
 }
 
 // ensureProviderColumn adds stream_configs.provider when it is missing.
@@ -185,6 +260,21 @@ func (l *Logger) Close() {
 		l.db.Close()
 	}
 }
+
+// DB exposes the underlying connection.
+//
+// It exists so the rest of the process shares the ONE writer this constructor
+// opened against the database, rather than opening a second pool at the same
+// file. internal/tuyaqr's SQLite session store is the caller that needs it: the
+// session belongs in this database, and two connections would also mean two
+// places where the file's permissions have to be enforced.
+//
+// The caller must not close it; Close does, and it owns the handle.
+func (l *Logger) DB() *sql.DB { return l.db }
+
+// Path is the database file this logger opened. It is reported so a caller can
+// point another store at the same file without re-deriving the name.
+func (l *Logger) Path() string { return l.path }
 
 // log inserts a new log entry into the database
 func (l *Logger) log(streamID string, level LogLevel, source, message string) {

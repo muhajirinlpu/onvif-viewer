@@ -63,8 +63,20 @@ func (b *Bridge) Stop() { b.engine.Stop() }
 // lazily by the first StartStream, and an install without
 // TUYA_ENGINE_SESSION_FILE never spawns anything.
 func NewBridgeFromEnv(starter StreamStarter, log *logger.Logger) (*Bridge, error) {
-	session := strings.TrimSpace(os.Getenv(EnvSessionFile))
-	if session == "" {
+	return NewBridgeForSession(starter, log, strings.TrimSpace(os.Getenv(EnvSessionFile)) != "")
+}
+
+// NewBridgeForSession builds a bridge, given the caller's answer to "is a Tuya
+// session actually configured in this process?".
+//
+// It exists because the session no longer has to be a file: in M8 the credential
+// lives in the project database, and TUYA_ENGINE_SESSION_FILE may legitimately be
+// unset on an install that is fully migrated. Gating the bridge on the
+// environment variable alone would then silently disable Tuya streaming on a
+// working install, which is exactly the kind of "it just stopped working"
+// regression this milestone must not introduce.
+func NewBridgeForSession(starter StreamStarter, log *logger.Logger, configured bool) (*Bridge, error) {
+	if !configured {
 		return nil, nil
 	}
 	engine := New(DefaultConfig())

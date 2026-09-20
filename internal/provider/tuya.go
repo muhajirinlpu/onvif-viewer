@@ -17,6 +17,39 @@ import (
 // so a hung cloud cannot make the HTTP request hang with it.
 const sessionProbeTimeout = 8 * time.Second
 
+// storeStatusLocked fills the store axes. Caller holds t.mu (or is
+// single-threaded), because it reads the provider's cached session.
+//
+// A store with no explicit reason still gets one: the response must always
+// explain where the credential is, and a caller that wired a store directly
+// (tests, embedders) must not be able to strip that explanation by omitting it.
+func (t *Tuya) storeStatusLocked() (kind, location, reason, fallbackFrom string, modes []tuyaqr.FileMode, accounts []tuyaqr.StoredSession) {
+	if t.store == nil {
+		return "", "", "", "", nil, nil
+	}
+	kind = t.store.Kind()
+	location = t.store.Location()
+	reason = t.storeReason
+	fallbackFrom = t.storeFallbackFrom
+	if strings.TrimSpace(reason) == "" {
+		switch kind {
+		case tuyaqr.StoreKindSQLite:
+			reason = "the session is kept in the project database " + location
+		case tuyaqr.StoreKindFile:
+			reason = "the session is kept in the file " + location
+		default:
+			reason = "the session is kept in a " + kind + " store"
+		}
+	}
+	if s, ok := t.store.(*tuyaqr.SQLiteSessionStore); ok {
+		modes = s.ObservedModes()
+	}
+	if listed, err := t.store.Accounts(); err == nil {
+		accounts = listed
+	}
+	return
+}
+
 // TuyaStreaming is the slice of tuyaengine.Bridge this package needs. Declaring
 // it here (rather than importing *tuyaengine.Bridge concretely) keeps the Tuya
 // provider unit-testable without an engine, while the real bridge satisfies it
@@ -68,8 +101,12 @@ type TuyaStreamStopper interface {
 // (p2p auth token, localKey) is never copied into a Camera or into a log line.
 type Tuya struct {
 	sessionFile string
-	resolution  string
-	host        string
+	store       tuyaqr.SessionStore
+	// materialized is the 0600 file the DB store last wrote for the vendored
+	// go2rtc driver. It is a path, never a credential.
+	materialized string
+	resolution   string
+	host         string
 
 	bridge  TuyaStreaming
 	stopper TuyaStreamStopper
@@ -83,6 +120,14 @@ type Tuya struct {
 	lastCheck   time.Time
 	lastCheckOK bool
 	lastErr     string
+	// account is the stored credential this provider has loaded: a label,
+	// never a secret.
+	account tuyaqr.Account
+	// storeReason / storeFallbackFrom explain why this store was chosen and,
+	// when non-empty, that a preferred store failed and a fallback was used.
+	// They are operator-facing words, never credentials.
+	storeReason       string
+	storeFallbackFrom string
 	// expiryOrigin records whether the stored expiry came from the cloud
 	// ("cookie:fast-sid") or is genuinely unknown (""). It is never guessed.
 	expiryOrigin string
@@ -123,26 +168,78 @@ func WithTuyaLogger(l TuyaLogger) TuyaOption { return func(t *Tuya) { t.log = l 
 func WithTuyaStreamStopper(s TuyaStreamStopper) TuyaOption { return func(t *Tuya) { t.stopper = s } }
 
 // withTuyaLister injects a discovery client. Test-only seam: the real one is
-// built from the session file.
+// built from the session store.
 func withTuyaLister(l TuyaList, s *tuyaqr.Session) TuyaOption {
 	return func(t *Tuya) {
 		t.client = l
 		t.session = s
+		if s != nil {
+			t.account = s.Account()
+		}
 	}
+}
+
+// WithTuyaStore attaches the session store the provider reads credentials from.
+// This is the seam the database-backed installation uses.
+func WithTuyaStore(store tuyaqr.SessionStore) TuyaOption {
+	return func(t *Tuya) { t.store = store }
+}
+
+// WithTuyaAccount names the account to read when the store holds more than one.
+// It is a label (region + email), never a credential. Leaving it empty means
+// "the only account in the store", and a store with several accounts then
+// answers with an error that names them rather than picking one.
+func WithTuyaAccount(a tuyaqr.Account) TuyaOption {
+	return func(t *Tuya) { t.account = a.Normalize() }
+}
+
+// WithTuyaResolvedStore attaches a store together with the selection decision
+// that produced it (store kind, location and the reason for the choice). The
+// reason is reported by GET /api/tuya/session so an operator can always see
+// where the credential went and why.
+func WithTuyaResolvedStore(res *tuyaqr.ResolvedStore) TuyaOption {
+	return func(t *Tuya) {
+		if res == nil {
+			return
+		}
+		t.store = res.Store
+		t.storeReason = res.Reason
+		t.storeFallbackFrom = res.FallbackFrom
+	}
+}
+
+// WithTuyaValidateTTL overrides the session-validation cache window.
+func WithTuyaValidateTTL(d time.Duration) TuyaOption { return func(t *Tuya) { t.validateTTL = d } }
+
+// WithTuyaCloudClientForTest injects the discovery/validation client, so a test
+// in another package (internal/handlers drives the real HTTP surface) can run
+// the whole path without a network round trip.
+//
+// It injects the CLIENT only, never a session: the session still comes from the
+// store, which is the behaviour under test.
+func WithTuyaCloudClientForTest(l TuyaList) TuyaOption {
+	return func(t *Tuya) { t.client = l }
 }
 
 // withTuyaValidateTTL shortens the session-validation cache in tests.
 func withTuyaValidateTTL(d time.Duration) TuyaOption { return func(t *Tuya) { t.validateTTL = d } }
 
-// NewTuya builds a Tuya provider over a read-only session file. It does not
-// touch the cloud or the file here: the session is loaded lazily on first use so
-// that constructing the provider cannot fail a server start.
+// NewTuya builds a Tuya provider over a session store. The path form is kept
+// from the file-only era: it builds a file store bound to that exact path, so
+// every existing caller - and every test that passes a path - behaves exactly
+// as before. Pass WithTuyaStore to use the database instead.
+//
+// Nothing touches the cloud or the store here: the session is loaded lazily on
+// first use so that constructing the provider cannot fail a server start.
 func NewTuya(sessionFile string, opts ...TuyaOption) *Tuya {
 	t := &Tuya{
 		sessionFile: sessionFile,
 		resolution:  tuyaengine.DefaultResolution,
 		host:        tuyaengine.DefaultTuyaHost,
 		validateTTL: 30 * time.Second,
+	}
+	if strings.TrimSpace(sessionFile) != "" {
+		t.store = tuyaqr.NewFileSessionStore(sessionFile)
 	}
 	for _, fn := range opts {
 		fn(t)
@@ -153,11 +250,43 @@ func NewTuya(sessionFile string, opts ...TuyaOption) *Tuya {
 // Kind reports Tuya.
 func (t *Tuya) Kind() Kind { return KindTuya }
 
-// SessionFile is the read-only session path this provider reads.
-func (t *Tuya) SessionFile() string { return t.sessionFile }
+// Store reports the session store in use (nil when none is configured).
+func (t *Tuya) Store() tuyaqr.SessionStore { return t.store }
 
-// Configured reports whether a session file is wired up at all.
-func (t *Tuya) Configured() bool { return strings.TrimSpace(t.sessionFile) != "" }
+// SessionFile reports a read-only session FILE path, or "" when the store is
+// not file-backed. It is kept because tuyaengine takes a path; a database-backed
+// store answers with the 0600 materialized copy, never with a database path.
+func (t *Tuya) SessionFile() string {
+	if t.store == nil {
+		return ""
+	}
+	if t.store.Kind() == tuyaqr.StoreKindFile {
+		return t.sessionFile
+	}
+	return t.materialized
+}
+
+// sessionPathForEngine returns the file path the vendored go2rtc driver must be
+// given, materializing a private 0600 copy when the store is a database.
+func (t *Tuya) sessionPathForEngine(s *tuyaqr.Session) (string, error) {
+	if t.store == nil {
+		return "", fmt.Errorf("%w: no Tuya session store is configured", tuyaqr.ErrNoSession)
+	}
+	if s == nil {
+		return "", fmt.Errorf("%w: no Tuya session is loaded", tuyaqr.ErrNoSession)
+	}
+	path, err := t.store.Materialize(s)
+	if err != nil {
+		return "", err
+	}
+	t.mu.Lock()
+	t.materialized = path
+	t.mu.Unlock()
+	return path, nil
+}
+
+// Configured reports whether a session store is wired up at all.
+func (t *Tuya) Configured() bool { return t.store != nil }
 
 // ErrSessionReloginRequired is returned when a Tuya stream cannot be started or
 // kept running because the stored session is dead. The HTTP layer maps it to a
@@ -190,9 +319,22 @@ func (t *Tuya) StartStream(deviceID string) (*models.StreamInfo, error) {
 		return nil, fmt.Errorf("%w (camera %s): not started", ErrSessionReloginRequired, deviceID)
 	}
 
+	// The engine consumes a session FILE (internal/go2rtc is vendored and
+	// frozen), so a database-backed session is materialized as a private 0600
+	// copy here and that copy is what the engine reads.
+	session, err := t.currentSession()
+	if err != nil {
+		t.degradeOnSessionLoss(ErrSessionReloginRequired)
+		return nil, fmt.Errorf("%w (camera %s): %v", ErrSessionReloginRequired, deviceID, err)
+	}
+	sessionPath, err := t.sessionPathForEngine(session)
+	if err != nil {
+		return nil, fmt.Errorf("provider: tuya session is not readable: %w", err)
+	}
+
 	spec := tuyaengine.DeviceSpec{
 		DeviceID:    deviceID,
-		SessionFile: t.sessionFile,
+		SessionFile: sessionPath,
 		Resolution:  t.resolution,
 		Host:        t.host,
 	}
@@ -328,12 +470,36 @@ func cameraFromTuyaDevice(d tuyaqr.Device) Camera {
 // countdown exists for it; ExpiresAt and RemainingSeconds are then null/0 and
 // ExpirySource says "unknown".
 type SessionStatus struct {
-	Configured   bool `json:"configured"`
-	FilePresent  bool `json:"filePresent"`
+	Configured    bool `json:"configured"`
+	FilePresent   bool `json:"filePresent"`
 	CloudVerified bool `json:"cloudVerified"`
 	// Valid is the single boolean the UI gates on. It means "an authenticated
 	// call to the cloud just succeeded": file presence alone is NOT validity.
 	Valid bool `json:"valid"`
+
+	// StoreKind / StoreLocation / StoreReason say WHERE the credential is kept
+	// and WHY that choice was made. With the session in the project database
+	// these are the honest replacement for "the session file exists", and they
+	// are additions: FilePresent still means exactly what it always did, and
+	// still reports true when a database-backed session is present, because a
+	// stored credential that loads is present whatever the storage medium.
+	StoreKind     string `json:"storeKind"`
+	StoreLocation string `json:"storeLocation"`
+	StoreReason   string `json:"storeReason,omitempty"`
+	// StoreFileModes reports the observed permission of the database and its
+	// -wal/-shm siblings. It is how the 0600 hardening is verifiable from
+	// outside the process instead of being a claim.
+	StoreFileModes []tuyaqr.FileMode `json:"storeFileModes,omitempty"`
+	// Accounts are the stored accounts, described without any secret. A
+	// single-account install has one entry.
+	Accounts []tuyaqr.StoredSession `json:"accounts,omitempty"`
+	// StoreFallbackFrom is set when the preferred store could not be opened and
+	// a fallback was used. Non-empty means "this is the degraded case".
+	StoreFallbackFrom string `json:"storeFallbackFrom,omitempty"`
+	// Email / Region identify the account whose credential is loaded. They are
+	// account labels the UI already showed, not secrets.
+	Email  string `json:"email,omitempty"`
+	Region string `json:"region,omitempty"`
 
 	// ExpiresAt is the cloud-reported cookie deadline, or null when unknown.
 	ExpiresAt *time.Time `json:"expiresAt"`
@@ -409,6 +575,16 @@ func (t *Tuya) Session(ctx context.Context) (*SessionStatus, error) {
 	// expiry into the in-memory session, so a session captured before M6 can
 	// acquire a real (cloud-stated) countdown without being rewritten on disk.
 	validateErr := client.RefreshExpiry(ctx, t.session)
+	if validateErr == nil {
+		// PERSIST what the cloud just stated. This is the M8 half of the M6
+		// expiry work: capturing a deadline is only useful if it survives the
+		// process, and with the session in the database the deadline belongs in
+		// the same row as the cookies it describes. Nothing is invented - only
+		// a value the cloud reported is written - and a store failure is logged
+		// rather than hidden, because silently losing the expiry would put the
+		// API back to "unknown" with no explanation.
+		t.persistSession(t.session)
+	}
 
 	t.mu.Lock()
 	t.lastCheck = time.Now()
@@ -566,6 +742,8 @@ func (t *Tuya) statusLocked() *SessionStatus {
 		ExpirySource:    "unknown",
 		CacheTTLSeconds: int(t.validateTTL.Seconds()),
 	}
+	status.StoreKind, status.StoreLocation, status.StoreReason, status.StoreFallbackFrom,
+		status.StoreFileModes, status.Accounts = t.storeStatusLocked()
 	status.ExpiredStreamsStopped = t.stoppedStreams
 	if !t.lastCheck.IsZero() {
 		checked := t.lastCheck
@@ -573,6 +751,8 @@ func (t *Tuya) statusLocked() *SessionStatus {
 		status.CheckedSecondsAgo = int(time.Since(checked).Seconds())
 	}
 	if t.session != nil {
+		status.Email = t.session.Account().Normalize().Email
+		status.Region = t.session.Account().Normalize().Region
 		status.CookieNames = t.session.CookieNames()
 		status.CookieCount = len(status.CookieNames)
 		with, total := t.session.CookiesWithExpiry()
@@ -627,32 +807,116 @@ func detailSuffix(errText string) string {
 	return ": " + errText
 }
 
-// clientFor lazily loads the session file and builds an authenticated client.
-// The file is opened read-only and never rewritten here.
+// persistSession writes the (possibly just refreshed) session back to the
+// store. It is called on the refresh path only, and only when the cloud
+// accepted the session, so a credential the cloud rejected can never be
+// re-saved.
+//
+// Failures are logged and swallowed: losing a persisted expiry degrades the
+// countdown to "unknown", which is honest, and must not turn a working session
+// check into an HTTP 502.
+func (t *Tuya) persistSession(s *tuyaqr.Session) {
+	if s == nil {
+		return
+	}
+	t.mu.Lock()
+	store := t.store
+	logger := t.log
+	t.mu.Unlock()
+	if store == nil {
+		return
+	}
+	if err := store.Save(s); err != nil {
+		if logger != nil {
+			// The account label and the failure only: never cookie material.
+			logger.LogWarn("tuya", "tuya", fmt.Sprintf(
+				"the refreshed Tuya session for %s could not be written back to the %s store: %v",
+				s.Account(), store.Kind(), err))
+		}
+		return
+	}
+	if logger != nil {
+		logger.LogInfo("tuya", "tuya", fmt.Sprintf(
+			"persisted the cloud-reported Tuya session state for %s into the %s store (%d cookie(s))",
+			s.Account(), store.Kind(), len(s.CookieNames())))
+	}
+}
+
+// clientFor lazily loads the session from the store and builds an authenticated
+// client. Nothing is written: the store is only read here.
+//
+// A client that is already cached does NOT short-circuit the session load. That
+// matters because the two are cached separately and an injected client (the test
+// seam, and any future caller) arrives with no session behind it; returning early
+// there left t.session nil, so the probe ran against nothing, reported
+// cloudVerified=true and then reported filePresent=false — a status that claims
+// the cloud accepted a credential the process does not hold.
 func (t *Tuya) clientFor() (TuyaList, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.client != nil && t.session != nil {
+		return t.client, nil
+	}
+	session, err := t.loadSessionLocked()
+	if err != nil {
+		return nil, fmt.Errorf("provider: tuya session: %w", err)
+	}
+	t.session = session
 	if t.client != nil {
 		return t.client, nil
 	}
-	if !t.Configured() {
-		return nil, fmt.Errorf("%w: no Tuya session file configured", ErrUnknownProvider)
-	}
-	client, session, err := tuyaqr.NewClientForSessionFile(t.sessionFile)
+	client, err := tuyaqr.NewClientFromSession(session)
 	if err != nil {
 		return nil, fmt.Errorf("provider: tuya session: %w", err)
 	}
 	t.client = client
-	t.session = session
 	return client, nil
 }
 
-// Invalidate drops the cached session and its validation result, so the next
-// discovery call reloads the session file. Called after a successful QR scan:
-// the file on disk has just been replaced and the cached cookies are stale.
+// loadSessionLocked reads the stored session. Caller holds t.mu.
 //
-// The streaming bridge needs no equivalent: internal/go2rtc reads the session
-// file itself on every engine connect.
+// With no account named it takes the store's single account, so a
+// single-account install needs no configuration; a store holding several
+// accounts produces an error that NAMES them instead of silently binding a
+// stream to whichever credential happened to sort first.
+func (t *Tuya) loadSessionLocked() (*tuyaqr.Session, error) {
+	if t.store == nil {
+		return nil, fmt.Errorf("%w: no Tuya session store is configured", tuyaqr.ErrNoSession)
+	}
+	account, err := tuyaqr.ResolveAccount(t.store, t.account)
+	if err != nil {
+		return nil, err
+	}
+	session, err := t.store.Load(account)
+	if err != nil {
+		return nil, err
+	}
+	t.account = account.Normalize()
+	return session, nil
+}
+
+// currentSession returns the loaded session, loading it if necessary.
+func (t *Tuya) currentSession() (*tuyaqr.Session, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.session != nil {
+		return t.session, nil
+	}
+	session, err := t.loadSessionLocked()
+	if err != nil {
+		return nil, err
+	}
+	t.session = session
+	return session, nil
+}
+
+// Invalidate drops the cached session and its validation result, so the next
+// discovery call reloads the credential from the store. Called after a
+// successful QR scan: the store has just been written and the cached cookies
+// are stale.
+//
+// The streaming bridge needs no equivalent: it is handed the materialized path
+// on every start.
 func (t *Tuya) Invalidate() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -661,6 +925,7 @@ func (t *Tuya) Invalidate() {
 	t.lastCheck = time.Time{}
 	t.lastCheckOK = false
 	t.lastErr = ""
+	t.expiryOrigin = ""
 }
 
 // SessionExpired reports whether a discovery error means the user must scan a

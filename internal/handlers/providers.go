@@ -18,7 +18,8 @@ import (
 //
 // tuya is the concrete Tuya provider used for the streaming path (nil when Tuya
 // is not configured). onSessionCaptured runs after a successful QR scan so the
-// provider reloads the new session file.
+// provider reloads the credential from its session store. With the session in
+// the project database that is a re-read of the stored row, not a file watch.
 func (h *Handler) SetProviders(set *provider.Set, logins *provider.LoginManager, tuya *provider.Tuya, onSessionCaptured func()) {
 	h.providers = set
 	h.logins = logins
@@ -235,10 +236,17 @@ func (h *Handler) TuyaLoginPoll(w http.ResponseWriter, r *http.Request) {
 // The response answers FOUR independent questions instead of collapsing them
 // into one misleading "valid" flag:
 //
-//	configured      - is a Tuya session file wired up in this process?
-//	filePresent     - does it load and carry fast-sid/s-sid?
+//	configured      - is a Tuya session store wired up in this process?
+//	filePresent     - does a stored session load and carry fast-sid/s-sid?
 //	cloudVerified   - did an ACTUAL authenticated call to the cloud succeed?
 //	expiryKnown     - did the cloud ever state when the cookies expire?
+//
+// `filePresent` keeps its exact meaning now that the session may live in the
+// project database: it is "a stored credential loads and carries the auth
+// cookie pair", which is what it always meant, and it must NOT be renamed to
+// something database-shaped without an equivalent, because that would quietly
+// change an answer the UI gates on. `storeKind`/`storeLocation`/`storeReason`
+// are ADDED so the response still says, unambiguously, WHERE the credential is.
 //
 // `expiryKnown:false` is an honest answer, not a failure: MEASURED, the user's
 // stored session has a ZERO expiry on all four cookies, so no truthful
@@ -249,6 +257,7 @@ func (h *Handler) TuyaLoginPoll(w http.ResponseWriter, r *http.Request) {
 // Response 200 (valid, expiry known):
 //
 //	{"configured":true,"filePresent":true,"cloudVerified":true,"valid":true,
+//	 "storeKind":"sqlite","storeLocation":"onvif_logs.db",
 //	 "expiresAt":"2026-09-22T12:56:20Z","remainingSeconds":214000,"expiryKnown":true,
 //	 "expirySource":"cookie:fast-sid","cookiesWithExpiry":3,"cookieCount":4,
 //	 "checkedSecondsAgo":0,"cacheTtlSeconds":30,"reloginRequired":false,"detail":"..."}
@@ -256,6 +265,7 @@ func (h *Handler) TuyaLoginPoll(w http.ResponseWriter, r *http.Request) {
 // Response 200 (valid, expiry UNKNOWN — the honest case today):
 //
 //	{"configured":true,"filePresent":true,"cloudVerified":true,"valid":true,
+//	 "storeKind":"sqlite","storeLocation":"onvif_logs.db",
 //	 "expiresAt":null,"remainingSeconds":0,"expiryKnown":false,
 //	 "expirySource":"unknown","cookiesWithExpiry":0,"cookieCount":4,
 //	 "detail":"accepted by the cloud; the stored cookies declare no expiry, so no countdown can be shown"}
@@ -284,24 +294,34 @@ func (h *Handler) TuyaSession(w http.ResponseWriter, r *http.Request) {
 
 // TuyaLogout serves POST /api/tuya/logout.
 //
-// It removes the stored session file from this host. HONESTY: Tuya exposes NO
-// server-side logout endpoint for these cookies, so this is local credential
-// removal — the cookies would still be accepted by the cloud until they expire.
-// Removing the file is nevertheless the right local action: it is what makes the
-// UI stop using a credential the user asked to be rid of, and it is what forces
-// the one-click QR flow.
+// It removes the stored session from this host — the database row when the
+// session lives in the project store, the file when a legacy file store is
+// configured. HONESTY: Tuya exposes NO server-side logout endpoint for these
+// cookies, so this is local credential removal — the cookies would still be
+// accepted by the cloud until they expire. Removing them is nevertheless the
+// right local action: it is what makes the UI stop using a credential the user
+// asked to be rid of, and it is what forces the one-click QR flow.
 //
 // Response 200:
 //
-//	{"removed":true,"sessionFile":"/path/...","serverSideLogout":false,
-//	 "detail":"the stored Tuya session file was removed from this host; Tuya has no server-side logout, so the cookies remain valid at the cloud until they expire"}
+//	{"removed":true,"sessionStore":"sqlite","storeLocation":"onvif_logs.db",
+//	 "serverSideLogout":false,
+//	 "detail":"the stored Tuya session was removed from this host; Tuya has no server-side logout, so the cookies remain valid at the cloud until they expire"}
 type TuyaLogoutResponse struct {
-	Removed           bool   `json:"removed"`
-	SessionFile       string `json:"sessionFile,omitempty"`
-	ServerSideLogout  bool   `json:"serverSideLogout"`
-	ReloginRequired   bool   `json:"reloginRequired"`
-	StreamsStopped    int    `json:"streamsStopped"`
-	Detail            string `json:"detail"`
+	Removed bool `json:"removed"`
+	// SessionFile is kept for compatibility: it names the file when the store
+	// is file-backed, and the database when it is not. SessionStore is the
+	// unambiguous answer.
+	SessionFile string `json:"sessionFile,omitempty"`
+	// SessionStore is the kind of store the credential was deleted from
+	// (file|sqlite) and StoreLocation is where that store is. Neither is a
+	// secret.
+	SessionStore     string `json:"sessionStore,omitempty"`
+	StoreLocation    string `json:"storeLocation,omitempty"`
+	ServerSideLogout bool   `json:"serverSideLogout"`
+	ReloginRequired  bool   `json:"reloginRequired"`
+	StreamsStopped   int    `json:"streamsStopped"`
+	Detail           string `json:"detail"`
 }
 
 func (h *Handler) TuyaLogout(w http.ResponseWriter, r *http.Request) {
@@ -316,7 +336,7 @@ func (h *Handler) TuyaLogout(w http.ResponseWriter, r *http.Request) {
 	removed, err := h.logins.Logout()
 	if err != nil {
 		h.logger.LogError("", "tuya", fmt.Sprintf("Tuya logout could not remove the stored session: %v", err))
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "the stored Tuya session file could not be removed"})
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "the stored Tuya session could not be removed"})
 		return
 	}
 
@@ -334,14 +354,21 @@ func (h *Handler) TuyaLogout(w http.ResponseWriter, r *http.Request) {
 			stopped = n
 		}
 	}
-	h.logger.LogWarn("", "tuya", "stored Tuya session removed locally (no server-side logout exists); a new QR scan is required")
+	storeKind := h.logins.StoreKind()
+	storeLocation := h.logins.SessionFilePath()
+	h.logger.LogWarn("", "tuya", fmt.Sprintf(
+		"stored Tuya session removed from the %s store (%s) — no server-side logout exists; a new QR scan is required",
+		storeKind, storeLocation))
 
 	writeJSON(w, http.StatusOK, &TuyaLogoutResponse{
 		Removed:          removed,
+		SessionFile:      storeLocation,
+		SessionStore:     storeKind,
+		StoreLocation:    storeLocation,
 		ServerSideLogout: false,
 		ReloginRequired:  true,
 		StreamsStopped:   stopped,
-		Detail: "the stored Tuya session file was removed from this host; Tuya has no server-side logout, " +
+		Detail: "the stored Tuya session was removed from this host; Tuya has no server-side logout, " +
 			"so the cookies remain valid at the cloud until they expire",
 	})
 }

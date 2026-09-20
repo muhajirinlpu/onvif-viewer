@@ -59,6 +59,10 @@ type Session struct {
 	CookieNames []string `json:"cookieNames"`
 	CookieCount int      `json:"cookieCount"`
 	SavedAt     string   `json:"savedTo"`
+	// StoreKind names the store the session was persisted into (file|sqlite),
+	// so the response says WHERE the credential went rather than implying a
+	// file that no longer exists.
+	StoreKind string `json:"storeKind,omitempty"`
 }
 
 // LoginClient is the slice of *tuyaqr.Client the QR handshake needs. Declaring
@@ -75,15 +79,28 @@ type LoginClient interface {
 // so the state cannot live in a handler closure. It lives here, keyed by token,
 // and expires on its own: a token nobody scans must not leak a map entry.
 type LoginManager struct {
-	host        string
-	sessionFile string
-	save        func(path string, s *tuyaqr.Session) error
-	newClient   func() LoginClient
-	onSession   func(*tuyaqr.Session)
-	now         func() time.Time
+	host         string
+	sessionFile  string
+	store        tuyaqr.SessionStore
+	save         func(path string, s *tuyaqr.Session) error
+	saveInjected bool
+	newClient    func() LoginClient
+	onSession    func(*tuyaqr.Session)
+	now          func() time.Time
 
 	mu      sync.Mutex
 	pending map[string]*pendingLogin
+	// lastSaved is the secret-free description of the last session persisted by
+	// this manager, so the poll response can say WHERE it went.
+	lastSaved StoredSessionRef
+}
+
+// StoredSessionRef is the secret-free description of a persisted session: the
+// store kind, its location and the account label. No credential material.
+type StoredSessionRef struct {
+	Kind     string `json:"kind"`
+	Location string `json:"location"`
+	Account  string `json:"account,omitempty"`
 }
 
 type pendingLogin struct {
@@ -95,9 +112,23 @@ type pendingLogin struct {
 type LoginOption func(*LoginManager)
 
 // WithLoginSessionFile is where a completed scan is persisted. Empty disables
-// persistence (useful for tests).
+// persistence (useful for tests). When no store is attached it also builds the
+// file store this path names, so the pre-milestone behaviour is byte for byte
+// what it was.
 func WithLoginSessionFile(path string) LoginOption {
-	return func(m *LoginManager) { m.sessionFile = path }
+	return func(m *LoginManager) {
+		m.sessionFile = path
+		if m.store == nil && strings.TrimSpace(path) != "" {
+			m.store = tuyaqr.NewFileSessionStore(path)
+		}
+	}
+}
+
+// WithLoginStore is where a completed scan is persisted. It replaces the file
+// store, so the QR flow writes straight into the project database and the
+// login path never needs a file at all.
+func WithLoginStore(store tuyaqr.SessionStore) LoginOption {
+	return func(m *LoginManager) { m.store = store }
 }
 
 // WithLoginHost overrides the Tuya region host.
@@ -117,9 +148,14 @@ func WithLoginClientFactory(fn func() LoginClient) LoginOption {
 	return func(m *LoginManager) { m.newClient = fn }
 }
 
-// WithLoginSaver replaces the persistence function (tests).
+// WithLoginSaver replaces the persistence function (tests). Injecting one makes
+// it authoritative: the store is then used only for listing and deletion, so a
+// test can observe exactly what was persisted without a filesystem or database.
 func WithLoginSaver(fn func(path string, s *tuyaqr.Session) error) LoginOption {
-	return func(m *LoginManager) { m.save = fn }
+	return func(m *LoginManager) {
+		m.save = fn
+		m.saveInjected = true
+	}
 }
 
 // WithLoginClock replaces the clock (tests).
@@ -219,10 +255,25 @@ func (m *LoginManager) Poll(ctx context.Context, token string) (*PollResult, err
 	// The scan succeeded. Persist the session BEFORE anything else can consume
 	// it, then drop the handshake: a token is single-use.
 	var saveErr error
-	if m.sessionFile != "" {
+	var ref StoredSessionRef
+	switch {
+	case m.saveInjected && strings.TrimSpace(m.sessionFile) != "":
+		// A test injected the persistence function: it is authoritative, and the
+		// store is only consulted for listing and deletion.
 		saveErr = m.save(m.sessionFile, session)
+		ref = StoredSessionRef{Kind: tuyaqr.StoreKindFile, Location: m.sessionFile, Account: session.Account().String()}
+	case m.store != nil:
+		// The store is authoritative. With the database store this writes
+		// straight into onvif_logs.db and no session FILE exists at all.
+		saveErr = m.store.Save(session)
+		ref = StoredSessionRef{Kind: m.store.Kind(), Location: m.store.Location(), Account: session.Account().String()}
+	case strings.TrimSpace(m.sessionFile) != "":
+		// Legacy path: a manager built with an explicit path but no store.
+		saveErr = m.save(m.sessionFile, session)
+		ref = StoredSessionRef{Kind: tuyaqr.StoreKindFile, Location: m.sessionFile, Account: session.Account().String()}
 	}
 	m.mu.Lock()
+	m.lastSaved = ref
 	delete(m.pending, token)
 	m.mu.Unlock()
 
@@ -239,7 +290,8 @@ func (m *LoginManager) Poll(ctx context.Context, token string) (*PollResult, err
 	if saveErr != nil {
 		return nil, fmt.Errorf("provider: tuya session could not be saved: %w", saveErr)
 	}
-	summary.SavedAt = m.sessionFile
+	summary.SavedAt = ref.Location
+	summary.StoreKind = ref.Kind
 	return &PollResult{Status: StatusDone, Session: summary}, nil
 }
 
@@ -247,40 +299,105 @@ func (m *LoginManager) Poll(ctx context.Context, token string) (*PollResult, err
 //
 // HONEST NOTE: the Tuya protect cloud exposes NO server-side logout endpoint for
 // these cookies — there is no call that invalidates a fast-sid/s-sid pair. So
-// this is LOCAL credential removal and nothing else: the file is gone from this
-// host, but the cookies themselves would still be accepted by the cloud until
-// they expire. That is why the UI words it as "sign out on this device" rather
-// than pretending the session was revoked server-side.
+// this is LOCAL credential removal and nothing else: the credential is gone from
+// this host, but the cookies themselves would still be accepted by the cloud
+// until they expire. That is why the UI words it as "sign out on this device"
+// rather than pretending the session was revoked server-side.
 //
-// The file is removed with os.Remove, not emptied, so no truncated credential
-// can be left behind. An already-absent file is not an error: the caller asked
-// for "no session", and that is the state.
+// The removal goes through the store, so a database-backed install deletes the
+// ROW (and secure_delete zeroes the blob) while a file-backed install removes
+// the file. An already-absent session is not an error: the caller asked for "no
+// session", and that is the state.
 func (m *LoginManager) Logout() (removed bool, err error) {
 	m.mu.Lock()
 	// In-flight handshakes belong to the old account; drop them so a scan
 	// started before the logout cannot resurrect it.
-	cleared := len(m.pending)
 	m.pending = map[string]*pendingLogin{}
+	m.lastSaved = StoredSessionRef{}
+	store := m.store
+	filePath := m.sessionFile
 	m.mu.Unlock()
-	_ = cleared
 
-	if strings.TrimSpace(m.sessionFile) == "" {
+	if store == nil && strings.TrimSpace(filePath) == "" {
 		return false, nil
 	}
-	if _, statErr := os.Stat(m.sessionFile); statErr != nil {
-		if os.IsNotExist(statErr) {
-			return false, nil
+	if store == nil {
+		// Legacy path with no store attached: behave exactly as before.
+		if _, statErr := os.Stat(filePath); statErr != nil {
+			if os.IsNotExist(statErr) {
+				return false, nil
+			}
+			return false, statErr
 		}
-		return false, statErr
+		if err := os.Remove(filePath); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
-	if err := os.Remove(m.sessionFile); err != nil {
-		return false, err
+
+	// Every account the store holds must go: the user asked for no session on
+	// this device, and for a single-account install that is exactly one row.
+	stored, listErr := store.Accounts()
+	if listErr != nil {
+		return false, listErr
 	}
-	return true, nil
+	existed := false
+	for _, s := range stored {
+		acct := s.Account
+		if acct.IsZero() {
+			continue
+		}
+		existed = true
+		if err := store.Delete(acct); err != nil {
+			return false, err
+		}
+	}
+	// A file-backed store whose file did not parse still needs the removal.
+	if !existed {
+		if fs, ok := store.(*tuyaqr.FileSessionStore); ok {
+			path := fs.Path(tuyaqr.Account{})
+			if _, statErr := os.Stat(path); statErr == nil {
+				if err := fs.Delete(tuyaqr.Account{}); err != nil {
+					return false, err
+				}
+				existed = true
+			}
+		}
+	}
+	return existed, nil
 }
 
 // SessionFilePath reports where a captured session is persisted (diagnostics).
-func (m *LoginManager) SessionFilePath() string { return m.sessionFile }
+// With a database store this is the database path, never a credential.
+func (m *LoginManager) SessionFilePath() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.store != nil {
+		return m.store.Location()
+	}
+	return m.sessionFile
+}
+
+// StoreKind names the store a captured session is written to (diagnostics).
+func (m *LoginManager) StoreKind() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.store != nil {
+		return m.store.Kind()
+	}
+	if strings.TrimSpace(m.sessionFile) != "" {
+		return tuyaqr.StoreKindFile
+	}
+	return ""
+}
+
+// LastSaved describes the last session this manager persisted, in secret-free
+// terms.
+func (m *LoginManager) LastSaved() StoredSessionRef {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastSaved
+}
 
 // Pending reports how many handshakes are alive (diagnostics only).
 func (m *LoginManager) Pending() int {

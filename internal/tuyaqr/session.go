@@ -296,6 +296,43 @@ func (s *Session) httpCookies() []*http.Cookie {
 	return out
 }
 
+// validate reports why a session cannot be used. It is the single place a
+// session's usability is decided, so the file store and the database store
+// cannot drift apart and start accepting different credentials.
+func (s *Session) validate() error {
+	if s == nil {
+		return errors.New("tuyaqr: nil session")
+	}
+	if s.SessionData.LoginResult == nil {
+		return fmt.Errorf("%w: session has no loginResult", ErrNoSession)
+	}
+	if _, err := s.CookieJar(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// sessionJSON marshals a session to its canonical on-disk/on-row encoding. The
+// shape is byte-compatible with the session files written by tuya-ipc-terminal,
+// so a session can move between the two stores losslessly.
+func sessionJSON(s *Session) ([]byte, error) {
+	return json.MarshalIndent(s, "", "  ")
+}
+
+// sessionFromJSON parses and validates a stored session. It is used by both
+// stores so a credential that came out of the database is validated exactly as
+// strictly as one that came out of a file.
+func sessionFromJSON(raw []byte) (*Session, error) {
+	var s Session
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return nil, fmt.Errorf("invalid session JSON: %w", err)
+	}
+	if err := s.validate(); err != nil {
+		return nil, err
+	}
+	return &s, nil
+}
+
 // LoadSession reads and validates a session file. The file is opened
 // read-only and never modified.
 func LoadSession(path string) (*Session, error) {
@@ -303,26 +340,17 @@ func LoadSession(path string) (*Session, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrNoSession, err)
 	}
-	var s Session
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return nil, fmt.Errorf("%w: invalid session JSON: %v", ErrNoSession, err)
+	s, err := sessionFromJSON(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrNoSession, err)
 	}
-	if s.SessionData.LoginResult == nil {
-		return nil, fmt.Errorf("%w: session has no loginResult", ErrNoSession)
-	}
-	if _, err := s.CookieJar(); err != nil {
-		return nil, err
-	}
-	return &s, nil
+	return s, nil
 }
 
 // SaveSession writes s to path atomically, mode 0600, inside a 0700 directory.
 // It refuses to write a session that cannot be used (missing fast-sid/s-sid).
 func SaveSession(path string, s *Session) error {
-	if s == nil {
-		return errors.New("tuyaqr: nil session")
-	}
-	if _, err := s.CookieJar(); err != nil {
+	if err := s.validate(); err != nil {
 		return err
 	}
 	dir := filepath.Dir(path)
@@ -332,7 +360,7 @@ func SaveSession(path string, s *Session) error {
 	// Tighten a pre-existing, more permissive directory.
 	_ = os.Chmod(dir, 0o700)
 
-	data, err := json.MarshalIndent(s, "", "  ")
+	data, err := sessionJSON(s)
 	if err != nil {
 		return err
 	}
