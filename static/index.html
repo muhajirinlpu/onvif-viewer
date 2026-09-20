@@ -52,6 +52,30 @@
     .panel-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:18px 20px; border-bottom:1px solid rgba(148,163,184,.18); }
     .panel-title { display:flex; align-items:center; gap:10px; min-width:0; }
     .stream-card { border:1px solid rgba(148,163,184,.22); border-radius:14px; padding:16px; background:rgba(148,163,184,.045); }
+    /* One grid for both providers: ONVIF and Tuya cards render from the same
+       template, so they must also share the same track sizing. */
+    .stream-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:16px; align-items:start; }
+    .stream-grid > .stream-card { margin-top:0!important; }
+    .provider-badge { display:inline-flex; align-items:center; gap:5px; padding:2px 8px; border-radius:999px; font-size:.68rem; font-weight:600; letter-spacing:.04em; text-transform:uppercase; border:1px solid transparent; }
+    .provider-badge-onvif { background:rgba(59,130,246,.14); color:#2563eb; border-color:rgba(59,130,246,.3); }
+    .dark .provider-badge-onvif { color:#93c5fd; }
+    .provider-badge-tuya { background:rgba(234,88,12,.14); color:#c2410c; border-color:rgba(234,88,12,.32); }
+    .dark .provider-badge-tuya { color:#fdba74; }
+    .provider-chooser { display:flex; flex-direction:column; gap:10px; }
+    .provider-chooser-options { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    .provider-option { min-height:44px; display:flex; align-items:center; justify-content:center; border-radius:12px; border:1px solid rgba(148,163,184,.4); background:rgba(148,163,184,.08); color:inherit; font-weight:600; cursor:pointer; transition:all .15s ease; }
+    .provider-option:hover { border-color:rgba(94,106,210,.6); }
+    .provider-option-active { background:var(--accent); border-color:var(--accent); color:#fff; box-shadow:0 6px 18px rgba(94,106,210,.28); }
+    .provider-chooser-hint { font-size:.8rem; color:#64748b; margin:0; }
+    .dark .provider-chooser-hint { color:#94a3b8; }
+    .tuya-qr-frame { display:flex; flex-direction:column; align-items:center; gap:12px; padding:16px; border-radius:14px; border:1px dashed rgba(148,163,184,.5); background:rgba(148,163,184,.06); }
+    .tuya-qr-frame img { width:220px; height:220px; image-rendering:pixelated; background:#fff; border-radius:10px; }
+    .tuya-countdown { font-variant-numeric:tabular-nums; font-weight:700; }
+    .tuya-expired { color:#dc2626; }
+    .device-pick { display:flex; flex-direction:column; gap:8px; max-height:260px; overflow-y:auto; }
+    .device-pick-item { display:flex; align-items:center; justify-content:space-between; gap:12px; width:100%; min-height:44px; text-align:left; padding:10px 12px; border-radius:12px; border:1px solid rgba(148,163,184,.35); background:rgba(148,163,184,.06); color:inherit; cursor:pointer; }
+    .device-pick-item:hover { border-color:rgba(94,106,210,.6); }
+    .device-pick-item:disabled { opacity:.55; cursor:not-allowed; }
     .stream-card-header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
     .stream-identity { min-width:0; }
     .stream-identity h3 { overflow-wrap:anywhere; }
@@ -89,6 +113,9 @@
       .panel-heading { padding:15px; }
       .panel-body { padding:15px!important; }
       .stream-card { padding:14px; }
+      .stream-grid { grid-template-columns:1fr; gap:12px; }
+      .provider-chooser-options { grid-template-columns:1fr; }
+      .tuya-qr-frame img { width:180px; height:180px; }
       .stream-card-header { flex-direction:column; align-items:stretch; }
       .stream-actions { justify-content:stretch; }
       .stream-actions>button { flex:1; }
@@ -207,6 +234,35 @@
 
             <!-- Config Form -->
             <div class="modal-body space-y-6">
+              <!-- Provider Chooser: adding a camera starts here -->
+              <div class="provider-chooser">
+                <h3 class="text-sm font-medium text-slate-500 dark:text-slate-400">PROVIDER</h3>
+                <div class="provider-chooser-options" role="group" aria-label="Camera provider">
+                  <button type="button" class="provider-option"
+                    :class="{ 'provider-option-active': providerChoice === 'onvif' }"
+                    :aria-pressed="providerChoice === 'onvif'"
+                    @click="selectProvider('onvif')">
+                    <i class="fas fa-network-wired mr-2"></i>ONVIF
+                  </button>
+                  <button type="button" class="provider-option"
+                    :class="{ 'provider-option-active': providerChoice === 'tuya' }"
+                    :aria-pressed="providerChoice === 'tuya'"
+                    :disabled="!availableProviders.includes('tuya')"
+                    :title="availableProviders.includes('tuya') ? 'Tuya / Smart Life camera' : 'This server has no Tuya session configured'"
+                    @click="selectProvider('tuya')">
+                    <i class="fas fa-cloud mr-2"></i>Tuya
+                  </button>
+                </div>
+                <p class="provider-chooser-hint" v-if="providerChoice === 'onvif'">
+                  An ONVIF camera reached directly over the LAN.
+                </p>
+                <p class="provider-chooser-hint" v-else>
+                  A Tuya / Smart Life camera, reached through the Tuya cloud after signing in with a QR code.
+                </p>
+              </div>
+
+              <!-- ONVIF Panel: the original form, untouched -->
+              <template v-if="providerChoice === 'onvif'">
               <!-- Connection Settings -->
               <div>
                 <h3 class="text-sm font-medium mb-4 text-slate-500 dark:text-slate-400">CONNECTION</h3>
@@ -292,6 +348,97 @@
                   Execute Function
                 </button>
               </div>
+              </template>
+
+              <!-- Tuya Panel: QR sign-in -> device list -> pick -->
+              <template v-if="providerChoice === 'tuya'">
+                <!-- Step: sign in -->
+                <div v-if="!tuyaSession.valid" class="space-y-4">
+                  <div>
+                    <h3 class="text-sm font-medium mb-4 text-slate-500 dark:text-slate-400">SIGN IN WITH THE TUYA APP</h3>
+                    <p class="text-sm text-slate-600 dark:text-slate-300">
+                      Open the Tuya / Smart Life app, tap the <strong>+</strong> button and choose
+                      <strong>Scan QR code</strong>.
+                      <span v-if="!tuyaQrExpired">The code below is valid for the next few minutes.</span>
+                    </p>
+                  </div>
+
+                  <div class="tuya-qr-frame" v-if="tuyaQr">
+                    <img :src="tuyaQr" alt="Tuya login QR code" width="220" height="220">
+                    <p class="text-sm" :class="{ 'tuya-expired': tuyaQrExpired }">
+                      <i class="fas fa-clock mr-1"></i>
+                      <span class="tuya-countdown">{{ tuyaCountdownLabel }}</span>
+                    </p>
+                  </div>
+                  <div class="tuya-qr-frame" v-else>
+                    <i class="fas fa-qrcode text-4xl text-slate-400"></i>
+                    <p class="text-sm text-slate-500 dark:text-slate-400">
+                      {{ tuyaLoginBusy ? 'Requesting a QR code...' : 'No QR code yet.' }}
+                    </p>
+                  </div>
+
+                  <!-- The main UX failure mode is a silently stale QR, so an
+                       expired token always surfaces an explicit refresh action. -->
+                  <div v-if="tuyaQrExpired"
+                    class="p-4 rounded-lg bg-amber-100 dark:bg-amber-500/20 text-amber-800 dark:text-amber-300">
+                    <div class="flex items-start">
+                      <i class="fas fa-triangle-exclamation mr-2 mt-0.5"></i>
+                      <span class="text-sm">This QR code has expired and can no longer be scanned. Request a fresh one.</span>
+                    </div>
+                  </div>
+
+                  <div class="flex gap-2">
+                    <button type="button" class="provider-option flex-1" @click="beginTuyaLogin" :disabled="tuyaLoginBusy">
+                      <i class="fas fa-sync mr-2"></i>
+                      {{ tuyaQr ? 'Refresh QR code' : 'Get QR code' }}
+                    </button>
+                  </div>
+
+                  <div v-if="tuyaLoginMessage"
+                    class="p-4 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
+                    <span class="text-sm">{{ tuyaLoginMessage }}</span>
+                  </div>
+                </div>
+
+                <!-- Step: signed in, pick a camera -->
+                <div v-else class="space-y-4">
+                  <div>
+                    <h3 class="text-sm font-medium mb-4 text-slate-500 dark:text-slate-400">TUYA CAMERAS</h3>
+                    <p class="text-sm text-slate-600 dark:text-slate-300">
+                      Signed in as {{ tuyaSession.email || 'the stored account' }} on {{ tuyaSession.region || 'the Tuya cloud' }}.
+                      <span v-if="tuyaSession.detail"> {{ tuyaSession.detail }}</span>
+                    </p>
+                  </div>
+
+                  <div v-if="tuyaCamerasLoading" class="text-sm text-slate-500 dark:text-slate-400">
+                    <i class="fas fa-spinner fa-spin mr-2"></i>Loading cameras...
+                  </div>
+
+                  <div v-else-if="tuyaCameras.length" class="device-pick">
+                    <button type="button" class="device-pick-item" v-for="camera in tuyaCameras" :key="camera.id"
+                      @click="startTuyaCamera(camera)" :disabled="tuyaStarting">
+                      <span class="min-w-0">
+                        <span class="block font-semibold truncate">{{ camera.name || camera.id }}</span>
+                        <span class="block text-xs text-slate-500 dark:text-slate-400 truncate">{{ camera.detail }}</span>
+                      </span>
+                      <span class="provider-badge" :class="camera.online ? 'provider-badge-tuya' : 'provider-badge-onvif'">
+                        {{ camera.online ? 'Online' : 'Offline' }}
+                      </span>
+                    </button>
+                  </div>
+
+                  <div v-else class="p-4 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
+                    <span class="text-sm">No Tuya cameras were found on this account.</span>
+                  </div>
+
+                  <button type="button" class="provider-option w-full" @click="refreshTuyaCameras" :disabled="tuyaCamerasLoading">
+                    <i class="fas fa-rotate mr-2"></i>Reload camera list
+                  </button>
+                  <button type="button" class="provider-option w-full" @click="signOutTuya">
+                    <i class="fas fa-right-from-bracket mr-2"></i>Use a different Tuya account
+                  </button>
+                </div>
+              </template>
 
               <!-- Error Display -->
               <div v-if="error" class="p-4 rounded-lg bg-red-100 dark:bg-red-500/20 text-red-600 dark:text-red-400">
@@ -303,11 +450,16 @@
             </div>
             <div class="modal-footer">
               <button type="button" @click="toggleConfigPanel" class="bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-5 py-3 rounded-lg font-medium">Cancel</button>
-              <button type="button" @click="fetchStreamUri" :disabled="isProcessing"
+              <!-- ONVIF only: the Tuya panel starts its stream by picking a device. -->
+              <button type="button" v-if="providerChoice === 'onvif'" @click="fetchStreamUri" :disabled="isProcessing"
                 class="bg-indigo-600 text-white hover:bg-indigo-500 px-5 py-3 rounded-lg font-medium flex items-center justify-center disabled:opacity-50 disabled:cursor-not-allowed">
                 <span v-if="isProcessing" class="animate-spin inline-block w-5 h-5 border-2 border-white/30 border-t-white rounded-full mr-2"></span>
                 <i v-else class="fas fa-play mr-2"></i>
                 <span>{{ isProcessing ? 'Connecting...' : 'Start Stream' }}</span>
+              </button>
+              <button type="button" v-else @click="toggleConfigPanel"
+                class="bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 px-5 py-3 rounded-lg font-medium flex items-center justify-center">
+                Done
               </button>
             </div>
           </div>
@@ -329,14 +481,25 @@
             </span>
           </div>
 
-          <div v-if="streams.length" class="panel-body p-5 space-y-4">
+          <div v-if="streams.length" class="panel-body p-5">
+            <!-- ONE grid for every provider. ONVIF and Tuya cameras render from
+                 this same collapsible square card template. -->
+            <div class="stream-grid">
             <div v-for="stream in streams" :key="stream.id"
               class="stream-card">
               <div class="stream-card-header">
                 <div class="stream-identity">
-                  <div class="flex items-center gap-2 mb-1">
+                  <div class="flex items-center gap-2 mb-1 flex-wrap">
                     <span class="w-2 h-2 rounded-full" :class="stream.status === 'running' ? 'bg-emerald-500 animate-pulse' : stream.status === 'failed' || stream.status === 'stalled' ? 'bg-red-500' : 'bg-amber-500 animate-pulse'"></span>
                     <span class="text-xs uppercase tracking-wide" :class="stream.status === 'running' ? 'text-emerald-600 dark:text-emerald-400' : stream.status === 'failed' || stream.status === 'stalled' ? 'text-red-600 dark:text-red-400' : 'text-amber-600 dark:text-amber-400'">{{ stream.status }}</span>
+                    <!-- Provider badge: the grid mixes providers, so each card
+                         must say which one it came from. -->
+                    <span class="provider-badge"
+                      :class="streamProvider(stream) === 'tuya' ? 'provider-badge-tuya' : 'provider-badge-onvif'"
+                      :title="streamProvider(stream) === 'tuya' ? 'Tuya / Smart Life camera' : 'ONVIF camera'">
+                      <i :class="streamProvider(stream) === 'tuya' ? 'fas fa-cloud' : 'fas fa-network-wired'"></i>
+                      {{ streamProvider(stream) === 'tuya' ? 'Tuya' : 'ONVIF' }}
+                    </span>
                   </div>
                   <h3 class="font-semibold">{{ stream.id }}</h3>
                   <p class="text-sm text-slate-500 dark:text-slate-400">
@@ -369,7 +532,11 @@
                     <i :class="stream.showVideo ? 'fas fa-eye-slash' : 'fas fa-eye'" class="mr-2"></i>
                     {{ stream.showVideo ? 'Hide' : 'View' }}
                   </button>
-                  <button type="button" @click="synchronizeStream(stream)" :disabled="stream.actionPending"
+                  <!-- Sync is an ONVIF-only SOAP call: a Tuya stream has no SOAP
+                       endpoint, so the button is not rendered at all rather
+                       than shown dead. -->
+                  <button type="button" v-if="streamProvider(stream) === 'onvif'"
+                    @click="synchronizeStream(stream)" :disabled="stream.actionPending"
                     class="bg-violet-600 hover:bg-violet-500 text-white px-4 py-2 rounded-lg disabled:opacity-50">
                     <i class="fas fa-bolt mr-2"></i>Sync
                   </button>
@@ -402,6 +569,7 @@
                   </button>
                 </div>
               </div>
+            </div>
             </div>
           </div>
 
@@ -528,7 +696,7 @@
     </div>
   </footer>
   <script type="module">
-    import { createApp, ref, onMounted, nextTick, watch } from 'vue';
+    import { createApp, ref, computed, onMounted, nextTick, watch } from 'vue';
 
     createApp({
       setup() {
@@ -560,6 +728,255 @@
         let eventSource = null;
         let modalTrigger = null;
         let modalKeydownHandler = null;
+        let tuyaPollTimer = null;
+        let tuyaCountdownTimer = null;
+
+        // --- Provider selection (the add-camera modal starts here) ------------
+        // 'onvif' is the default, which keeps the old flow byte-identical for
+        // anyone who never touches the chooser.
+        const providerChoice = ref('onvif');
+        const availableProviders = ref(['onvif']);
+
+        // --- Tuya QR login state ---
+        const tuyaQr = ref('');
+        const tuyaToken = ref('');
+        const tuyaQrExpiresAt = ref(0);   // epoch ms
+        const tuyaQrRemaining = ref(0);   // seconds
+        const tuyaQrTtl = ref(0);         // seconds
+        const tuyaQrExpired = ref(false);
+        const tuyaLoginBusy = ref(false);
+        const tuyaLoginMessage = ref('');
+        const tuyaSession = ref({ valid: false });
+        const tuyaCameras = ref([]);
+        const tuyaCamerasLoading = ref(false);
+        const tuyaStarting = ref(false);
+
+        // streamProvider normalises a stream's provider for the UI. A row that
+        // predates the provider column, or one that arrives through the SSE
+        // state channel without it, is ONVIF.
+        const streamProvider = (stream) => (stream && stream.provider === 'tuya' ? 'tuya' : 'onvif');
+
+        // A computed ref, not a plain function: a bare function interpolated as
+        // {{ tuyaCountdownLabel }} would render the function's source text.
+        const tuyaCountdownLabel = computed(() => {
+          if (tuyaQrExpired.value) return 'QR code expired';
+          const remaining = tuyaQrRemaining.value;
+          if (remaining <= 0 && !tuyaToken.value) return 'not started';
+          const minutes = Math.floor(remaining / 60);
+          const seconds = remaining % 60;
+          return `${minutes}:${String(seconds).padStart(2, '0')} remaining`;
+        });
+
+        const stopTuyaTimers = () => {
+          if (tuyaPollTimer) { clearInterval(tuyaPollTimer); tuyaPollTimer = null; }
+          if (tuyaCountdownTimer) { clearInterval(tuyaCountdownTimer); tuyaCountdownTimer = null; }
+        };
+
+        const resetTuyaLogin = () => {
+          stopTuyaTimers();
+          tuyaQr.value = '';
+          tuyaToken.value = '';
+          tuyaQrRemaining.value = 0;
+          tuyaQrTtl.value = 0;
+          tuyaQrExpiresAt.value = 0;
+          tuyaQrExpired.value = false;
+          tuyaLoginMessage.value = '';
+        };
+
+        const selectProvider = (choice) => {
+          providerChoice.value = choice;
+          error.value = '';
+          if (choice === 'tuya') {
+            loadTuyaSession();
+          }
+        };
+
+        // --- Tuya session -----------------------------------------------------
+        const loadTuyaSession = async () => {
+          try {
+            const resp = await fetch('/api/tuya/session');
+            if (!resp.ok) {
+              tuyaSession.value = { valid: false };
+              return;
+            }
+            tuyaSession.value = await resp.json();
+            if (tuyaSession.value.valid) {
+              stopTuyaTimers();
+              await refreshTuyaCameras();
+            } else {
+              tuyaLoginMessage.value = tuyaSession.value.detail
+                || 'Scan the QR code with the Tuya / Smart Life app to sign in.';
+            }
+          } catch (err) {
+            console.error('Failed to read the Tuya session:', err);
+          }
+        };
+
+        const refreshTuyaCameras = async () => {
+          tuyaCamerasLoading.value = true;
+          try {
+            const resp = await fetch('/api/providers/cameras?provider=tuya');
+            const data = await resp.json();
+            if (resp.status === 401) {
+              // The stored session died: the user must scan a new QR.
+              tuyaSession.value = { valid: false };
+              resetTuyaLogin();
+              tuyaLoginMessage.value = data.detail || 'The saved Tuya session is no longer valid. Scan a new QR code.';
+              tuyaCameras.value = [];
+              return;
+            }
+            if (!resp.ok) {
+              throw new Error(data.detail || 'Failed to load Tuya cameras');
+            }
+            tuyaCameras.value = data.cameras || [];
+          } catch (err) {
+            error.value = err.message;
+            tuyaCameras.value = [];
+          } finally {
+            tuyaCamerasLoading.value = false;
+          }
+        };
+
+        // --- QR handshake -----------------------------------------------------
+        const beginTuyaLogin = async () => {
+          resetTuyaLogin();
+          tuyaLoginBusy.value = true;
+          try {
+            const resp = await fetch('/api/tuya/login/begin', { method: 'POST' });
+            const data = await resp.json();
+            if (!resp.ok) {
+              throw new Error(data.detail || 'Could not start the Tuya QR login');
+            }
+            tuyaQr.value = data.qrPng;
+            tuyaToken.value = data.token;
+            tuyaQrTtl.value = data.ttlSeconds || 0;
+            tuyaQrExpiresAt.value = Date.now() + ((data.remainingSeconds || 0) * 1000);
+            tuyaQrRemaining.value = data.remainingSeconds || 0;
+            tuyaQrExpired.value = tuyaQrRemaining.value <= 0;
+            startTuyaTimers();
+          } catch (err) {
+            error.value = err.message;
+          } finally {
+            tuyaLoginBusy.value = false;
+          }
+        };
+
+        // startTuyaTimers drives BOTH the visible countdown and the poll loop.
+        // The countdown is client-side so it ticks every second even if a poll
+        // is slow, and it reaches zero BEFORE the cloud rejects the token.
+        const startTuyaTimers = () => {
+          stopTuyaTimers();
+          tuyaCountdownTimer = setInterval(() => {
+            const seconds = Math.max(0, Math.round((tuyaQrExpiresAt.value - Date.now()) / 1000));
+            tuyaQrRemaining.value = seconds;
+            if (seconds === 0 && tuyaToken.value) {
+              growTuyaExpired();
+            }
+          }, 1000);
+          tuyaPollTimer = setInterval(pollTuyaLogin, 2000);
+        };
+
+        const growTuyaExpired = () => {
+          if (tuyaQrExpired.value) return;
+          tuyaQrExpired.value = true;
+          tuyaToken.value = '';
+          tuyaLoginMessage.value = 'The QR code expired. Request a fresh one to continue.';
+          if (tuyaPollTimer) { clearInterval(tuyaPollTimer); tuyaPollTimer = null; }
+        };
+
+        const pollTuyaLogin = async () => {
+          if (!tuyaToken.value) return;
+          try {
+            const resp = await fetch(`/api/tuya/login/poll?token=${encodeURIComponent(tuyaToken.value)}`);
+            // 410 means the token is gone (expired or the server restarted).
+            if (resp.status === 410) {
+              tuyaQrExpired.value = true;
+              tuyaToken.value = '';
+              tuyaLoginMessage.value = 'This QR code is no longer valid. Request a fresh one.';
+              stopTuyaTimers();
+              return;
+            }
+            if (!resp.ok) return; // transient: let the next tick retry
+            const data = await resp.json();
+            if (data.status === 'expired') {
+              tuyaQrExpired.value = true;
+              tuyaToken.value = '';
+              tuyaLoginMessage.value = 'The QR code expired. Request a fresh one to continue.';
+              stopTuyaTimers();
+              return;
+            }
+            if (data.status === 'done') {
+              stopTuyaTimers();
+              tuyaToken.value = '';
+              tuyaQrExpired.value = false;
+              tuyaLoginMessage.value = 'Signed in. Loading your Tuya cameras...';
+              tuyaSession.value = { valid: true, ...(data.session || {}) };
+              await refreshTuyaCameras();
+              if (!tuyaCameras.value.length) {
+                tuyaLoginMessage.value = 'Signed in, but this account has no Tuya cameras.';
+              }
+            }
+          } catch (err) {
+            console.error('Tuya QR poll failed:', err);
+          }
+        };
+
+        const signOutTuya = () => {
+          // Local-only: the stored session file is owned by the server and is
+          // never deleted from the browser.
+          resetTuyaLogin();
+          tuyaSession.value = { valid: false };
+          tuyaCameras.value = [];
+          tuyaLoginMessage.value = 'Scan a QR code to sign in to a Tuya account.';
+        };
+
+        // loadAvailableProviders asks the server which providers it has. A
+        // failure leaves the ONVIF-only default in place rather than offering a
+        // provider the process cannot serve.
+        const loadAvailableProviders = async () => {
+          try {
+            const resp = await fetch('/api/providers/cameras');
+            if (!resp.ok) return;
+            const data = await resp.json();
+            if (Array.isArray(data.providers) && data.providers.length) {
+              availableProviders.value = data.providers;
+            }
+          } catch (err) {
+            console.error('Failed to read the provider list:', err);
+          }
+        };
+
+        // --- Starting a Tuya stream ------------------------------------------
+        const startTuyaCamera = async (camera) => {
+          if (tuyaStarting.value) return;
+          tuyaStarting.value = true;
+          error.value = '';
+          try {
+            const resp = await fetch('/api/stream/start', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ provider: 'tuya', deviceId: camera.id }),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+              throw new Error(data.detail || 'Failed to start the Tuya stream');
+            }
+            await loadStreams();
+
+            // Reveal the new card and start HLS on it, exactly like the ONVIF
+            // path does.
+            const started = streams.value.find(s => s.id === data.id) || streams.value[streams.value.length - 1];
+            if (started) {
+              started.showVideo = true;
+              initializeVideoPlayer(started);
+            }
+            closeConfigPanel();
+          } catch (err) {
+            error.value = err.message;
+          } finally {
+            tuyaStarting.value = false;
+          }
+        };
 
         // Enhanced theme functions
         const setTheme = (mode) => {
@@ -729,6 +1146,9 @@
         onMounted(async () => {
           initializeTheme();
           loadStreams();
+          // Discover which providers the server actually has configured, so the
+          // Tuya option is not offered by an ONVIF-only install.
+          loadAvailableProviders();
 
           const savedSettings = JSON.parse(localStorage.getItem('cameraSettings') || '{}');
           cameraIp.value = savedSettings.cameraIp || '';
@@ -966,6 +1386,10 @@
 
               return {
                 ...stream,
+                // The server reports the provider; keep the old value as a
+                // fallback so an SSE state frame without it cannot blank the
+                // badge.
+                provider: stream.provider || existingStream?.provider || 'onvif',
                 ...(existingStream?.lastStateEventAt ? {
                   status: existingStream.status,
                   detail: existingStream.detail,
@@ -1053,10 +1477,14 @@
 
               if (logEntry.type === 'state' && logEntry.state) {
                 const index = streams.value.findIndex(stream => stream.id === logEntry.streamId);
+                const stateWithProvider = {
+                  ...logEntry.state,
+                  provider: logEntry.state.provider || 'onvif',
+                };
                 if (index >= 0) {
-                  streams.value[index] = { ...streams.value[index], ...logEntry.state, lastStateEventAt: logEntry.time };
+                  streams.value[index] = { ...streams.value[index], ...stateWithProvider, lastStateEventAt: logEntry.time };
                 } else if (logEntry.state.status !== 'stopped') {
-                  streams.value.push({ ...logEntry.state, lastStateEventAt: logEntry.time });
+                  streams.value.push({ ...stateWithProvider, lastStateEventAt: logEntry.time });
                 }
                 if (logEntry.state.status === 'stopped') {
                   streams.value = streams.value.filter(stream => stream.id !== logEntry.streamId);
@@ -1134,6 +1562,26 @@
           logsCollapsed,
           toggleLogsPanel,
           logsContainer,
+          // Multi-provider additions
+          providerChoice,
+          availableProviders,
+          selectProvider,
+          streamProvider,
+          tuyaQr,
+          tuyaQrExpired,
+          tuyaQrRemaining,
+          tuyaQrTtl,
+          tuyaLoginBusy,
+          tuyaLoginMessage,
+          tuyaSession,
+          tuyaCameras,
+          tuyaCamerasLoading,
+          tuyaStarting,
+          tuyaCountdownLabel,
+          beginTuyaLogin,
+          refreshTuyaCameras,
+          signOutTuya,
+          startTuyaCamera,
         };
       },
     }).mount('#app');

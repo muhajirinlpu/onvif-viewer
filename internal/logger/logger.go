@@ -37,7 +37,12 @@ type StreamLog struct {
 type StreamConfig struct {
 	ProfileToken string
 	RTSPURL      string
+	Provider     string
 }
+
+// defaultProvider is the provider value applied to legacy rows and used when a
+// caller does not name one.
+const defaultProvider = "onvif"
 
 // Logger handles database logging
 type Logger struct {
@@ -100,13 +105,52 @@ func newLogger(dbPath string, maxRows, pruneInterval int) (*Logger, error) {
 		db.Close()
 		return nil, fmt.Errorf("failed to create log time index: %w", err)
 	}
+	// Additive, idempotent provider column. Safe in all three deployment cases:
+	// a fresh database (the column is added right after CREATE TABLE), an
+	// existing populated database (ALTER TABLE ADD COLUMN with a constant
+	// default backfills every row in place), and a repeat run (the PRAGMA
+	// check finds the column and skips the DDL entirely).
+	if err := ensureProviderColumn(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Logger{db: db, maxRows: maxRows, pruneInterval: pruneInterval}, nil
 }
 
-// UpsertStreamConfig persists only a profile token and RTSP URL.
-func (l *Logger) UpsertStreamConfig(profileToken, rtspURL string) error {
-	_, err := l.db.Exec(`INSERT INTO stream_configs(profile_token, rtsp_url, updated_at) VALUES(?,?,?)
-		ON CONFLICT(profile_token) DO UPDATE SET rtsp_url=excluded.rtsp_url, updated_at=excluded.updated_at`, profileToken, rtspURL, time.Now())
+// ensureProviderColumn adds stream_configs.provider when it is missing.
+//
+// It is deliberately written as "inspect then alter" rather than
+// "ALTER TABLE ... " with an error swallow, because a swallowed error would
+// also hide a genuinely broken database. The default is a constant, which
+// SQLite applies to existing rows without a table rewrite, so a populated
+// production onvif_logs.db is upgraded in place.
+func ensureProviderColumn(db *sql.DB) error {
+	var present bool
+	if err := db.QueryRow(
+		`SELECT COUNT(*) > 0 FROM pragma_table_info('stream_configs') WHERE name = 'provider'`,
+	).Scan(&present); err != nil {
+		return fmt.Errorf("failed to inspect stream_configs schema: %w", err)
+	}
+	if present {
+		return nil
+	}
+	if _, err := db.Exec(
+		`ALTER TABLE stream_configs ADD COLUMN provider TEXT NOT NULL DEFAULT '` + defaultProvider + `'`,
+	); err != nil {
+		return fmt.Errorf("failed to add stream_configs.provider: %w", err)
+	}
+	return nil
+}
+
+// UpsertStreamConfig persists a profile token, its RTSP URL and the provider it
+// belongs to. The provider is normalised to "onvif" when empty, so existing
+// call sites keep working unchanged and never write a blank provider.
+func (l *Logger) UpsertStreamConfig(profileToken, rtspURL, provider string) error {
+	if provider == "" {
+		provider = defaultProvider
+	}
+	_, err := l.db.Exec(`INSERT INTO stream_configs(profile_token, rtsp_url, provider, updated_at) VALUES(?,?,?,?)
+		ON CONFLICT(profile_token) DO UPDATE SET rtsp_url=excluded.rtsp_url, provider=excluded.provider, updated_at=excluded.updated_at`, profileToken, rtspURL, provider, time.Now())
 	return err
 }
 
@@ -116,7 +160,10 @@ func (l *Logger) DeleteStreamConfig(profileToken string) error {
 }
 
 func (l *Logger) ListStreamConfigs() ([]StreamConfig, error) {
-	rows, err := l.db.Query(`SELECT profile_token, rtsp_url FROM stream_configs ORDER BY profile_token`)
+	// COALESCE + NULLIF keeps a row that somehow holds NULL or an empty
+	// provider from surfacing as "unknown": such rows are ONVIF by definition,
+	// because ONVIF was the only provider when they were written.
+	rows, err := l.db.Query(`SELECT profile_token, rtsp_url, COALESCE(NULLIF(provider, ''), '` + defaultProvider + `') FROM stream_configs ORDER BY profile_token`)
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +171,7 @@ func (l *Logger) ListStreamConfigs() ([]StreamConfig, error) {
 	var result []StreamConfig
 	for rows.Next() {
 		var config StreamConfig
-		if err := rows.Scan(&config.ProfileToken, &config.RTSPURL); err != nil {
+		if err := rows.Scan(&config.ProfileToken, &config.RTSPURL, &config.Provider); err != nil {
 			return nil, err
 		}
 		result = append(result, config)

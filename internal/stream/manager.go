@@ -93,12 +93,24 @@ func newStreamID() string {
 	return fmt.Sprintf("stream_%d", time.Now().UnixNano())
 }
 
-// StartStream starts a new FFmpeg stream process
+// StartStream starts a new FFmpeg stream process. The provider defaults to
+// ONVIF, which is what every ONVIF call site has always meant.
 func (sm *Manager) StartStream(profileToken, rtspURL string) (*models.StreamInfo, error) {
-	return sm.startStream(profileToken, rtspURL, true)
+	return sm.startStreamWithProvider(profileToken, rtspURL, models.ProviderONVIF, true)
+}
+
+// StartStreamForProvider starts (and persists) a stream tagged with the provider
+// that owns it, so a Tuya stream is restored as Tuya across restarts.
+func (sm *Manager) StartStreamForProvider(profileToken, rtspURL string, provider models.ProviderKind) (*models.StreamInfo, error) {
+	return sm.startStreamWithProvider(profileToken, rtspURL, provider, true)
 }
 
 func (sm *Manager) startStream(profileToken, rtspURL string, persist bool) (*models.StreamInfo, error) {
+	return sm.startStreamWithProvider(profileToken, rtspURL, models.ProviderONVIF, persist)
+}
+
+func (sm *Manager) startStreamWithProvider(profileToken, rtspURL string, provider models.ProviderKind, persist bool) (*models.StreamInfo, error) {
+	provider = provider.OrDefault()
 	if profileToken == "" || rtspURL == "" {
 		return nil, fmt.Errorf("profile token and RTSP URL are required")
 	}
@@ -129,7 +141,7 @@ func (sm *Manager) startStream(profileToken, rtspURL string, persist bool) (*mod
 		return nil, fmt.Errorf("failed to create HLS directory: %v", err)
 	}
 	if persist {
-		if err := sm.logger.UpsertStreamConfig(profileToken, rtspURL); err != nil {
+		if err := sm.logger.UpsertStreamConfig(profileToken, rtspURL, string(provider)); err != nil {
 			_ = os.RemoveAll(hlsDir)
 			return nil, fmt.Errorf("persist stream configuration: %w", err)
 		}
@@ -139,6 +151,7 @@ func (sm *Manager) startStream(profileToken, rtspURL string, persist bool) (*mod
 		Info: models.StreamInfo{
 			ID:           streamID,
 			ProfileToken: profileToken,
+			Provider:     provider,
 			RtspURL:      rtspURL,
 			HlsURL:       fmt.Sprintf("/hls/%s/stream.m3u8", streamID),
 			StartedAt:    time.Now(),
@@ -172,7 +185,8 @@ func (sm *Manager) RestoreStreams() {
 			return
 		}
 		for _, config := range configs {
-			if _, err := sm.startStream(config.ProfileToken, config.RTSPURL, false); err != nil {
+			provider := models.ProviderKind(config.Provider).OrDefault()
+			if _, err := sm.startStreamWithProvider(config.ProfileToken, config.RTSPURL, provider, false); err != nil {
 				sm.logger.LogError("", "restore", fmt.Sprintf("Failed to restore profile %s: %v", config.ProfileToken, err))
 			}
 		}

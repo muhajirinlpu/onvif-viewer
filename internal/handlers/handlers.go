@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"dengan.dev/camera-streamer/internal/logger"
 	"dengan.dev/camera-streamer/internal/models"
 	"dengan.dev/camera-streamer/internal/onvif"
+	"dengan.dev/camera-streamer/internal/provider"
 	"dengan.dev/camera-streamer/internal/stream"
 )
 
@@ -18,6 +20,15 @@ type Handler struct {
 	streamManager *stream.Manager
 	onvifClient   *onvif.Client
 	logger        *logger.Logger
+
+	// Provider seam. Optional: nil means "ONVIF only", which is exactly the
+	// pre-milestone behaviour. Wire them with SetProviders.
+	providers    *provider.Set
+	logins       *provider.LoginManager
+	tuyaProvider *provider.Tuya
+	// onTuyaSession is invoked when a new Tuya session has been captured, so
+	// the discovery provider drops any cached session without a restart.
+	onTuyaSession func()
 }
 
 // New creates a new Handler instance
@@ -29,16 +40,35 @@ func New(streamManager *stream.Manager, onvifClient *onvif.Client, logger *logge
 	}
 }
 
-// StartStream handles stream start requests
+// StartStream handles stream start requests.
+//
+// The ONVIF contract is unchanged: {profileToken, rtspUrl} starts the URL
+// directly, exactly as before. The two additive fields are OPTIONAL and only
+// used for the Tuya path:
+//
+//	{"provider":"tuya","deviceId":"eb9f1d6e677b1b39f222ag"}
+//
+// A Tuya request carries no rtspUrl on purpose: the RTSP endpoint is allocated
+// by the in-process engine and must not be spoofed by the browser.
 func (h *Handler) StartStream(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ProfileToken string `json:"profileToken"`
 		RtspURL      string `json:"rtspUrl"`
+		Provider     string `json:"provider"`
+		DeviceID     string `json:"deviceId"`
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		h.logger.LogError("", "http", fmt.Sprintf("Failed to decode start stream request: %v", err))
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Tuya path: only taken when the caller actually says provider=tuya (or
+	// names a deviceId without an rtspUrl), so ONVIF requests cannot regress.
+	if models.ProviderKind(req.Provider).OrDefault() == models.ProviderTuya || (req.DeviceID != "" && req.RtspURL == "") {
+		h.startTuyaStream(w, req.DeviceID)
 		return
 	}
 
@@ -54,6 +84,32 @@ func (h *Handler) StartStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(streamInfo); err != nil {
 		h.logger.LogError(streamInfo.ID, "http", fmt.Sprintf("Failed to encode response: %v", err))
+	}
+}
+
+// startTuyaStream routes a Tuya device through the in-process bridge. The
+// response body is the same models.StreamInfo shape the ONVIF path returns, with
+// provider="tuya".
+func (h *Handler) startTuyaStream(w http.ResponseWriter, deviceID string) {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "deviceId is required for provider=tuya"})
+		return
+	}
+	if h.tuyaProvider == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "Tuya streaming is not configured in this process"})
+		return
+	}
+	info, err := h.tuyaProvider.StartStream(deviceID)
+	if err != nil {
+		h.logger.LogError("", "tuya", fmt.Sprintf("Failed to start Tuya stream: %v", err))
+		writeJSON(w, http.StatusBadGateway, map[string]any{"detail": "could not start the Tuya stream"})
+		return
+	}
+	h.logger.LogInfo(info.ID, "tuya", "Tuya stream started through the shared HLS pipeline")
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(info); err != nil {
+		h.logger.LogError(info.ID, "http", fmt.Sprintf("Failed to encode response: %v", err))
 	}
 }
 

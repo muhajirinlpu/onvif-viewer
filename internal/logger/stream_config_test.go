@@ -11,7 +11,7 @@ func TestStreamConfigurationsRoundTripAndDelete(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer l.Close()
-	if err := l.UpsertStreamConfig("profile-a", "rtsp://user:pass@camera/live"); err != nil {
+	if err := l.UpsertStreamConfig("profile-a", "rtsp://user:pass@camera/live", "onvif"); err != nil {
 		t.Fatal(err)
 	}
 	configs, err := l.ListStreamConfigs()
@@ -20,6 +20,9 @@ func TestStreamConfigurationsRoundTripAndDelete(t *testing.T) {
 	}
 	if len(configs) != 1 || configs[0].ProfileToken != "profile-a" || configs[0].RTSPURL != "rtsp://user:pass@camera/live" {
 		t.Fatalf("unexpected configs: %#v", configs)
+	}
+	if configs[0].Provider != "onvif" {
+		t.Fatalf("provider not persisted: %#v", configs[0])
 	}
 	if err := l.DeleteStreamConfig("profile-a"); err != nil {
 		t.Fatal(err)
