@@ -36,7 +36,7 @@
     button:focus-visible,input:focus-visible,select:focus-visible { outline:2px solid #7170ff; outline-offset:2px; }
     .app-shell { min-height:100dvh; background:radial-gradient(circle at 10% 0%,rgba(94,106,210,.12),transparent 30%),#f8fafc; padding:16px; }
     .dark .app-shell { background:radial-gradient(circle at 10% 0%,rgba(94,106,210,.16),transparent 30%),#08090a; }
-    .page-container { width:min(100%,1280px); margin-inline:auto; }
+    .page-container { width:min(100%,1440px); margin-inline:auto; }
     .topbar { display:flex; align-items:center; justify-content:space-between; gap:20px; padding:16px 18px; border:1px solid rgba(148,163,184,.25); border-radius:16px; background:rgba(255,255,255,.88); backdrop-filter:blur(18px); box-shadow:0 10px 35px rgba(15,23,42,.07); }
     .dark .topbar { background:rgba(15,16,17,.88); border-color:rgba(255,255,255,.08); box-shadow:0 10px 35px rgba(0,0,0,.28); }
     .brand-block { display:flex; align-items:center; gap:12px; min-width:0; }
@@ -51,7 +51,16 @@
     .dark .panel { background:rgba(15,16,17,.92); border-color:rgba(255,255,255,.08); box-shadow:0 8px 30px rgba(0,0,0,.25); }
     .panel-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:18px 20px; border-bottom:1px solid rgba(148,163,184,.18); }
     .panel-title { display:flex; align-items:center; gap:10px; min-width:0; }
-    .stream-card { position:relative; display:flex; flex-direction:column; border:1px solid rgba(148,163,184,.22); border-radius:14px; padding:16px; background:rgba(148,163,184,.045); }
+    .stream-card { position:relative; display:flex; flex-direction:column; overflow:hidden; border:1px solid rgba(148,163,184,.22); border-radius:14px; padding:16px; background:rgba(148,163,184,.045); }
+    /* M12: UNIFORM CARD HEIGHTS IN A ROW.
+       The measured defect was 551px next to 591px inside ONE row: the cards were
+       `align-items:start`, so each tile ended wherever its own optional lines
+       happened to end. The grid now STRETCHES its items and every card is a
+       full-height flex column whose last block is pushed to the bottom, so a row
+       of cameras is a row of equal rectangles and the wall reads as a grid
+       rather than a ragged stack. */
+    .stream-grid { align-items:stretch; }
+    .stream-card > .stream-controls { margin-top:auto; }
     /* One grid for both providers: ONVIF and Tuya cards render from the same
        template, so they must also share the same track sizing. */
     /* M10: the track count per breakpoint is now EXPLICIT. `auto-fill` over a
@@ -67,6 +76,11 @@
     .stream-grid { display:grid; grid-template-columns:1fr; gap:16px; align-items:start; }
     @media (min-width: 768px) { .stream-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
     @media (min-width: 1920px) { .stream-grid { grid-template-columns:repeat(3,minmax(0,1fr)); } }
+    /* M12: this re-states `align-items` on the SAME element the M10 rule above
+       sizes, and it comes AFTER it so it wins: grid items now STRETCH to their
+       row, which is what makes every card in a row the same height (MEASURED
+       before: 551px next to 591px in one row). */
+    .stream-grid { align-items:stretch; }
     .stream-grid > .stream-card { margin-top:0!important; }
     /* M10: the S/M/L control no longer caps a video height - it decides how
        many grid tracks this card claims, so one camera can be featured without
@@ -101,8 +115,22 @@
     .device-pick-item:hover { border-color:rgba(94,106,210,.6); }
     .device-pick-item:disabled { opacity:.55; cursor:not-allowed; }
     .stream-card-header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
-    .stream-identity { min-width:0; }
+    .stream-identity { min-width:0; flex:1 1 auto; }
     .stream-identity h3 { overflow-wrap:anywhere; }
+    /* M12: THE CARD TITLE NAMES THE CAMERA.
+       `stream.cameraLabel` comes from the server's non-secret StreamLabel: the
+       Tuya device name ("Security Camera") or the ONVIF host ("10.2.56.194"),
+       never an internal id and never an RTSP URL. One line, ellipsised rather
+       than wrapped, so cards in a row keep the same title height and the grid
+       rhythm stays uniform; the full id stays readable in the collapsed
+       controls, and the full name is in the title attribute. */
+    .stream-card-title { min-width:0; margin-bottom:10px; }
+    .stream-camera-name { margin:0; font-weight:600; font-size:.95rem; line-height:1.25; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    /* M12: the card's metadata lives INSIDE the collapsed panel, so it must not
+       be a flex row like the controls around it - it is prose stacked on its own
+       lines, above the buttons, and takes the full panel width. */
+    .stream-metadata { display:block; flex:1 1 100%; width:100%; padding-bottom:8px; margin-bottom:4px; border-bottom:1px dashed rgba(148,163,184,.35); }
+    .stream-metadata p { margin:0; }
     /* M10: the status indicator line. The compact Hide/Show control lives here,
        next to the dot, the status word and the provider badge. */
     .stream-status-line { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:4px; }
@@ -140,6 +168,10 @@
        per-size max-height caps that used to live here are gone - they are what
        made a large tile show a small picture. */
     .video-container { position:relative; display:flex; align-items:center; justify-content:center; width:100%; margin-top:16px; overflow:hidden; border-radius:12px; background:#000; aspect-ratio:16 / 9; }
+    /* M12: the video is now the element directly under the camera name, so it
+       must not carry a spacer above it - the picture starts at the top of the
+       card body instead of being pushed down by a margin. */
+    .stream-card-title + .video-container { margin-top:0; }
     .video-container video { width:100%; height:100%; object-fit:contain; background:#000; }
     .video-container.is-fullscreen { position:fixed; inset:0; width:100vw; height:100vh; aspect-ratio:auto; max-height:none; margin-top:0; border-radius:0; z-index:9999; }
     /* M10: the fullscreen control. `group` on the card (plus these rules) is what
@@ -176,6 +208,8 @@
       .page-container { width:min(100%,1560px); }
       .dashboard-grid { grid-template-columns:minmax(0,1fr) 360px; }
     }
+    @media (min-width: 1920px) { .page-container { width:min(100%,1980px); } }
+    @media (min-width: 2200px) { .page-container { width:min(100%,2440px); } }
     @media (max-width: 1023px) {
       .dashboard-grid { grid-template-columns:1fr; }
       .diagnostics-column { order:2; }
@@ -201,7 +235,14 @@
       .stream-grid { grid-template-columns:1fr; gap:12px; }
       /* The phone order is VIDEO FIRST, CONTROLS LAST. The identity/status block
          sits between them so the status word and the Hide/Show control stay
-         visible without pushing the picture off the screen. */
+         visible without pushing the picture off the screen.
+         M12: the card's TITLE is ordered BEFORE all three of these because it
+         carries no `order` at all, and the flex `order` property defaults to 0 -
+         lower than the 1/2/3 pinned here. So the phone order is
+         title -> video -> status/identity -> controls, the card still leads with
+         its picture on a phone, and the identity/status block does not have to
+         change to achieve it. The measured assertion is the video's own offset
+         against the status line and controls: see ui_structure_m12_test.go. */
       .video-container { order:1; margin-top:12px; }
       .stream-card-header { order:2; margin-top:12px; flex-direction:column; align-items:stretch; }
       .stream-controls { order:3; }
@@ -708,11 +749,55 @@
               class="stream-card"
               :class="'group'"
               :data-size="stream.videoSize || 'small'">
+              <!-- M12: THE CARD LEADS WITH ITS CAMERA.
+                   The title NAMES THE CAMERA - the Tuya device name ("Security
+                   Camera") or the ONVIF host ("10.2.56.194") - taken from the
+                   server's non-secret `streamLabel`. It used to be
+                   `stream.id` ("stream_1789961119825723855"), which tells you
+                   nothing when several cameras are on screen. The internal id
+                   is not deleted: it is demoted into the collapsed Controls
+                   panel below. -->
+              <div class="stream-card-title">
+                <h3 class="stream-camera-name" :title="streamLabelTitle(stream)">{{ streamLabel(stream) }}</h3>
+              </div>
+
+              <!-- M10: container-driven video. No per-size max-height cap, so the
+                   picture fills the grid track the card occupies.
+                   M12: it is now the FIRST substantial element on the card -
+                   directly under the camera name and ABOVE the status line and
+                   the controls - so a wall of cards is a wall of pictures. -->
+              <div v-if="stream.showVideo"
+                :class="['video-container', stream.isFullscreen ? 'is-fullscreen' : '']">
+                <video :id="'video-' + stream.id" controls class="w-full h-full"></video>
+                <div
+                  class="video-overlay-controls group-hover:opacity-100">
+                  <!-- [html-validate-disable-next text-content -- Vue supplies the accessible name dynamically] -->
+                  <button type="button"
+                    class="bg-black/70 text-white border-none rounded-lg p-2 cursor-pointer hover:bg-black/90 hover:scale-110 transition-all"
+                    @click="toggleFullscreen(stream)" :title="stream.isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'" :aria-label="stream.isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'">
+                    <i :class="stream.isFullscreen ? 'fas fa-compress' : 'fas fa-expand'"></i>
+                  </button>
+                </div>
+              </div>
+
+              <!-- M12: the always-visible strip. ONE line: status word, the
+                   resolution the server reports, the provider badge and the
+                   compact Hide/Show control. Everything else that used to push
+                   the video down (start time, detail, reconnect count, last
+                   segment, the M7 resolution/cost lines and the HD warning) is
+                   now inside the collapsed Controls panel. -->
               <div class="stream-card-header">
                 <div class="stream-identity">
                   <div class="stream-status-line">
                     <span class="w-2 h-2 rounded-full" :class="stream.status === 'running' ? 'bg-emerald-500 animate-pulse' : stream.status === 'failed' || stream.status === 'stalled' ? 'bg-red-500' : 'bg-amber-500 animate-pulse'"></span>
                     <span class="text-xs uppercase tracking-wide" :class="stream.status === 'running' ? 'text-emerald-600 dark:text-emerald-400' : stream.status === 'failed' || stream.status === 'stalled' ? 'text-red-600 dark:text-red-400' : 'text-amber-600 dark:text-amber-400'">{{ stream.status }}</span>
+                    <!-- The one-line summary's second half: what the camera is
+                         actually running at, from the server's own state. -->
+                    <span v-if="stream.resolution" class="stream-status-resolution text-xs text-slate-500 dark:text-slate-400"
+                      :class="streamResolutionIsHD(stream) ? 'text-amber-700 dark:text-amber-400' : 'text-slate-500 dark:text-slate-400'"
+                      :title="streamResolutionIsHD(stream) ? 'Software transcode to 720p: heavy CPU use on this 4-core host' : 'Streamed as-is; no transcode CPU'">
+                      {{ String(stream.resolution).toUpperCase() }}
+                    </span>
                     <!-- Provider badge: the grid mixes providers, so each card
                          must say which one it came from. -->
                     <span class="provider-badge"
@@ -733,30 +818,13 @@
                       <i :class="stream.showVideo ? 'fas fa-eye-slash' : 'fas fa-eye'" aria-hidden="true"></i>
                     </button>
                   </div>
-                  <h3 class="font-semibold">{{ stream.id }}</h3>
-                  <p class="text-sm text-slate-500 dark:text-slate-400">
-                    Started: {{ new Date(stream.startedAt).toLocaleString() }}
-                  </p>
-                  <p v-if="stream.detail" class="text-sm mt-1 text-slate-600 dark:text-slate-300">{{ stream.detail }}</p>
-                  <p v-if="stream.reconnectCount" class="text-xs mt-1 text-amber-600 dark:text-amber-400">Reconnect attempt {{ stream.reconnectCount }}<span v-if="stream.reconnectDelay"> · retry in {{ stream.reconnectDelay }}</span></p>
-                  <p v-if="stream.lastHlsAdvance" class="text-xs mt-1 text-slate-500 dark:text-slate-400">Last video segment: {{ new Date(stream.lastHlsAdvance).toLocaleString() }}</p>
-                  <!-- M7: which resolution is LIVE on this stream, and whether
-                       it is costing CPU. Read from the server's own state, not
-                       from the last thing the user clicked. -->
-                  <p v-if="streamProvider(stream) === 'tuya'" class="stream-resolution text-xs mt-1"
-                    :class="streamResolutionIsHD(stream) ? 'text-amber-700 dark:text-amber-400' : 'text-slate-500 dark:text-slate-400'">
-                    <span class="stream-resolution-value">{{ streamResolutionLabel(stream) }}</span>
-                    <span v-if="streamResolutionIsHD(stream)" class="stream-resolution-cost">
-                      &middot; <i class="fas fa-microchip mr-1"></i>software transcode to 1280x720{{ stream.transcoding ? '' : ' (not transcoding)' }}
-                    </span>
-                    <span v-else-if="stream.resolution">&middot; copied, no transcode CPU</span>
-                  </p>
-                  <p v-if="streamResolutionIsHD(stream)" class="stream-resolution-warning text-xs mt-1 text-amber-700 dark:text-amber-400">
-                    <i class="fas fa-triangle-exclamation mr-1"></i>HD uses a large share of this 4-core host's CPU and can affect other streams.
-                  </p>
                   <!-- M6: a stream whose Tuya session died says so on the card
                        and offers the one action that fixes it. It is NOT a
-                       silently broken video element. -->
+                       silently broken video element.
+                       M12: this is an ACTION, not metadata, so it stays
+                       ALWAYS VISIBLE and OUTSIDE the collapsed panel - a
+                       camera whose session died must never look like a card
+                       with no video and no reason. -->
                   <div v-if="stream.suspended || stream.status === 'needs_relogin'"
                     class="tuya-card-relogin mt-2 p-3 rounded-lg bg-amber-100 dark:bg-amber-500/20 text-amber-800 dark:text-amber-300">
                     <div class="flex items-start">
@@ -775,22 +843,6 @@
                 </div>
               </div>
 
-              <!-- M10: container-driven video. No per-size max-height cap, so the
-                   picture fills the grid track the card occupies. -->
-              <div v-if="stream.showVideo"
-                :class="['video-container', stream.isFullscreen ? 'is-fullscreen' : '']">
-                <video :id="'video-' + stream.id" controls class="w-full h-full"></video>
-                <div
-                  class="video-overlay-controls group-hover:opacity-100">
-                  <!-- [html-validate-disable-next text-content -- Vue supplies the accessible name dynamically] -->
-                  <button type="button"
-                    class="bg-black/70 text-white border-none rounded-lg p-2 cursor-pointer hover:bg-black/90 hover:scale-110 transition-all"
-                    @click="toggleFullscreen(stream)" :title="stream.isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'" :aria-label="stream.isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'">
-                    <i :class="stream.isFullscreen ? 'fas fa-compress' : 'fas fa-expand'"></i>
-                  </button>
-                </div>
-              </div>
-
               <!-- M10: ONE disclosure owns every control on the card except the
                    compact Hide/Show in the status line above. Collapsed by
                    default; nothing was removed, only folded away. -->
@@ -805,6 +857,39 @@
                   <i class="fas fa-chevron-down stream-actions-chevron" :class="{ 'is-open': streamActionsOpen(stream) }" aria-hidden="true"></i>
                 </button>
                 <div v-show="streamActionsOpen(stream)" :id="'stream-actions-' + stream.id" class="stream-actions">
+                  <!-- M12: THE CARD'S METADATA, folded away instead of pushing
+                       the video down. This is the block that used to render
+                       above the picture: the internal stream id (demoted here
+                       from the card title), when the stream started, the
+                       server's detail sentence, the reconnect count and the
+                       last segment time, plus the M7 resolution/cost lines and
+                       the HD CPU warning. Nothing was deleted - a glance at the
+                       one-line status strip still says status + resolution. -->
+                  <div class="stream-metadata">
+                    <p class="stream-metadata-id text-xs text-slate-500 dark:text-slate-400">
+                      Stream id: <span class="stream-metadata-id-value">{{ stream.id }}</span>
+                    </p>
+                    <p class="text-sm text-slate-500 dark:text-slate-400">
+                      Started: {{ new Date(stream.startedAt).toLocaleString() }}
+                    </p>
+                    <p v-if="stream.detail" class="text-sm mt-1 text-slate-600 dark:text-slate-300">{{ stream.detail }}</p>
+                    <p v-if="stream.reconnectCount" class="text-xs mt-1 text-amber-600 dark:text-amber-400">Reconnect attempt {{ stream.reconnectCount }}<span v-if="stream.reconnectDelay"> · retry in {{ stream.reconnectDelay }}</span></p>
+                    <p v-if="stream.lastHlsAdvance" class="text-xs mt-1 text-slate-500 dark:text-slate-400">Last video segment: {{ new Date(stream.lastHlsAdvance).toLocaleString() }}</p>
+                    <!-- M7: which resolution is LIVE on this stream, and whether
+                         it is costing CPU. Read from the server's own state, not
+                         from the last thing the user clicked. -->
+                    <p v-if="streamProvider(stream) === 'tuya'" class="stream-resolution text-xs mt-1"
+                      :class="streamResolutionIsHD(stream) ? 'text-amber-700 dark:text-amber-400' : 'text-slate-500 dark:text-slate-400'">
+                      <span class="stream-resolution-value">{{ streamResolutionLabel(stream) }}</span>
+                      <span v-if="streamResolutionIsHD(stream)" class="stream-resolution-cost">
+                        &middot; <i class="fas fa-microchip mr-1"></i>software transcode to 1280x720{{ stream.transcoding ? '' : ' (not transcoding)' }}
+                      </span>
+                      <span v-else-if="stream.resolution">&middot; copied, no transcode CPU</span>
+                    </p>
+                    <p v-if="streamResolutionIsHD(stream)" class="stream-resolution-warning text-xs mt-1 text-amber-700 dark:text-amber-400">
+                      <i class="fas fa-triangle-exclamation mr-1"></i>HD uses a large share of this 4-core host's CPU and can affect other streams.
+                    </p>
+                  </div>
                   <!-- Video Size Selector: which grid tracks this card claims. -->
                   <div v-if="stream.showVideo"
                     class="size-selector flex gap-1 bg-slate-100 dark:bg-slate-800 rounded-lg p-1 border border-slate-200 dark:border-slate-700">
@@ -1036,6 +1121,33 @@
         // predates the provider column, or one that arrives through the SSE
         // state channel without it, is ONVIF.
         const streamProvider = (stream) => (stream && stream.provider === 'tuya' ? 'tuya' : 'onvif');
+
+        // --- M12: the card titles itself with its CAMERA ----------------------
+        // `stream.streamLabel` is the SERVER's non-secret display label: the
+        // Tuya device name ("Security Camera") or the ONVIF host
+        // ("10.2.56.194"). The browser cannot derive it - the only
+        // address-bearing field, RtspUrl, is deliberately `json:"-"` because an
+        // RTSP URL can carry credentials - so the server sends the host alone as
+        // its own field, with any userinfo stripped before it is set.
+        //
+        // The fallback is a SHORT id, not the full internal id: if the server
+        // could not name the camera the card must still say something compact
+        // and distinguishable ("…394513021"), never
+        // "stream_1789961119825723855" again.
+        const shortStreamId = (id) => {
+          const value = String(id ?? '');
+          return value.length <= 8 ? value : '…' + value.slice(-8);
+        };
+        const streamLabel = (stream) => {
+          const label = stream && typeof stream.streamLabel === 'string' ? stream.streamLabel.trim() : '';
+          return label || shortStreamId(stream && stream.id);
+        };
+
+        // The title attribute is the FULL label plus the internal id, so a
+        // truncated name and the id are both recoverable on hover without
+        // widening the card.
+        const streamLabelTitle = (stream) =>
+          `${streamLabel(stream)} · ${stream && stream.id ? stream.id : ''}`;
 
         // --- M7: per-camera resolution ---------------------------------------
         // HD re-encodes 2560x1440 HEVC to H.264 1280x720 in SOFTWARE on this
@@ -1840,6 +1952,11 @@
                 // fallback so an SSE state frame without it cannot blank the
                 // badge.
                 provider: stream.provider || existingStream?.provider || 'onvif',
+                // M12: the camera label is server state, so it is carried
+                // forward when an SSE frame arrives without it (the same
+                // treatment the provider badge gets). It is what the card
+                // titles itself with.
+                streamLabel: stream.streamLabel || existingStream?.streamLabel || '',
                 ...(existingStream?.lastStateEventAt ? {
                   status: existingStream.status,
                   detail: existingStream.detail,
@@ -2024,6 +2141,9 @@
           availableProviders,
           selectProvider,
           streamProvider,
+          // M12: the card's camera title
+          streamLabel,
+          streamLabelTitle,
           // M7: per-camera resolution
           hdCostNote,
           resolutionNotice,

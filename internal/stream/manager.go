@@ -148,8 +148,13 @@ const defaultStreamResolution = "sd"
 
 // Process represents a single FFmpeg stream process
 type Process struct {
-	Info            models.StreamInfo
-	Command         *exec.Cmd
+	Info    models.StreamInfo
+	Command *exec.Cmd
+	// HLSURL is the playlist URL THIS process serves. It is a field rather than
+	// only Info.HlsURL because Info is handed to callers (and to tests) as a
+	// value, and an embedder that builds a stream's URL itself would otherwise
+	// have to guess the id.
+	HLSURL          string
 	Done            chan bool
 	Exited          chan struct{}
 	closed          sync.Once
@@ -190,6 +195,15 @@ type Manager struct {
 	// so a restored Tuya stream would retry a dead address forever. Nil means
 	// "this manager has no Tuya engine", and Tuya URLs then behave as opaque.
 	tuyaRTSPURL func(profileToken string) (string, error)
+	// pendingLabels holds the DISPLAY-ONLY camera label a provider registered
+	// for a profile token whose stream is about to be created by an internal
+	// start path (the Tuya engine hand-back). It is consumed at stream creation
+	// and never read afterwards. See SetPendingStreamLabel.
+	pendingLabels map[string]string
+	// streamLabelResolver names a camera whose stream is being created without
+	// the provider having registered a label (a restored stream). See
+	// SetStreamLabelResolver.
+	streamLabelResolver func(profileToken, rtspURL string) string
 }
 
 // NewManager creates a new stream manager
@@ -197,6 +211,7 @@ func NewManager(hlsBaseDir string, logger *logger.Logger) *Manager {
 	return &Manager{
 		streams:       make(map[string]*Process),
 		sseClients:    make(map[string]*models.ClientConnection),
+		pendingLabels: make(map[string]string),
 		clientTimeout: 3 * time.Minute,
 		stopCleanup:   make(chan struct{}),
 		hlsBaseDir:    hlsBaseDir,
@@ -247,6 +262,93 @@ func (sm *Manager) StartStream(profileToken, rtspURL string) (*models.StreamInfo
 // that owns it, so a Tuya stream is restored as Tuya across restarts.
 func (sm *Manager) StartStreamForProvider(profileToken, rtspURL string, provider models.ProviderKind) (*models.StreamInfo, error) {
 	return sm.startStreamWithOptions(profileToken, rtspURL, provider, "", true)
+}
+
+// SetPendingStreamLabel records the DISPLAY-ONLY camera label ("Security
+// Camera") for a profile token whose stream is about to be created by an
+// internal start path.
+//
+// WHY IT IS A SEAM RATHER THAN A PARAMETER: the label is known to the Tuya
+// provider (it comes from the cloud device listing) but not to the stream
+// manager, and the manager's start signature is shared with the ONVIF path,
+// which must not change. It is registered immediately before the internal start
+// and consumed (and cleared) by the stream creation.
+//
+// It is deliberately a LABEL and not a name lookup: nothing here may hold a
+// device name after the stream is up, so a stale label cannot leak onto an
+// unrelated stream that later reuses the token.
+func (sm *Manager) SetPendingStreamLabel(profileToken, label string) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+	if sm.pendingLabels == nil {
+		sm.pendingLabels = make(map[string]string)
+	}
+	sm.pendingLabels[profileToken] = strings.TrimSpace(label)
+}
+
+// takePendingStreamLabel consumes the label registered for a profile token.
+// Caller holds sm.mutex.
+func (sm *Manager) takePendingStreamLabel(profileToken string) string {
+	if sm.pendingLabels == nil {
+		return ""
+	}
+	label := sm.pendingLabels[profileToken]
+	delete(sm.pendingLabels, profileToken)
+	return label
+}
+
+// SetStreamLabelResolver installs the callback used to name a CAMERA whose
+// stream is being created without the provider having registered a label
+// first.
+//
+// The case it exists for is the RESTART: a stream restored from a stored row
+// carries a profile token and a URL, not a camera name, so a Tuya card would
+// otherwise come back titled with an internal id even though the process knows
+// perfectly well which camera the token belongs to. The resolver is consulted
+// once per stream creation and must return "" when it cannot name the camera
+// (which then falls back to the per-provider default).
+//
+// The value it returns is passed through models.CameraLabelOrLabel, so a label
+// that is secretly a URL or carries userinfo is reduced to its host rather than
+// published.
+func (sm *Manager) SetStreamLabelResolver(resolve func(profileToken, rtspURL string) string) {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+	sm.streamLabelResolver = resolve
+}
+
+// streamLabelFor chooses the non-secret display label for a new stream.
+// It is the single place a StreamInfo gets its camera label, so both providers
+// are covered by one rule and one test:
+//
+//   - a label registered by the provider (Tuya device name) wins, because it is
+//     a real camera NAME rather than an address;
+//   - then the installed resolver, which is how a RESTORED stream gets its
+//     camera back;
+//   - otherwise an ONVIF stream is labelled with the HOST of its RTSP URL,
+//     stripped of any userinfo by models.CameraLabelFromRTSPURL;
+//   - a Tuya stream is NEVER labelled from its URL, because that URL points at
+//     OUR OWN loopback engine and its host ("127.0.0.1") names nothing about
+//     the camera. It falls back to a short device id instead.
+//
+// An empty result means "the server could not name this camera", and the UI
+// then falls back to a shortened stream id, rather than the server inventing or
+// exposing anything.
+//
+// Caller holds sm.mutex.
+func (sm *Manager) streamLabelFor(profileToken, rtspURL string, provider models.ProviderKind, registeredLabel string) string {
+	if label := strings.TrimSpace(registeredLabel); label != "" {
+		return models.CameraLabelOrLabel(label)
+	}
+	if sm.streamLabelResolver != nil {
+		if label := models.CameraLabelOrLabel(sm.streamLabelResolver(profileToken, rtspURL)); label != "" {
+			return label
+		}
+	}
+	if provider.OrDefault() == models.ProviderTuya {
+		return models.ShortStreamID(strings.TrimPrefix(profileToken, "tuya:"))
+	}
+	return models.CameraLabelFromRTSPURL(rtspURL)
 }
 
 // StartStreamWithResolution starts a stream at an explicit video resolution and
@@ -367,11 +469,16 @@ func (sm *Manager) startStreamWithOptions(profileToken, rtspURL string, provider
 			Resolution:   resolution,
 			Output:       outputPathName(videoOutputPathFor(resolution)),
 			Transcoding:  videoOutputPathFor(resolution) == OutputTranscodeH264,
-			RtspURL:      rtspURL,
-			HlsURL:       fmt.Sprintf("/hls/%s/stream.m3u8", streamID),
-			StartedAt:    time.Now(),
-			Status:       "starting",
+			// The camera-identifying, non-secret display label. Consumed from
+			// the registry here, at the one place a stream is created, so both
+			// providers get it from the same rule.
+			StreamLabel: sm.streamLabelFor(profileToken, rtspURL, provider, sm.takePendingStreamLabel(profileToken)),
+			RtspURL:     rtspURL,
+			HlsURL:      fmt.Sprintf("/hls/%s/stream.m3u8", streamID),
+			StartedAt:   time.Now(),
+			Status:      "starting",
 		},
+		HLSURL:          fmt.Sprintf("/hls/%s/stream.m3u8", streamID),
 		Command:         nil,
 		Done:            make(chan bool),
 		Exited:          make(chan struct{}),
@@ -435,7 +542,15 @@ func (sm *Manager) RestoreStreams() {
 }
 
 func (sm *Manager) stateEntry(info models.StreamInfo, detail string) models.LogEntry {
+	// The full RTSP URL is NEVER part of a broadcast state frame: it can carry
+	// credentials, and this path fans out to every connected browser.
 	info.RtspURL = ""
+	// The camera LABEL, by contrast, is display-only and userinfo-free (see
+	// models.CameraLabelFromRTSPURL), so it is what the card titles itself with.
+	// It is re-derived rather than trusted, so a value that somehow reached
+	// StreamInfo by another route still cannot carry a credential to the
+	// browser.
+	info.StreamLabel = models.CameraLabelOrLabel(info.StreamLabel)
 	info.Detail = redactSensitiveText(detail)
 	return models.LogEntry{Type: "state", StreamID: info.ID, Message: info.Detail, Time: time.Now().Format(time.RFC3339), State: &info}
 }

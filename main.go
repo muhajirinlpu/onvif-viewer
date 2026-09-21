@@ -415,6 +415,10 @@ func main() {
 			provider.WithTuyaBridge(streaming),
 			provider.WithTuyaStreamRegistrar(registrar),
 			provider.WithTuyaStreamStopper(streamManager),
+			// M12: the manager is also the seam that carries the camera NAME
+			// onto the stream it will be rendered as, so a Tuya card titles
+			// itself "Security Camera" rather than "stream_178996...".
+			provider.WithTuyaCameraLabeller(streamManager),
 			provider.WithTuyaHost(tuyaengine.DefaultTuyaHost),
 			provider.WithTuyaLogger(dbLogger),
 			// The per-camera sd|hd choice lives in the same stream_configs rows the
@@ -428,6 +432,23 @@ func main() {
 			provider.WithLoginHost(tuyaengine.DefaultTuyaHost),
 		)
 		log.Printf("Tuya provider enabled (session store=%s, legacy file=%t, streaming=%t)", sessionStore.Kind(), legacySessionFile != "", tuyaBridge != nil)
+
+		// M12: the CAMERA a card belongs to must be readable from the card's
+		// title, and for Tuya the only source of that is the cloud device NAME.
+		// Two seams carry it:
+		//
+		//   - the labeller, used when the stream is CREATED (the provider knows
+		//     the device id and can look the name up);
+		//   - the resolver, used when the stream is RESTORED (a stored row has
+		//     a profile token, not a device id, and restore calls the manager
+		//     before any device can be named).
+		//
+		// Both feed the same non-secret models.StreamInfo.StreamLabel the card
+		// renders, and both are name-only: the Tuya provider never hands a
+		// credential or a URL to the manager here.
+		streamManager.SetStreamLabelResolver(func(profileToken, rtspURL string) string {
+			return tuyaProvider.CameraLabelForProfile(profileToken)
+		})
 	}
 
 	// The session state at boot, said LOUDLY. An install with no stored session
@@ -460,6 +481,13 @@ func main() {
 	// ---------------------------------------------------------------------------
 	if tuyaProvider != nil {
 		storedConfigs, listErr := dbLogger.ListStreamConfigs()
+		// M12: fill the device-name cache BEFORE anything is restored, so a
+		// restored Tuya card comes back titled with its CAMERA rather than with
+		// an internal stream id. It is one listing, it is non-fatal, and its
+		// failure only costs the label.
+		if named := tuyaProvider.PrimeCameraNames(context.Background()); named > 0 {
+			log.Printf("Tuya camera names cached for display: %d camera(s)", named)
+		}
 		if listErr != nil {
 			log.Printf("WARNING: the stored stream configs could not be read (%v), so no Tuya camera can be re-registered with the engine; ONVIF streams are unaffected", listErr)
 			dbLogger.LogWarn("tuya", "startup", fmt.Sprintf("stored stream configs unreadable at start-up: %v", listErr))

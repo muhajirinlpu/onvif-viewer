@@ -60,6 +60,23 @@ type TuyaStreaming interface {
 	Resolve(deviceID string) (string, error)
 }
 
+// TuyaCameraLabeller is the seam used to put the CAMERA'S NAME ("Security
+// Camera") on the stream a card renders.
+//
+// WHY IT IS NEEDED: a Tuya stream's RTSP URL is a loopback address on this
+// process's own engine, so no part of it names the camera; and the browser
+// cannot derive a name from anywhere else either (the only address-bearing
+// field is hidden on purpose). The device name is known HERE, from the cloud
+// device listing, so the provider registers it against the profile token
+// immediately before asking the engine to start the stream. The manager
+// consumes it at stream creation and broadcasts it as the non-secret
+// StreamLabel on every state frame.
+//
+// *stream.Manager satisfies it through SetPendingStreamLabel.
+type TuyaCameraLabeller interface {
+	SetPendingStreamLabel(profileToken, label string)
+}
+
 // TuyaStreamRegistrar is the ENGINE-REGISTRATION half of the bridge, declared
 // separately from TuyaStreaming so the start-up path can only REGISTER a device.
 //
@@ -147,6 +164,15 @@ type Tuya struct {
 	bridge  TuyaStreaming
 	stopper TuyaStreamStopper
 	log     TuyaLogger
+	// labeller hands the camera NAME to the stream manager at start time, so a
+	// card can title itself with the camera instead of an internal stream id.
+	// Optional: without it the label falls back to a short device id.
+	labeller TuyaCameraLabeller
+	// deviceNames caches device id -> cloud device name from the last discovery
+	// listing. It is a NAME cache, never a credential: the map is populated from
+	// tuyaqr.Device.DeviceName only, and it exists so a start does not have to
+	// re-list the account just to title a card.
+	deviceNames map[string]string
 	// registrar is the engine-registration seam used at start-up. It is a
 	// separate (and strictly narrower) capability from bridge: see
 	// TuyaStreamRegistrar.
@@ -220,6 +246,13 @@ func WithTuyaHost(h string) TuyaOption { return func(t *Tuya) { t.host = h } }
 
 // WithTuyaLogger attaches a logger for secret-free discovery diagnostics.
 func WithTuyaLogger(l TuyaLogger) TuyaOption { return func(t *Tuya) { t.log = l } }
+
+// WithTuyaCameraLabeller attaches the seam that carries a camera's NAME to the
+// stream it will appear as. Without it the card falls back to a shortened
+// device id, because a Tuya stream's loopback URL names nothing.
+func WithTuyaCameraLabeller(l TuyaCameraLabeller) TuyaOption {
+	return func(t *Tuya) { t.labeller = l }
+}
 
 // WithTuyaStreamStopper attaches the stream registry the provider uses to stop
 // the streams a dead session can no longer feed. Without it, a session loss is
@@ -423,6 +456,15 @@ func (t *Tuya) StartStreamAt(deviceID string, resolution string) (*models.Stream
 		// Device id and resolution only: no session file contents, no config.
 		t.log.LogInfo("tuya:"+deviceID, "tuya", "starting Tuya stream (resolution="+resolved+")")
 	}
+	// Tell the stream manager which CAMERA is about to appear, so its card can
+	// title itself with the camera rather than with an internal stream id. It
+	// must happen BEFORE the start: the manager consumes the label as it creates
+	// the stream. A camera whose name is not cached yet (no discovery listing in
+	// this process) leaves the manager to fall back to a short device id.
+	label := t.cameraName(deviceID)
+	if t.labeller != nil && label != "" {
+		t.labeller.SetPendingStreamLabel(tuyaengine.ProfileTokenPrefix+deviceID, label)
+	}
 	info, err := t.bridge.StartStream(spec)
 	if err != nil {
 		// The engine refused. Re-check liveness so "the credentials are dead" is
@@ -441,8 +483,75 @@ func (t *Tuya) StartStreamAt(deviceID string, resolution string) (*models.Stream
 		// other StreamStarter implementation passed to the bridge.
 		info.Provider = KindTuya
 		info.Resolution = resolved
+		// ...and the same is true of the display label: the manager consumed it
+		// at creation, and echoing it here means a caller that does NOT go
+		// through the manager (a test double, an embedder) still gets a card
+		// title that names the camera.
+		if label != "" {
+			info.StreamLabel = label
+		}
 	}
 	return info, nil
+}
+
+// cameraName returns the cached cloud device name for a device id, or "" when
+// this process has not listed the account yet.
+//
+// It is a NAME lookup only. Nothing secret is cached: the map is filled from
+// tuyaqr.Device.DeviceName in Cameras(), and the tokens that carry a camera's
+// credentials (DeviceConfig.Auth / LocalKey) are never copied into it.
+func (t *Tuya) cameraName(deviceID string) string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return strings.TrimSpace(t.deviceNames[deviceID])
+}
+
+// CameraLabelForProfile returns the camera NAME behind a Tuya profile token
+// ("tuya:<deviceId>"), or "" when this process has no name for it.
+//
+// It is the RESTORE-time half of the card title: a stream restored from a
+// stored row is created before any device can be named, so the manager asks
+// this instead. It reads the NAME CACHE only - it never calls the cloud - so a
+// restore cannot be held up (or the cloud hammered) by labelling. An empty
+// answer leaves the manager to fall back to a short device id.
+//
+// A token that is not a Tuya token answers "" rather than guessing, so an ONVIF
+// card can never be titled with a Tuya device name.
+func (t *Tuya) CameraLabelForProfile(profileToken string) string {
+	deviceID, ok := storedDeviceID(profileToken)
+	if !ok {
+		return ""
+	}
+	return t.cameraName(deviceID)
+}
+
+// PrimeCameraNames fills the device-name cache from one cloud listing, so that
+// a stream created or restored from now on can be titled with its CAMERA.
+//
+// It is called once at start-up, before the stored streams are restored, and it
+// is deliberately non-fatal: no session, a rejected session, an offline camera
+// and a transport failure each leave the cache as it was (empty), and the
+// affected cards then fall back to a short device id. It returns how many names
+// it cached.
+//
+// Note what is cached and what is not: tuyaqr.Device.DeviceName only. The
+// per-device streaming config (DeviceConfig.Auth / LocalKey) is never read.
+func (t *Tuya) PrimeCameraNames(ctx context.Context) int {
+	cams, err := t.Cameras(ctx)
+	if err != nil {
+		if t.log != nil {
+			t.log.LogWarn("tuya", "tuya", fmt.Sprintf(
+				"could not list the account to name the running cameras (%v); their cards fall back to a short device id", err))
+		}
+		return 0
+	}
+	named := 0
+	for _, cam := range cams {
+		if strings.TrimSpace(cam.Name) != "" {
+			named++
+		}
+	}
+	return named
 }
 
 // TuyaRegistrationOutcome explains what RegisterStoredDevice did, WITHOUT an
@@ -725,7 +834,14 @@ func (t *Tuya) Cameras(ctx context.Context) ([]Camera, error) {
 	}
 	out := make([]Camera, 0, len(devices))
 	var skipped []string
+	names := make(map[string]string, len(devices))
 	for _, d := range devices {
+		// Cache the NAME of every camera the cloud reports, so a later stream
+		// start can title its card with the camera rather than an internal
+		// stream id, without a second cloud round trip.
+		if name := strings.TrimSpace(d.DeviceName); name != "" {
+			names[d.DeviceID] = name
+		}
 		if !tuyaqr.IsCamera(d.Category) {
 			skipped = append(skipped, d.DeviceID)
 			continue
@@ -742,6 +858,9 @@ func (t *Tuya) Cameras(ctx context.Context) ([]Camera, error) {
 		cam.ResolutionOptions = tuyaengine.Resolutions()
 		out = append(out, cam)
 	}
+	t.mu.Lock()
+	t.deviceNames = names
+	t.mu.Unlock()
 	if t.log != nil {
 		t.log.LogInfo("tuya", "tuya", fmt.Sprintf("discovery: %d camera(s) after filtering, %d non-camera device(s) excluded", len(out), len(skipped)))
 	}
