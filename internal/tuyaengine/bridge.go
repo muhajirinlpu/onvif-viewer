@@ -2,8 +2,6 @@ package tuyaengine
 
 import (
 	"fmt"
-	"os"
-	"strings"
 
 	"dengan.dev/camera-streamer/internal/logger"
 	"dengan.dev/camera-streamer/internal/models"
@@ -40,11 +38,30 @@ func (b *Bridge) StartStream(spec DeviceSpec) (*models.StreamInfo, error) {
 	if b.starter == nil {
 		return nil, fmt.Errorf("tuyaengine: bridge has no stream starter")
 	}
-	rtspURL, token, err := b.engine.AddStream(spec)
+	rtspURL, token, err := b.RegisterStream(spec)
 	if err != nil {
 		return nil, err
 	}
 	return b.starter.StartStream(token, rtspURL)
+}
+
+// RegisterStream registers the device with the engine and returns the live
+// loopback RTSP URL plus the namespaced profile token, WITHOUT starting the
+// viewer's HLS pipeline.
+//
+// It is the NARROW half of StartStream, and it exists for the start-up path: a
+// Tuya stream's URL points at our own in-process engine on an ephemeral port, so
+// (a) the persisted row carries an EMPTY url and (b) nothing can restore that row
+// until the device is registered with THIS process's engine again. Calling
+// StartStream to achieve that would be wrong twice over: it would spawn a second
+// ffmpeg for a camera that is about to be restored, and it would re-persist a
+// stream_configs row that already exists (with an empty URL, which is the new,
+// correct value). RegisterStream touches ONLY the engine.
+func (b *Bridge) RegisterStream(spec DeviceSpec) (rtspURL, profileToken string, err error) {
+	if b == nil || b.engine == nil {
+		return "", "", fmt.Errorf("tuyaengine: bridge has no engine")
+	}
+	return b.engine.AddStream(spec)
 }
 
 // Resolve returns the RTSP URL currently served for a device id.
@@ -64,29 +81,33 @@ func (b *Bridge) Engine() *Engine { return b.engine }
 // Stop shuts the engine down and releases its ports.
 func (b *Bridge) Stop() { b.engine.Stop() }
 
-// NewBridgeFromEnv builds a bridge from the environment, or returns (nil, nil)
-// when no Tuya session is configured.
+// NewBridgeFromEnv builds a bridge from the environment.
 //
-// This is the whole of the process-level wiring: the engine child is started
-// lazily by the first StartStream, and an install without
-// TUYA_ENGINE_SESSION_FILE never spawns anything.
+// The environment is only consulted for the *engine's* own configuration
+// (DefaultConfig) - never to decide whether Tuya exists at all. See
+// NewBridgeForSession for why that decision is no longer made here.
 func NewBridgeFromEnv(starter StreamStarter, log *logger.Logger) (*Bridge, error) {
-	return NewBridgeForSession(starter, log, strings.TrimSpace(os.Getenv(EnvSessionFile)) != "")
+	return NewBridgeForSession(starter, log)
 }
 
-// NewBridgeForSession builds a bridge, given the caller's answer to "is a Tuya
-// session actually configured in this process?".
+// NewBridgeForSession builds a bridge over a fresh supervisor engine.
 //
-// It exists because the session no longer has to be a file: in M8 the credential
-// lives in the project database, and TUYA_ENGINE_SESSION_FILE may legitimately be
-// unset on an install that is fully migrated. Gating the bridge on the
-// environment variable alone would then silently disable Tuya streaming on a
-// working install, which is exactly the kind of "it just stopped working"
-// regression this milestone must not introduce.
-func NewBridgeForSession(starter StreamStarter, log *logger.Logger, configured bool) (*Bridge, error) {
-	if !configured {
-		return nil, nil
-	}
+// It deliberately NO LONGER takes an "is a Tuya session configured?" flag, and
+// that removal is the fix for a MEASURED defect. The flag answered the question
+// ONCE, at start-up: when the project database held no `tuya_sessions` row yet
+// (the session arrived later, through an import or the periodic cloud refresh),
+// the bridge stayed nil for the whole lifetime of the process. The only symptom
+// was an opaque "tuya streaming is not configured in this process" at start
+// time, with NO warning at boot, and the operator had to restart to fix it.
+//
+// A bridge is now always constructed. It costs nothing until a stream is
+// started: Engine.New allocates no ports, spawns no child and binds no listener
+// - the RTSP listener comes up on the first AddStream (see Engine.EnsureRunning).
+// A start with no session is refused by the provider, which reads the session
+// from the store on every start and answers with the QR-relogin prompt that the
+// UI can act on. The net effect is that a session which appears AFTER start-up
+// is usable immediately, with no restart.
+func NewBridgeForSession(starter StreamStarter, log *logger.Logger) (*Bridge, error) {
 	engine := New(DefaultConfig())
 	engine.SetEventSink(func(event Event) {
 		log.LogInfo("tuya-engine", "engine", event.String())
