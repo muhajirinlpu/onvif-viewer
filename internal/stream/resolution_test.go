@@ -30,7 +30,12 @@ func TestSDArgumentsAreUnchangedFromHEAD(t *testing.T) {
 	defer l.Close()
 
 	const head = "-y -fflags +genpts+igndts -rtsp_transport tcp -rtsp_flags prefer_tcp " +
-		"-timeout 5000000 -i rtsp://10.0.0.9:554/live -c:v copy -c:a aac " +
+		// -timeout is 30s, not the 5s that was here at HEAD: the 5s bound killed
+		// a healthy Tuya start (14.3s to the first segment) and surfaced as a
+		// camera reconnecting forever. Pinned as a literal so any further change
+		// is caught here; TestInputIOTimeoutIsGenerousEnoughForTuyaStartup
+		// guards the value itself.
+		"-timeout 30000000 -i rtsp://10.0.0.9:554/live -c:v copy -c:a aac " +
 		"-avoid_negative_ts make_zero -max_interleave_delta 0 -hls_time 2 -hls_list_size 5 " +
 		"-hls_start_number_source epoch -hls_flags delete_segments+independent_segments " +
 		"-hls_segment_type mpegts -f hls /tmp/hls/stream.m3u8"
@@ -132,7 +137,7 @@ func TestHDArgumentsSelectTheTranscodingPath(t *testing.T) {
 		"-fflags +genpts+igndts",
 		"-rtsp_transport tcp",
 		"-rtsp_flags prefer_tcp",
-		"-timeout 5000000",
+		"-timeout 30000000",
 		"-avoid_negative_ts make_zero",
 		"-max_interleave_delta 0",
 		"-hls_time 2",

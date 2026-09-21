@@ -50,6 +50,27 @@ const (
 	// muxer can take ~30-90s to close its first segment with -c:v copy, so
 	// without this grace the watchdog kills a healthy start.
 	playlistFirstSegmentGrace = 120 * time.Second
+	// ffmpegInputIOTimeout bounds the RTSP demuxer's socket I/O -- BOTH the
+	// connect and the reads on an established session (-timeout takes
+	// microseconds). (ffmpeg has no -rw_timeout CLI option - that name exists
+	// only at the AVIO level.)
+	//
+	// It is deliberately generous, and it is NOT the stall detector: the HLS
+	// watchdog (hlsStallTimeout, plus playlistFirstSegmentGrace) owns "connected
+	// but producing nothing". This value only catches a truly dead socket, so it
+	// must not be tightened toward a "snappier reconnect".
+	//
+	// MEASURED on the ES06 Tuya camera, and the reason this is not 5s: a Tuya
+	// stream is served by the in-process engine over loopback, and the engine
+	// returns nothing on a fresh RTSP connection until it has finished its
+	// WebRTC handshake with the cloud and received a keyframe -- 14.3s to the
+	// first segment, against an engine-internal start of ~6s. A 5s value
+	// therefore killed a perfectly healthy stream 6s in with "Failed reading
+	// RTSP data: Connection timed out", which surfaced to the user as a camera
+	// reconnecting forever. ONVIF (the camera answers in well under a second)
+	// is unaffected by this change; the longer bound costs nothing when reads
+	// keep flowing, because the timeout is per read, not for the whole session.
+	ffmpegInputIOTimeout = 30 * time.Second
 )
 
 // StatusNeedsRelogin is the stream status used when a provider's stored session
@@ -709,6 +730,23 @@ func diagnoseReachability(rtspURL, onvifAddress string, timeout time.Duration) s
 	if err != nil || parsed.Hostname() == "" {
 		return "camera address invalid; unable to run network diagnosis"
 	}
+	// A loopback source with NO ONVIF endpoint is the in-process Tuya engine,
+	// NOT the camera. Probing "the camera's" RTSP/ONVIF ports would then report
+	// a healthy stream as "RTSP port reachable; ONVIF port unreachable" -- the
+	// Tuya camera has neither port open by design -- which reads as a camera
+	// fault and sends whoever is debugging it after the wrong thing. Say what
+	// the source actually is instead; the engine's own health is what matters.
+	//
+	// The empty ONVIF address is part of the test on purpose: a LAN ONVIF
+	// camera can legitimately be reached over loopback (a tunnelled or port
+	// forwarded camera) and its ONVIF port must still be diagnosed, so loopback
+	// alone is not enough to call the source the engine.
+	if host := parsed.Hostname(); onvifAddress == "" && (host == "127.0.0.1" || host == "::1" || host == "localhost") {
+		if tcpReachable(net.JoinHostPort(parsed.Hostname(), parsed.Port()), timeout) {
+			return "local Tuya engine reachable; the camera's own ports are not used on this path"
+		}
+		return "local Tuya engine unreachable; the in-process engine is not answering on its loopback RTSP port"
+	}
 	rtspAddress := parsed.Host
 	if parsed.Port() == "" {
 		rtspAddress = net.JoinHostPort(parsed.Hostname(), "554")
@@ -828,10 +866,10 @@ func (sm *Manager) ffmpegArgsFor(rtspURL string, hlsDir string, path VideoOutput
 	}
 
 	args = append(args,
-		// RTSP demuxer -timeout is an I/O timeout in microseconds; it bounds both
-		// the connection and reads on an established session. (ffmpeg has no
-		// -rw_timeout CLI option - that name exists only at the AVIO level.)
-		"-timeout", "5000000", // 5s socket I/O timeout
+		// FFmpegInputIOTimeoutMicroseconds is ffmpegInputIOTimeout in the
+		// microseconds the RTSP demuxer expects (see the constant for why this
+		// is deliberately generous rather than a tight stall detector).
+		"-timeout", strconv.FormatInt(ffmpegInputIOTimeout.Microseconds(), 10),
 		"-i", rtspURL,
 	)
 
