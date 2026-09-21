@@ -51,11 +51,35 @@
     .dark .panel { background:rgba(15,16,17,.92); border-color:rgba(255,255,255,.08); box-shadow:0 8px 30px rgba(0,0,0,.25); }
     .panel-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:18px 20px; border-bottom:1px solid rgba(148,163,184,.18); }
     .panel-title { display:flex; align-items:center; gap:10px; min-width:0; }
-    .stream-card { border:1px solid rgba(148,163,184,.22); border-radius:14px; padding:16px; background:rgba(148,163,184,.045); }
+    .stream-card { position:relative; display:flex; flex-direction:column; border:1px solid rgba(148,163,184,.22); border-radius:14px; padding:16px; background:rgba(148,163,184,.045); }
     /* One grid for both providers: ONVIF and Tuya cards render from the same
        template, so they must also share the same track sizing. */
-    .stream-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:16px; align-items:start; }
+    /* M10: the track count per breakpoint is now EXPLICIT. `auto-fill` over a
+       grid that a fixed 360px diagnostics gutter had squeezed is what made every
+       desktop tile too small to actually watch. The counts are chosen for the
+       primary use - several cameras at once:
+         <=767px   : 1 column  (phone: video first, one camera at a time)
+         768-1023  : 2 columns (tablet)
+         1024-1919 : 2 columns (desktop: two cameras side by side, ~650px each)
+         >=1920px  : 3 columns (wide desktop)
+       The video is container-driven (see .video-container), so a wider track IS
+       a bigger picture: there is no per-size max-height cap left to fight it. */
+    .stream-grid { display:grid; grid-template-columns:1fr; gap:16px; align-items:start; }
+    @media (min-width: 768px) { .stream-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+    @media (min-width: 1920px) { .stream-grid { grid-template-columns:repeat(3,minmax(0,1fr)); } }
     .stream-grid > .stream-card { margin-top:0!important; }
+    /* M10: the S/M/L control no longer caps a video height - it decides how
+       many grid tracks this card claims, so one camera can be featured without
+       shrinking the others. S is the DEFAULT: one track per camera, which is
+       what "watch several cameras at once" means. M/L claim both tracks of the
+       pair (or all three on a wide desktop). The span is clamped at each
+       breakpoint so a card can never be wider than the grid it is in.
+       Chosen by data-size on the card rather than a class on purpose: an
+       earlier milestone pinned the exact string `class="stream-card"`. */
+    .stream-card[data-size="medium"] { grid-column:span 2; }
+    .stream-card[data-size="large"] { grid-column:span 2; }
+    @media (min-width: 1920px) { .stream-card[data-size="large"] { grid-column:span 3; } }
+    @media (max-width: 1023px) { .stream-card[data-size="medium"],.stream-card[data-size="large"] { grid-column:span 1; } }
     .provider-badge { display:inline-flex; align-items:center; gap:5px; padding:2px 8px; border-radius:999px; font-size:.68rem; font-weight:600; letter-spacing:.04em; text-transform:uppercase; border:1px solid transparent; }
     .provider-badge-onvif { background:rgba(59,130,246,.14); color:#2563eb; border-color:rgba(59,130,246,.3); }
     .dark .provider-badge-onvif { color:#93c5fd; }
@@ -79,9 +103,54 @@
     .stream-card-header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; }
     .stream-identity { min-width:0; }
     .stream-identity h3 { overflow-wrap:anywhere; }
-    .stream-actions { display:flex; align-items:center; justify-content:flex-end; flex-wrap:wrap; gap:8px; }
-    .video-container { position:relative; display:flex; align-items:center; justify-content:center; width:100%; margin-top:16px; overflow:hidden; border-radius:12px; background:#000; }
-    .video-container video { object-fit:contain; background:#000; }
+    /* M10: the status indicator line. The compact Hide/Show control lives here,
+       next to the dot, the status word and the provider badge. */
+    .stream-status-line { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:4px; }
+    /* Compact, icon-first Hide/Show. It overrides the global 44px button floor
+       on purpose: it is a compact indicator control, not a primary action, and
+       the 44px floor is what made six full-width buttons own the phone screen.
+       It keeps an accessible name (aria-label + title), so shrinking it does not
+       make it unusable - and it is the ONE control never hidden behind the
+       disclosure. */
+    .stream-hide-toggle {
+      display:inline-flex; align-items:center; justify-content:center;
+      width:28px; height:28px; min-height:0; padding:0; margin-left:auto;
+      border-radius:8px; border:1px solid rgba(148,163,184,.4);
+      background:rgba(148,163,184,.1); color:inherit; cursor:pointer;
+      font-size:.72rem; line-height:1; transition:all .15s ease;
+    }
+    .stream-hide-toggle:hover { border-color:rgba(94,106,210,.6); background:rgba(94,106,210,.15); }
+    .stream-hide-toggle[aria-pressed="true"] { background:var(--accent); border-color:var(--accent); color:#fff; }
+    /* M10: the one disclosure that hides every other card control. The panel is
+       `v-show`-hidden by default, so a card with a video shows the picture and
+       the compact status line, not six buttons. */
+    .stream-controls { display:flex; flex-direction:column; align-items:stretch; margin-top:12px; }
+    .stream-actions-toggle { display:inline-flex; align-items:center; justify-content:center; gap:8px; min-height:44px; padding:8px 14px; border-radius:10px; border:1px solid rgba(148,163,184,.4); background:rgba(148,163,184,.08); color:inherit; font-weight:600; cursor:pointer; }
+    .stream-actions-toggle:hover { border-color:rgba(94,106,210,.6); }
+    .stream-actions-chevron { transition:transform .2s ease; }
+    .stream-actions-chevron.is-open { transform:rotate(180deg); }
+    .stream-actions { display:flex; align-items:center; justify-content:flex-start; flex-wrap:wrap; gap:8px; margin-top:10px; padding:10px; border-radius:12px; border:1px dashed rgba(148,163,184,.45); background:rgba(148,163,184,.06); }
+    .stream-actions>button { min-height:44px; }
+    /* The S/M/L items are divs, so the global 44px button floor does not reach
+       them. They are now real buttons for touch: role=button, tabindex=0 and a
+       44px square, so folding them into the panel did not shrink them below the
+       same touch target every other control keeps. */
+    .size-selector>div { display:flex; align-items:center; justify-content:center; min-width:44px; min-height:44px; }
+    /* Container-driven video: the picture fills the card track it sits in. The
+       per-size max-height caps that used to live here are gone - they are what
+       made a large tile show a small picture. */
+    .video-container { position:relative; display:flex; align-items:center; justify-content:center; width:100%; margin-top:16px; overflow:hidden; border-radius:12px; background:#000; aspect-ratio:16 / 9; }
+    .video-container video { width:100%; height:100%; object-fit:contain; background:#000; }
+    .video-container.is-fullscreen { position:fixed; inset:0; width:100vw; height:100vh; aspect-ratio:auto; max-height:none; margin-top:0; border-radius:0; z-index:9999; }
+    /* M10: the fullscreen control. `group` on the card (plus these rules) is what
+       finally makes it reachable: the wrapper carried `group-hover:opacity-100`
+       but no ancestor had the `group` class, so it never became visible on hover
+       - and on a touch device it could never be reached at all. */
+    .video-overlay-controls { position:absolute; bottom:12px; right:12px; display:flex; gap:8px; opacity:0; transition:opacity .3s; }
+    .stream-card:hover .video-overlay-controls,
+    .stream-card:focus-within .video-overlay-controls,
+    .video-container:hover .video-overlay-controls { opacity:1; }
+    @media (hover:none), (pointer:coarse), (max-width:767px) { .video-overlay-controls { opacity:1; } }
     .logs-console { min-height:220px; max-height:50dvh; overflow:auto; }
     .modal-overlay { position:fixed; inset:0; z-index:100; display:flex; align-items:center; justify-content:center; padding:16px; background:rgba(2,6,23,.72); backdrop-filter:blur(8px); }
     .modal-shell { display:flex; flex-direction:column; width:min(100%,560px); max-height:calc(100dvh - 32px); overflow:hidden; border:1px solid rgba(255,255,255,.1); border-radius:18px; background:#fff; box-shadow:0 30px 90px rgba(0,0,0,.4); }
@@ -92,6 +161,21 @@
     .dark .modal-footer { background:rgba(15,16,17,.98); }
     .mobile-fab { display:none; }
     .footer-shell { padding:28px 16px; text-align:center; }
+    /* M10: the fixed 360px diagnostics column used to sit next to the stream
+       grid all the way down to 1023px, so at a normal desktop width it took a
+       quarter of the page and forced every camera tile small. The gutter now
+       only appears when the page is genuinely wide enough for it AND for the
+       streams; below that the logs move UNDER the grid and the cameras get the
+       full width. At >=1600px the page container also widens, so the pair is
+       3-wide-capable rather than 3 x ~400px. */
+    @media (max-width: 1599px) {
+      .dashboard-grid { grid-template-columns:minmax(0,1fr); }
+      .diagnostics-column { order:2; }
+    }
+    @media (min-width: 1600px) {
+      .page-container { width:min(100%,1560px); }
+      .dashboard-grid { grid-template-columns:minmax(0,1fr) 360px; }
+    }
     @media (max-width: 1023px) {
       .dashboard-grid { grid-template-columns:1fr; }
       .diagnostics-column { order:2; }
@@ -113,13 +197,20 @@
       .panel-heading { padding:15px; }
       .panel-body { padding:15px!important; }
       .stream-card { padding:14px; }
+      /* Explicit single column: a phone shows one camera at a time, full width. */
       .stream-grid { grid-template-columns:1fr; gap:12px; }
+      /* The phone order is VIDEO FIRST, CONTROLS LAST. The identity/status block
+         sits between them so the status word and the Hide/Show control stay
+         visible without pushing the picture off the screen. */
+      .video-container { order:1; margin-top:12px; }
+      .stream-card-header { order:2; margin-top:12px; flex-direction:column; align-items:stretch; }
+      .stream-controls { order:3; }
+      .stream-actions-toggle { width:100%; justify-content:space-between; }
       .provider-chooser-options { grid-template-columns:1fr; }
       .tuya-qr-frame img { width:180px; height:180px; }
-      .stream-card-header { flex-direction:column; align-items:stretch; }
       .stream-actions { justify-content:stretch; }
-      .stream-actions>button { flex:1; }
-      .size-selector { order:3; width:100%; justify-content:center; }
+      .stream-actions>button { flex:1 1 45%; }
+      .size-selector { width:100%; justify-content:center; }
       .modal-overlay { align-items:flex-end; padding:0; }
       .modal-shell { width:100%; max-height:94dvh; border-radius:18px 18px 0 0; border-bottom:0; }
       .modal-body { padding:16px; }
@@ -133,7 +224,12 @@
     @media (max-width: 420px) {
       .brand-icon { width:36px!important; height:36px!important; margin-right:0!important; }
       .topbar-actions { gap:6px; }
-      .stream-actions { display:grid; grid-template-columns:1fr 1fr; }
+      /* M10: previously a 2x2 grid of ALWAYS-VISIBLE buttons. The panel is
+         collapsed by default now, and when it is opened the controls stack in
+         one full-width column so each touch target is the largest it can be
+         without cramming two per row. */
+      .stream-actions { display:grid; grid-template-columns:1fr; }
+      .stream-actions>button { flex:none; width:100%; }
       .size-selector { grid-column:1/-1; }
     }
   </style>
@@ -603,11 +699,18 @@
             <!-- ONE grid for every provider. ONVIF and Tuya cameras render from
                  this same collapsible square card template. -->
             <div class="stream-grid">
+            <!-- M10: `group` is bound here rather than added to the static class
+                 string, because an earlier milestone pins the exact literal
+                 `class="stream-card"`. Tailwind's group-hover needs an ancestor
+                 carrying it, and there was NONE - which is why the fullscreen
+                 control on the video was unreachable. -->
             <div v-for="stream in streams" :key="stream.id"
-              class="stream-card">
+              class="stream-card"
+              :class="'group'"
+              :data-size="stream.videoSize || 'small'">
               <div class="stream-card-header">
                 <div class="stream-identity">
-                  <div class="flex items-center gap-2 mb-1 flex-wrap">
+                  <div class="stream-status-line">
                     <span class="w-2 h-2 rounded-full" :class="stream.status === 'running' ? 'bg-emerald-500 animate-pulse' : stream.status === 'failed' || stream.status === 'stalled' ? 'bg-red-500' : 'bg-amber-500 animate-pulse'"></span>
                     <span class="text-xs uppercase tracking-wide" :class="stream.status === 'running' ? 'text-emerald-600 dark:text-emerald-400' : stream.status === 'failed' || stream.status === 'stalled' ? 'text-red-600 dark:text-red-400' : 'text-amber-600 dark:text-amber-400'">{{ stream.status }}</span>
                     <!-- Provider badge: the grid mixes providers, so each card
@@ -618,6 +721,17 @@
                       <i :class="streamProvider(stream) === 'tuya' ? 'fas fa-cloud' : 'fas fa-network-wired'"></i>
                       {{ streamProvider(stream) === 'tuya' ? 'Tuya' : 'ONVIF' }}
                     </span>
+                    <!-- M10: Hide/Show, compact and icon-first, INSIDE the status
+                         indicator line. It is the only control that is never
+                         collapsed, and it keeps an accessible name because it
+                         has to work on touch. -->
+                    <button type="button" v-if="!stream.stopping" @click="toggleVideo(stream)"
+                      class="stream-hide-toggle"
+                      :aria-label="stream.showVideo ? 'Hide video for ' + stream.id : 'Show video for ' + stream.id"
+                      :title="stream.showVideo ? 'Hide video' : 'Show video'"
+                      :aria-pressed="stream.showVideo ? 'true' : 'false'">
+                      <i :class="stream.showVideo ? 'fas fa-eye-slash' : 'fas fa-eye'" aria-hidden="true"></i>
+                    </button>
                   </div>
                   <h3 class="font-semibold">{{ stream.id }}</h3>
                   <p class="text-sm text-slate-500 dark:text-slate-400">
@@ -659,29 +773,60 @@
                     </button>
                   </div>
                 </div>
-                <div class="stream-actions">
-                  <!-- Video Size Selector -->
+              </div>
+
+              <!-- M10: container-driven video. No per-size max-height cap, so the
+                   picture fills the grid track the card occupies. -->
+              <div v-if="stream.showVideo"
+                :class="['video-container', stream.isFullscreen ? 'is-fullscreen' : '']">
+                <video :id="'video-' + stream.id" controls class="w-full h-full"></video>
+                <div
+                  class="video-overlay-controls group-hover:opacity-100">
+                  <!-- [html-validate-disable-next text-content -- Vue supplies the accessible name dynamically] -->
+                  <button type="button"
+                    class="bg-black/70 text-white border-none rounded-lg p-2 cursor-pointer hover:bg-black/90 hover:scale-110 transition-all"
+                    @click="toggleFullscreen(stream)" :title="stream.isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'" :aria-label="stream.isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'">
+                    <i :class="stream.isFullscreen ? 'fas fa-compress' : 'fas fa-expand'"></i>
+                  </button>
+                </div>
+              </div>
+
+              <!-- M10: ONE disclosure owns every control on the card except the
+                   compact Hide/Show in the status line above. Collapsed by
+                   default; nothing was removed, only folded away. -->
+              <div class="stream-controls">
+                <button type="button" class="stream-actions-toggle"
+                  @click="toggleStreamActions(stream)"
+                  :aria-expanded="streamActionsOpen(stream) ? 'true' : 'false'"
+                  :aria-controls="'stream-actions-' + stream.id"
+                  :aria-label="(streamActionsOpen(stream) ? 'Hide camera controls for ' : 'Show camera controls for ') + stream.id">
+                  <i class="fas fa-sliders" aria-hidden="true"></i>
+                  <span>Controls</span>
+                  <i class="fas fa-chevron-down stream-actions-chevron" :class="{ 'is-open': streamActionsOpen(stream) }" aria-hidden="true"></i>
+                </button>
+                <div v-show="streamActionsOpen(stream)" :id="'stream-actions-' + stream.id" class="stream-actions">
+                  <!-- Video Size Selector: which grid tracks this card claims. -->
                   <div v-if="stream.showVideo"
                     class="size-selector flex gap-1 bg-slate-100 dark:bg-slate-800 rounded-lg p-1 border border-slate-200 dark:border-slate-700">
                     <div
                       class="px-2 py-1 rounded cursor-pointer text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 transition-all"
                       :class="{ 'bg-blue-500 text-white shadow-sm hover:text-white dark:hover:text-white': stream.videoSize === 'small' }"
-                      @click="setVideoSize(stream, 'small')">S</div>
+                      role="button" tabindex="0" :aria-pressed="stream.videoSize === 'small' ? 'true' : 'false'"
+                      :aria-label="'Show ' + stream.id + ' at one grid column'"
+                      @click="setVideoSize(stream, 'small')" @keydown.enter.prevent="setVideoSize(stream, 'small')" @keydown.space.prevent="setVideoSize(stream, 'small')">S</div>
                     <div
                       class="px-2 py-1 rounded cursor-pointer text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 transition-all"
                       :class="{ 'bg-blue-500 text-white shadow-sm hover:text-white dark:hover:text-white': stream.videoSize === 'medium' }"
-                      @click="setVideoSize(stream, 'medium')">M</div>
+                      role="button" tabindex="0" :aria-pressed="stream.videoSize === 'medium' ? 'true' : 'false'"
+                      :aria-label="'Show ' + stream.id + ' at two grid columns'"
+                      @click="setVideoSize(stream, 'medium')" @keydown.enter.prevent="setVideoSize(stream, 'medium')" @keydown.space.prevent="setVideoSize(stream, 'medium')">M</div>
                     <div
                       class="px-2 py-1 rounded cursor-pointer text-xs font-medium text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-100 transition-all"
                       :class="{ 'bg-blue-500 text-white shadow-sm hover:text-white dark:hover:text-white': stream.videoSize === 'large' }"
-                      @click="setVideoSize(stream, 'large')">L</div>
+                      role="button" tabindex="0" :aria-pressed="stream.videoSize === 'large' ? 'true' : 'false'"
+                      :aria-label="'Show ' + stream.id + ' at the widest grid span'"
+                      @click="setVideoSize(stream, 'large')" @keydown.enter.prevent="setVideoSize(stream, 'large')" @keydown.space.prevent="setVideoSize(stream, 'large')">L</div>
                   </div>
-
-                  <button type="button" v-if="!stream.stopping" @click="toggleVideo(stream)"
-                    class="bg-blue-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 shadow-sm transition-colors px-4 py-2 rounded-lg">
-                    <i :class="stream.showVideo ? 'fas fa-eye-slash' : 'fas fa-eye'" class="mr-2"></i>
-                    {{ stream.showVideo ? 'Hide' : 'View' }}
-                  </button>
                   <!-- Sync is an ONVIF-only SOAP call: a Tuya stream has no SOAP
                        endpoint, so the button is not rendered at all rather
                        than shown dead. -->
@@ -702,20 +847,6 @@
                     class="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed">
                     <i :class="stream.stopping ? 'fas fa-spinner fa-spin' : 'fas fa-stop'" class="mr-2"></i>
                     {{ stream.stopping ? 'Stopping...' : 'Stop' }}
-                  </button>
-                </div>
-              </div>
-
-              <div v-if="stream.showVideo"
-                :class="['video-container', stream.videoSize === 'small' ? 'aspect-video max-h-[400px]' : stream.videoSize === 'medium' ? 'aspect-video max-h-[600px]' : stream.videoSize === 'large' ? 'aspect-video max-h-[800px]' : stream.isFullscreen ? 'fixed inset-0 w-screen h-screen z-[9999] aspect-auto max-h-none rounded-none' : 'aspect-video max-h-[600px]']">
-                <video :id="'video-' + stream.id" controls class="w-full h-full"></video>
-                <div
-                  class="absolute bottom-3 right-3 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
-                  <!-- [html-validate-disable-next text-content -- Vue supplies the accessible name dynamically] -->
-                  <button type="button"
-                    class="bg-black/70 text-white border-none rounded-lg p-2 cursor-pointer hover:bg-black/90 hover:scale-110 transition-all"
-                    @click="toggleFullscreen(stream)" :title="stream.isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'" :aria-label="stream.isFullscreen ? 'Exit fullscreen' : 'Enter fullscreen'">
-                    <i :class="stream.isFullscreen ? 'fas fa-compress' : 'fas fa-expand'"></i>
                   </button>
                 </div>
               </div>
@@ -1321,11 +1452,27 @@
         };
 
         // Video size and fullscreen controls
+        // M10: `size` no longer caps the video's height - it selects how many
+        // grid tracks this card claims (see .stream-card.size-* in the CSS), so
+        // the picture is always as big as the tile it sits in.
         const setVideoSize = (stream, size) => {
           stream.videoSize = size;
           // Save preference
           localStorage.setItem(`videoSize_${stream.id}`, size);
         };
+
+        // M10: ONE disclosure per card owns every control except Hide/Show.
+        // Collapsed by default: with six always-visible controls per card, a
+        // phone viewport was mostly buttons. Expanding is a visibility change,
+        // never a capability change - every control is still in the panel.
+        const streamActionsOpen = (stream) => stream.actionsOpen === true;
+
+        const toggleStreamActions = (stream) => {
+          stream.actionsOpen = !streamActionsOpen(stream);
+          localStorage.setItem(`streamActions_${stream.id}`, stream.actionsOpen ? 'true' : 'false');
+        };
+
+        const storedActionsOpen = (streamId) => localStorage.getItem(`streamActions_${streamId}`) === 'true';
 
         const toggleFullscreen = (stream) => {
           const videoContainer = document.querySelector(`#video-${stream.id}`).parentElement;
@@ -1685,7 +1832,7 @@
 
             streams.value = data.map(stream => {
               const existingStream = streams.value.find(s => s.id === stream.id);
-              const savedVideoSize = localStorage.getItem(`videoSize_${stream.id}`) || 'medium';
+              const savedVideoSize = localStorage.getItem(`videoSize_${stream.id}`) || 'small';
 
               return {
                 ...stream,
@@ -1704,6 +1851,10 @@
                 showVideo: existingStream?.showVideo || false,
                 stopping: false,
                 videoSize: existingStream?.videoSize || savedVideoSize,
+                // M10: the collapsed/expanded state of this card's control
+                // panel. Default false, so a freshly loaded page shows the
+                // video and the status line, not six buttons.
+                actionsOpen: existingStream?.actionsOpen ?? storedActionsOpen(stream.id),
                 isFullscreen: existingStream?.isFullscreen || false
               };
             });
@@ -1836,6 +1987,9 @@
           setTheme,
           setVideoSize,
           toggleFullscreen,
+          // M10: the one per-card disclosure
+          toggleStreamActions,
+          streamActionsOpen,
           func,
           cameraIp,
           cameraPort,
