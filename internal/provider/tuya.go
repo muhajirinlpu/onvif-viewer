@@ -60,6 +60,25 @@ type TuyaStreaming interface {
 	Resolve(deviceID string) (string, error)
 }
 
+// TuyaStreamRegistrar is the ENGINE-REGISTRATION half of the bridge, declared
+// separately from TuyaStreaming so the start-up path can only REGISTER a device.
+//
+// It is deliberately narrower, because the start-up path must be able to do
+// exactly one thing and no more:
+//
+//   - it must NOT call StartStream, which would spawn a SECOND ffmpeg for a
+//     camera that is about to be restored;
+//   - it must NOT persist anything, because a stream_configs row for this
+//     camera already exists (with the empty URL Bug 1 stores) and re-writing it
+//     is stream.Manager's job, not this path's.
+//
+// Registering a device with the engine is what makes the camera's EPHEMERAL
+// loopback RTSP URL exist again in this process, which is the precondition for
+// stream.Manager.RestoreStreams to resolve it at all.
+type TuyaStreamRegistrar interface {
+	RegisterStream(spec tuyaengine.DeviceSpec) (rtspURL, profileToken string, err error)
+}
+
 // TuyaResolutionStore persists and reads back the per-camera resolution choice.
 // It is the *logger.Logger in production; declaring the sliver here keeps the
 // provider testable without a database.
@@ -128,6 +147,10 @@ type Tuya struct {
 	bridge  TuyaStreaming
 	stopper TuyaStreamStopper
 	log     TuyaLogger
+	// registrar is the engine-registration seam used at start-up. It is a
+	// separate (and strictly narrower) capability from bridge: see
+	// TuyaStreamRegistrar.
+	registrar TuyaStreamRegistrar
 
 	validateTTL time.Duration
 
@@ -168,6 +191,16 @@ type TuyaOption func(*Tuya)
 // WithTuyaBridge attaches the stream bridge. Without it, discovery still works
 // but starting a Tuya stream fails with a clear message.
 func WithTuyaBridge(b TuyaStreaming) TuyaOption { return func(t *Tuya) { t.bridge = b } }
+
+// WithTuyaStreamRegistrar attaches the engine-registration seam used to
+// re-register a PERSISTED Tuya camera with the engine at start-up, without
+// starting a stream. The real *tuyaengine.Bridge satisfies it.
+//
+// A nil registrar is the honest answer for an install where Tuya streaming is
+// disabled: RegisterStoredDevice then reports that, instead of pretending.
+func WithTuyaStreamRegistrar(r TuyaStreamRegistrar) TuyaOption {
+	return func(t *Tuya) { t.registrar = r }
+}
 
 // WithTuyaResolution overrides the engine stream resolution ("sd" default).
 //
@@ -410,6 +443,145 @@ func (t *Tuya) StartStreamAt(deviceID string, resolution string) (*models.Stream
 		info.Resolution = resolved
 	}
 	return info, nil
+}
+
+// TuyaRegistrationOutcome explains what RegisterStoredDevice did, WITHOUT an
+// error, because "nothing to register" is not a failure of the viewer: an
+// install with no session yet, and a camera the engine already serves, are both
+// normal.
+type TuyaRegistrationOutcome struct {
+	// DeviceID is the device this call was about.
+	DeviceID string
+	// ProfileToken is the namespaced token the stream manager addresses it by.
+	ProfileToken string
+	// RTSPURL is the live loopback URL the engine serves the device on, when
+	// Registered is true. It is engine-allocated and changes every start, which
+	// is exactly why it is never persisted.
+	RTSPURL string
+	// Resolution is what the engine was asked to serve the camera at.
+	Resolution string
+	// Registered is true only when the engine now serves this device.
+	Registered bool
+	// SkippedReason is set when Registered is false, and is a full sentence an
+	// operator can act on. It is never an empty string in that case.
+	SkippedReason string
+}
+
+// RegisterStoredDeviceForProfile re-registers a PERSISTED Tuya camera with the
+// engine, so that a stream row left by a PREVIOUS run of this process can be
+// restored by the current one.
+//
+// WHY THIS EXISTS (the defect, MEASURED live): a Tuya stream's RTSP URL is a
+// loopback address on OUR OWN in-process engine, and that engine binds an
+// EPHEMERAL port that changes on every start. So a Tuya stream_configs row is
+// stored with an EMPTY url (see stream.Manager.startStreamWithOptions) and
+// stream.Manager.RestoreStreams asks the engine for the live address instead of
+// replaying a frozen one. But NOTHING used to put the device back into the
+// engine at boot, so restore asked the engine about a device it had never heard
+// of, correctly reported not-found, and skipped the camera. Net effect: 1 stream
+// before a restart, 0 after. This call is the missing half.
+//
+// It takes the PROFILE TOKEN, not a device id, because the token is the only
+// device identifier a stored row carries: the row's profile_token is
+// "tuya:<deviceId>" (tuyaengine.ProfileTokenPrefix), so the device id is
+// recoverable from the token alone.
+//
+// It REGISTERS and does nothing else: no stream is started (RestoreStreams will
+// start exactly one ffmpeg for it) and nothing is persisted (the row already
+// exists, with the empty URL by design).
+//
+// It never returns an error for an ordinary "cannot register right now"
+// condition — no session, camera offline, engine refusal — because a camera that
+// is offline must NOT be able to break the viewer's start-up. The caller decides
+// what to log; the returned outcome always says what happened and why.
+func (t *Tuya) RegisterStoredDeviceForProfile(profileToken string) TuyaRegistrationOutcome {
+	outcome := TuyaRegistrationOutcome{ProfileToken: strings.TrimSpace(profileToken)}
+	deviceID, ok := storedDeviceID(outcome.ProfileToken)
+	if !ok {
+		// An ONVIF token can legitimately reach here (the sweep is profile-token
+		// driven); it is not an error, it is simply not ours.
+		outcome.SkippedReason = "not a Tuya profile token, so there is nothing to register with the Tuya engine"
+		return outcome
+	}
+	outcome.DeviceID = deviceID
+	return t.RegisterStoredDevice(deviceID)
+}
+
+// RegisterStoredDevice is the device-id form of RegisterStoredDeviceForProfile.
+func (t *Tuya) RegisterStoredDevice(deviceID string) TuyaRegistrationOutcome {
+	outcome := TuyaRegistrationOutcome{DeviceID: strings.TrimSpace(deviceID)}
+	if outcome.DeviceID == "" {
+		outcome.SkippedReason = "the stored row names no device, so there is nothing to register"
+		return outcome
+	}
+	token, err := tuyaengine.ProfileTokenFor(outcome.DeviceID)
+	if err != nil {
+		outcome.SkippedReason = fmt.Sprintf("the stored row names an unusable device id: %v", err)
+		return outcome
+	}
+	outcome.ProfileToken = token
+
+	t.mu.Lock()
+	registrar := t.registrar
+	t.mu.Unlock()
+	if registrar == nil {
+		outcome.SkippedReason = "Tuya streaming is not configured in this process, so the engine cannot be given this camera"
+		return outcome
+	}
+
+	// The engine consumes a session FILE (internal/go2rtc is vendored and
+	// frozen); a database-backed session is materialized as a private 0600 copy
+	// here and that copy is what the engine reads.
+	session, err := t.currentSession()
+	if err != nil {
+		outcome.SkippedReason = fmt.Sprintf("no Tuya session is available yet (%v), so the engine cannot be given this camera", err)
+		return outcome
+	}
+	sessionPath, err := t.sessionPathForEngine(session)
+	if err != nil {
+		outcome.SkippedReason = fmt.Sprintf("the stored Tuya session is not readable (%v), so the engine cannot be given this camera", err)
+		return outcome
+	}
+
+	// An empty request means "the resolution already stored for this camera", so
+	// the restore replays the user's own choice. Reading it does not write it.
+	resolved, err := t.resolveStartResolution(outcome.DeviceID, "")
+	if err != nil {
+		outcome.SkippedReason = fmt.Sprintf("the stored resolution could not be resolved: %v", err)
+		return outcome
+	}
+	outcome.Resolution = resolved
+
+	spec := tuyaengine.DeviceSpec{
+		DeviceID:    outcome.DeviceID,
+		SessionFile: sessionPath,
+		Resolution:  resolved,
+		Host:        t.host,
+	}
+	rtspURL, _, err := registrar.RegisterStream(spec)
+	if err != nil {
+		outcome.SkippedReason = fmt.Sprintf("the Tuya engine would not accept this camera: %v", err)
+		return outcome
+	}
+	if strings.TrimSpace(rtspURL) == "" {
+		outcome.SkippedReason = "the Tuya engine registered the camera but reported no RTSP URL for it"
+		return outcome
+	}
+	outcome.RTSPURL = rtspURL
+	outcome.Registered = true
+	return outcome
+}
+
+// storedDeviceID recovers the device id a stored profile token names.
+func storedDeviceID(profileToken string) (string, bool) {
+	if !tuyaengine.IsTuyaProfileToken(profileToken) {
+		return "", false
+	}
+	deviceID := strings.TrimPrefix(profileToken, tuyaengine.ProfileTokenPrefix)
+	if deviceID == "" || deviceID == profileToken {
+		return "", false
+	}
+	return deviceID, true
 }
 
 // resolveStartResolution decides which resolution a start should use and, when
