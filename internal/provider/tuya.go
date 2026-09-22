@@ -185,7 +185,35 @@ type Tuya struct {
 	session     *tuyaqr.Session
 	lastCheck   time.Time
 	lastCheckOK bool
-	lastErr     string
+	// lastCheckRejected / lastCheckUnknown are the OTHER TWO STATES of a
+	// THREE-STATE verdict, and they exist because collapsing them into
+	// lastCheckOK=false was a MEASURED defect: the periodic Tuya probe
+	// "failed" at 11:30:47 on 2026-09-22 with the SAME cookies that had
+	// succeeded at 11:27:14 and succeeded again at 11:33:07, and because
+	// "not verified" was read as "the cloud rejected these cookies", every
+	// Tuya stream was stood down and the install demanded a QR re-scan. The
+	// cost of that one conflation was three stand-downs, one of them 6.9
+	// HOURS of dead camera, each cleared only by a human scanning a QR.
+	//
+	//   lastCheckRejected - the cloud's OWN rejection signal (401 /
+	//                       USER_SESSION_LOSS / USER_SESSION_INVALID /
+	//                       not_login / no usable local credential). This is
+	//                       the ONLY thing that may stop a stream.
+	//   lastCheckUnknown  - the most recent probe could not conclude
+	//                       anything: a transport error, a timeout, a DNS
+	//                       failure, a body-read error or a non-401 HTTP
+	//                       status. It says NOTHING about the session.
+	//
+	// Both are updated only by a probe; lastCheckRejected is set only by a
+	// CONCLUSIVE probe, so a transport blip can neither claim validity nor
+	// un-latch a genuine rejection.
+	lastCheckRejected bool
+	lastCheckUnknown  bool
+	lastErr           string
+	// autoResumed counts the streams this provider brought back on its own
+	// after a successful probe cleared a rejection. It is the observable
+	// trace of the recovery half of the lifecycle.
+	autoResumed int
 	// account is the stored credential this provider has loaded: a label,
 	// never a secret.
 	account tuyaqr.Account
@@ -777,10 +805,18 @@ func (t *Tuya) SetResolution(deviceID, resolution string) (string, error) {
 
 // sessionRejected reports whether the stored session is dead, using the cached
 // verdict when it is still fresh. This is the cheap gate on the start path.
+//
+// Only a DEFINITIVE rejection counts. An inconclusive cached probe
+// (lastCheckUnknown) is not a rejection: it is retried instead of being read as
+// "dead", which is what keeps a transient failure from refusing a start.
 func (t *Tuya) sessionRejected() bool {
 	t.mu.Lock()
 	fresh := t.lastCheck != (time.Time{}) && time.Since(t.lastCheck) < t.validateTTL
-	rejected := fresh && !t.lastCheckOK
+	// Only a DEFINITIVE rejection counts. A fresh INCONCLUSIVE verdict is not a
+	// rejection, so it is reused as "not dead" rather than re-probed: that both
+	// lets the start through and keeps a burst of starts from becoming a burst
+	// of cloud probes.
+	rejected := fresh && t.lastCheckRejected
 	t.mu.Unlock()
 	if fresh {
 		return rejected
@@ -801,17 +837,38 @@ func (t *Tuya) probeSessionRejected() bool {
 	probeCtx, cancel := context.WithTimeout(context.Background(), sessionProbeTimeout)
 	defer cancel()
 	probeErr := client.Validate(probeCtx)
+	// THE SAME TRI-STATE RULE AS Session(). `SessionExpired` is the only thing
+	// that turns a probe failure into a rejection; everything else is
+	// inconclusive, and an inconclusive probe leaves the last definitive verdict
+	// (and therefore lastCheckOK) untouched rather than overwriting it with
+	// "not OK".
+	rejected := probeErr != nil && SessionExpired(probeErr)
 	t.mu.Lock()
+	wasRejected := t.lastCheckRejected
 	t.lastCheck = time.Now()
-	t.lastCheckOK = probeErr == nil
-	if probeErr != nil {
-		t.lastErr = probeErr.Error()
-	} else {
+	switch {
+	case probeErr == nil:
+		t.lastCheckOK = true
+		t.lastCheckRejected = false
+		t.lastCheckUnknown = false
 		t.lastErr = ""
+	case rejected:
+		t.lastCheckOK = false
+		t.lastCheckRejected = true
+		t.lastCheckUnknown = false
+		t.lastErr = probeErr.Error()
+	default:
+		t.lastCheckUnknown = true
+		t.lastErr = probeErr.Error()
 	}
 	t.mu.Unlock()
-	if probeErr != nil {
-		return SessionExpired(probeErr)
+	if rejected {
+		return true
+	}
+	if probeErr == nil && wasRejected {
+		// The cloud accepted the credential again: un-latch the streams the
+		// earlier rejection stood down, without a QR scan.
+		t.recoverAfterRejection("the start-path probe was accepted by the cloud")
 	}
 	return false
 }
@@ -964,6 +1021,30 @@ type SessionStatus struct {
 	// ReloginRequired is true only when a fresh QR scan is the way out.
 	ReloginRequired bool   `json:"reloginRequired"`
 	Detail          string `json:"detail,omitempty"`
+
+	// CheckFailed / CheckError are the ADDITIVE "could not verify" axes, and
+	// they exist so an inconclusive probe can be told apart from a rejection.
+	//
+	// CheckFailed is true only when the most recent probe could not reach a
+	// conclusion (transport error, timeout, DNS failure, body-read error, or a
+	// non-401 HTTP status). In that case Valid, CloudVerified and
+	// ReloginRequired all still carry the last DEFINITIVE verdict: the session
+	// is not reported as dead, because nothing proved it dead, and no QR scan
+	// is demanded, because a QR scan cannot fix a network blip. CheckError
+	// names the failure class in words, never a cookie value.
+	//
+	// It is additive: nothing that existed before reads it, and the
+	// reloginRequired contract is unchanged for a real rejection.
+	CheckFailed bool   `json:"checkFailed"`
+	CheckError  string `json:"checkError,omitempty"`
+	// CheckState is the tri-state verdict in one word: "valid", "invalid" or
+	// "unknown". It is derived, never probed, and it is the field the UI reads
+	// when it wants the classification rather than three booleans.
+	CheckState string `json:"checkState"`
+	// AutoResumedStreams counts the streams this provider restarted on its own
+	// once a successful probe cleared a previous rejection. It is how the
+	// self-healing half of the lifecycle is visible from outside the process.
+	AutoResumedStreams int `json:"autoResumedStreams,omitempty"`
 }
 
 // Session reports whether the stored session still works.
@@ -975,9 +1056,26 @@ type SessionStatus struct {
 // otherwise rather than being invented. The result is cached briefly so a
 // polling UI cannot hammer the cloud.
 //
-// When the cloud rejects the session, the session is marked invalid AND every
-// Tuya stream is stopped, because an HLS watchdog would otherwise restart ffmpeg
-// against a dead source forever.
+// THE VERDICT IS THREE-STATE, NOT TWO, and that distinction is the whole point
+// of this function. A probe can end in exactly three ways:
+//
+//	accepted     - the cloud answered an authenticated call. Valid.
+//	REJECTED     - the cloud's own rejection signal: HTTP 401, or a
+//	               success:false envelope carrying USER_SESSION_LOSS /
+//	               USER_SESSION_INVALID / not_login, or no usable local
+//	               credential at all. Only THIS may stop a stream, and only
+//	               this means the user must scan a new QR code.
+//	unverifiable - the probe could not reach a conclusion: a transport
+//	               error, a context deadline, a DNS failure, a body-read
+//	               error, or a non-401 HTTP status (a 5xx). The cloud never
+//	               said anything about the credential, so nothing is
+//	               concluded. Streams stay running.
+//
+// Collapsing "unverifiable" into "rejected" is the MEASURED bug this three-way
+// split fixes: the live install's own log shows the same cookies being accepted
+// at 11:27:14, "failing" at 11:30:47 and accepted again at 11:33:07, while the
+// old code treated that middle "failure" as a cloud rejection and stood every
+// Tuya stream down until the user re-scanned a QR code (6.9 hours in one case).
 func (t *Tuya) Session(ctx context.Context) (*SessionStatus, error) {
 	if !t.Configured() {
 		return &SessionStatus{Configured: false, Detail: "no Tuya session file is configured"}, nil
@@ -996,7 +1094,16 @@ func (t *Tuya) Session(ctx context.Context) (*SessionStatus, error) {
 	if err != nil {
 		t.mu.Lock()
 		t.lastCheck = time.Now()
+		// A credential that cannot even be assembled locally is a DEFINITIVE
+		// "a QR scan is the way out": there is nothing to probe with, and no
+		// probe could ever succeed with it. It is NOT a network error, so it is
+		// classified as rejected rather than unknown. It does NOT stop streams:
+		// only the cloud's own rejection of a credential that IS assemblable
+		// reaches degradeOnSessionLoss from this function, which keeps the
+		// "only a provider rejection may stop a stream" rule intact.
 		t.lastCheckOK = false
+		t.lastCheckRejected = true
+		t.lastCheckUnknown = false
 		t.lastErr = err.Error()
 		t.expiryOrigin = ""
 		status := t.statusLocked()
@@ -1018,23 +1125,67 @@ func (t *Tuya) Session(ctx context.Context) (*SessionStatus, error) {
 		t.persistSession(t.session)
 	}
 
+	// THE TRI-STATE CLASSIFICATION. `SessionExpired` is the predicate that
+	// distinguishes the cloud's own rejection signal from every other failure,
+	// using the typed ErrSessionExpired/ErrNoSession sentinels that
+	// tuyaqr.RefreshExpiry already returns for a 401.
+	rejected := validateErr != nil && SessionExpired(validateErr)
+
 	t.mu.Lock()
+	// wasRejected records whether the PREVIOUS verdict was a rejection, so a
+	// probe that is accepted after one can be recognised as a RECOVERY rather
+	// than as an ordinary success. It is read before the verdict is updated.
+	wasRejected := t.lastCheckRejected
 	t.lastCheck = time.Now()
-	t.lastCheckOK = validateErr == nil
-	if validateErr != nil {
+	if validateErr == nil {
+		t.lastCheckOK = true
+		t.lastCheckRejected = false
+		t.lastCheckUnknown = false
+		t.lastErr = ""
+	} else if rejected {
+		// DEFINITIVE. The cloud named the credential as dead; nothing else may
+		// reach this state.
+		t.lastCheckOK = false
+		t.lastCheckRejected = true
+		t.lastCheckUnknown = false
 		t.lastErr = validateErr.Error()
 	} else {
-		t.lastErr = ""
+		// INCONCLUSIVE. The probe proved nothing about the credential, so the
+		// last DEFINITIVE verdict (and therefore t.lastCheckOK) is left exactly
+		// as it was. Overwriting it with "not OK" is precisely the bug.
+		t.lastCheckUnknown = true
+		t.lastErr = validateErr.Error()
 	}
 	t.refreshExpiryLocked()
 	status := t.statusLocked()
-	sessionDead := !t.lastCheckOK
 	t.mu.Unlock()
 
-	if sessionDead {
+	if rejected {
 		// Degrade visibly and stop the bleed. This is deliberately done
 		// outside the lock: stopping a stream joins the ffmpeg process.
-		t.degradeOnSessionLoss(validateErr)
+		// ONLY a conclusive cloud rejection reaches here.
+		//
+		// The status is refreshed unconditionally (the verdict changed), but the
+		// STAND-DOWN itself only happens on the TRANSITION into a rejected
+		// state: re-sweeping the manager on every subsequent rejected probe
+		// would inflate the reported "streams stood down" count for streams the
+		// manager has already suspended, and it buys nothing, because starts are
+		// refused while the latch is set so no new Tuya stream can appear.
+		if !wasRejected {
+			t.degradeOnSessionLoss(validateErr)
+		} else {
+			t.recordRejection(validateErr)
+		}
+		t.mu.Lock()
+		status = t.statusLocked()
+		t.mu.Unlock()
+	} else if validateErr == nil && wasRejected {
+		// RECOVERY. The cloud has just accepted the credential that a previous
+		// probe called dead, and streams may be sitting suspended from that
+		// rejection. Bring them back without a QR scan: the credential was never
+		// discarded, so no human is needed here. Done outside the lock because
+		// resuming a stream joins the ffmpeg process.
+		t.recoverAfterRejection("a later probe was accepted by the cloud")
 		t.mu.Lock()
 		status = t.statusLocked()
 		t.mu.Unlock()
@@ -1058,16 +1209,45 @@ func (t *Tuya) refreshExpiryLocked() {
 	t.expiryOrigin = ""
 }
 
+// recordRejection updates the rejection bookkeeping WITHOUT sweeping the stream
+// manager. It is the "we are already stood down for this reason" half of
+// degradeOnSessionLoss, so a repeatedly-rejected probe refreshes the reason and
+// the timestamps instead of re-suspending streams that are already suspended.
+func (t *Tuya) recordRejection(cause error) {
+	t.mu.Lock()
+	t.lastCheckOK = false
+	t.lastCheckRejected = true
+	t.lastCheckUnknown = false
+	if cause != nil {
+		t.lastErr = cause.Error()
+	}
+	t.mu.Unlock()
+}
+
 // degradeOnSessionLoss marks the session dead and stops every Tuya stream.
 //
-// A dead Tuya session is unrecoverable without a human scan: retrying cannot
-// help. Leaving the streams running only makes the HLS watchdog restart ffmpeg
-// every hlsStallTimeout against a source that will never produce a frame, which
-// is both a reconnect storm in the log and pointless CPU. Stopping them is the
-// honest degradation, and it is what makes the one-click recovery cheap.
+// A dead Tuya session cannot be repaired locally: retrying with the same cookies
+// cannot help, and this install holds no credential that would let the process
+// mint a new one (the stored session is cookies only — there is no password, no
+// refresh token and no device fingerprint in it; see internal/tuyaqr). So
+// leaving streams running only makes the HLS watchdog restart ffmpeg every
+// hlsStallTimeout against a source that will never produce a frame: a reconnect
+// storm in the log and pointless CPU. Stopping them is the honest degradation,
+// and it is what makes the one-click recovery cheap.
+//
+// WHAT THIS IS NOT: it is no longer a permanent latch. If a LATER probe is
+// accepted by the cloud — which the live install's log shows happening within
+// minutes of a "failure" — recoverAfterRejection brings exactly these streams
+// back with no human involved. A stand-down is only ever justified by the
+// cloud's own rejection, and it is undone by the cloud accepting again.
 func (t *Tuya) degradeOnSessionLoss(cause error) {
 	t.mu.Lock()
 	t.lastCheckOK = false
+	// A stand-down is by definition a DEFINITIVE rejection: this function is
+	// only reached from the cloud-rejection branch, from a local credential that
+	// cannot be assembled, or from a deliberate logout.
+	t.lastCheckRejected = true
+	t.lastCheckUnknown = false
 	if cause != nil {
 		t.lastErr = cause.Error()
 	}
@@ -1136,6 +1316,24 @@ func (t *Tuya) ResumeStreams(ctx context.Context) (int, []string, error) {
 	// client so the engine and the next probe both read the new credentials.
 	t.Invalidate()
 
+	resumed, failures := t.resumeStreams(suspended)
+	if resumed > 0 && t.log != nil {
+		t.log.LogInfo("tuya", "tuya", fmt.Sprintf("resumed %d Tuya stream(s) after a successful re-login", resumed))
+	}
+	if len(failures) > 0 {
+		return resumed, failures, fmt.Errorf("provider: %d resumed, %d failed", resumed, len(failures))
+	}
+	return resumed, nil, nil
+}
+
+// resumeStreams restarts the given suspended streams with freshly resolved RTSP
+// URLs. It is shared by the re-login path (ResumeStreams) and the automatic
+// self-healing path (recoverAfterRejection) so both bring back exactly the same
+// cameras through exactly the same code.
+//
+// Each device is resumed independently: one camera the cloud has taken offline
+// must not prevent the others from coming back.
+func (t *Tuya) resumeStreams(suspended []models.StreamInfo) (int, []string) {
 	resumed := 0
 	var failures []string
 	for _, stream := range suspended {
@@ -1155,24 +1353,75 @@ func (t *Tuya) ResumeStreams(ctx context.Context) (int, []string, error) {
 		}
 		resumed++
 	}
-	if resumed > 0 && t.log != nil {
-		t.log.LogInfo("tuya", "tuya", fmt.Sprintf("resumed %d Tuya stream(s) after a successful re-login", resumed))
+	return resumed, failures
+}
+
+// recoverAfterRejection is the SELF-HEALING half of the session lifecycle: it is
+// called when a probe has just been ACCEPTED by the cloud after the previous
+// verdict was a rejection, and brings back the streams that rejection stood down.
+//
+// WHY THIS EXISTS: standing the streams down was, before this, a ONE-WAY LATCH.
+// The only way back was a human scanning a new QR code, because the only caller
+// of ResumeStreams was the post-login handler. That made a single bad verdict
+// cost hours (MEASURED: 6.9 hours of dead camera on 2026-09-22), and it is what
+// made an unreliable probe look like an intermittent fault. Recovering here is
+// safe precisely because the credential was never discarded: the suspended
+// streams kept their profile tokens, and the cloud has just accepted the SAME
+// stored cookies, so re-registering the devices and restarting them needs no
+// user input and no new credential.
+//
+// It deliberately does NOT Invalidate: nothing was re-scanned, and the session
+// the engine materializes is still the one the cloud just accepted.
+//
+// It is a no-op when the bridge or the stopper is missing, and when nothing is
+// suspended — so a recovery that is not needed costs one mutex read.
+func (t *Tuya) recoverAfterRejection(cause string) {
+	t.mu.Lock()
+	stopper := t.stopper
+	log := t.log
+	t.mu.Unlock()
+	if t.bridge == nil || stopper == nil {
+		return
+	}
+	suspended := stopper.SuspendedStreams(models.ProviderTuya)
+	if len(suspended) == 0 {
+		return
+	}
+	resumed, failures := t.resumeStreams(suspended)
+	t.mu.Lock()
+	t.autoResumed += resumed
+	t.mu.Unlock()
+	if log == nil {
+		return
+	}
+	if resumed > 0 {
+		log.LogInfo("tuya", "tuya", fmt.Sprintf(
+			"the stored Tuya session was accepted again (%s), so %d stood-down Tuya stream(s) were resumed automatically without a QR scan",
+			cause, resumed))
 	}
 	if len(failures) > 0 {
-		return resumed, failures, fmt.Errorf("provider: %d resumed, %d failed", resumed, len(failures))
+		log.LogWarn("tuya", "tuya", fmt.Sprintf(
+			"the session recovered but %d Tuya stream(s) could not be resumed: %s", len(failures), strings.Join(failures, "; ")))
 	}
-	return resumed, nil, nil
 }
 
 // statusLocked builds the status view. Caller holds t.mu or is single-threaded.
 func (t *Tuya) statusLocked() *SessionStatus {
 	status := &SessionStatus{
-		Configured:      true,
-		FilePresent:     t.session != nil,
-		CloudVerified:   t.lastCheckOK,
-		Valid:           t.session != nil && t.lastCheckOK,
-		ExpirySource:    "unknown",
-		CacheTTLSeconds: int(t.validateTTL.Seconds()),
+		Configured: true,
+		// FilePresent / CloudVerified / Valid all describe the last DEFINITIVE
+		// verdict, deliberately unchanged by an inconclusive probe.
+		FilePresent:        t.session != nil,
+		CloudVerified:      t.lastCheckOK,
+		Valid:              t.session != nil && t.lastCheckOK,
+		ExpirySource:       "unknown",
+		CacheTTLSeconds:    int(t.validateTTL.Seconds()),
+		CheckFailed:        t.lastCheckUnknown,
+		CheckState:         t.checkStateLocked(),
+		AutoResumedStreams: t.autoResumed,
+	}
+	if t.lastCheckUnknown {
+		status.CheckError = t.checkErrorTextLocked()
 	}
 	status.StoreKind, status.StoreLocation, status.StoreReason, status.StoreFallbackFrom,
 		status.StoreFileModes, status.Accounts = t.storeStatusLocked()
@@ -1203,19 +1452,112 @@ func (t *Tuya) statusLocked() *SessionStatus {
 			status.LastRefresh = &last
 		}
 	}
-	if !t.lastCheckOK {
+	if !t.lastCheckOK && !t.lastCheckUnknown {
 		status.ReloginRequired = t.session != nil
 	}
 	return t.buildDetail(status)
 }
 
+// checkStateLocked reports the one-word tri-state verdict of the LATEST probe:
+// "valid", "invalid", or "unknown".
+//
+// It is the state of the CHECK, not of the session: "unknown" means the probe
+// could not reach a conclusion (CheckFailed), and it is the only value a
+// non-conclusive probe can produce. The last DEFINITIVE verdict is reported
+// separately by Valid/CloudVerified, so a response can honestly say
+// `valid:true, checkFailed:true, checkState:"unknown"` — "the last thing we can
+// prove is that it was valid, and the newest check could not complete".
+func (t *Tuya) checkStateLocked() string {
+	switch {
+	case t.lastCheckUnknown:
+		return "unknown"
+	case t.lastCheckOK:
+		return "valid"
+	default:
+		return "invalid"
+	}
+}
+
+// checkErrorTextLocked describes, in one operator-facing sentence, WHY the probe
+// could not verify the session. It classifies the failure rather than echoing
+// the raw error, which is what keeps a JSON response from ever carrying
+// credential-adjacent material: only the CLASS of failure leaves the process,
+// and the raw text stays in lastErr for the log line.
+func (t *Tuya) checkErrorTextLocked() string {
+	return "the session could not be verified: " + classifyProbeFailure(t.lastErr)
+}
+
+// classifyProbeFailure names the class of an inconclusive probe failure in
+// words. The classification is by symptom, not by error type, because a
+// transport error reaches the provider as an untyped error from net/http.
+func classifyProbeFailure(errText string) string {
+	lower := strings.ToLower(errText)
+	switch {
+	case strings.Contains(lower, "context deadline exceeded"),
+		strings.Contains(lower, "timeout"),
+		strings.Contains(lower, "timed out"):
+		return "the cloud did not answer in time"
+	case strings.Contains(lower, "no such host"),
+		strings.Contains(lower, "lookup "),
+		strings.Contains(lower, "dns"),
+		strings.Contains(lower, "server misbehaving"):
+		return "the cloud host could not be resolved"
+	case strings.Contains(lower, "connection reset"),
+		strings.Contains(lower, "connection refused"),
+		strings.Contains(lower, "broken pipe"),
+		strings.Contains(lower, "unexpected eof"),
+		strings.Contains(lower, "eof"),
+		strings.Contains(lower, "dial tcp"),
+		strings.Contains(lower, "connect: "):
+		return "the network connection to the cloud failed"
+	case strings.Contains(lower, "refused request"):
+		return "the cloud answered with a server error rather than a verdict"
+	default:
+		return "the cloud probe did not complete"
+	}
+}
+
 // buildDetail fills ReloginRequired and Detail from the facts already gathered.
+//
+// THE ORDER OF THESE CASES IS THE FIX. An inconclusive probe (checkFailed) is
+// answered BEFORE the "not verified" case, so a network blip can never be
+// dressed up as "the stored Tuya session was rejected by the cloud; scan a new
+// QR code" — a QR scan cannot repair a transient failure, and demanding one is
+// exactly the misdiagnosis this change removes.
 func (t *Tuya) buildDetail(status *SessionStatus) *SessionStatus {
 	switch {
 	case t.session == nil:
 		status.ReloginRequired = true
 		status.Detail = "no usable stored session" + detailSuffix(t.lastErr)
+	case t.lastCheckRejected && t.lastCheckUnknown:
+		// REJECTED, and the newest probe could not confirm it either way. Both
+		// facts are stated, because both matter: the rejection is real and only
+		// a QR scan gets the cameras back IMMEDIATELY, while the automatic
+		// recovery may get them back with no human at all if the cloud starts
+		// accepting these cookies again. Saying only "scan a QR code" hid the
+		// second path and is how a 6.9-hour outage was created from a verdict the
+		// cloud itself contradicted two minutes later.
+		status.ReloginRequired = true
+		status.Detail = "the stored Tuya session was rejected by the cloud at the last conclusive check; " +
+			"the newest check could not verify it either (" + classifyProbeFailure(t.lastErr) + "). " +
+			"Scan a new QR code to bring the cameras back now, or do nothing: if the cloud accepts these " +
+			"cookies again the stood-down streams are resumed automatically"
+	case t.lastCheckRejected:
+		// DEFINITIVE: the cloud named these cookies as dead.
+		status.ReloginRequired = true
+		status.Detail = "the stored Tuya session was rejected by the cloud; scan a new QR code"
+	case t.lastCheckUnknown:
+		// INCONCLUSIVE: the cloud never rejected anything, so no QR scan is
+		// demanded and ReloginRequired stays exactly as the last definitive
+		// verdict left it. The streams keep running.
+		status.Detail = "the session could not be verified (" + classifyProbeFailure(t.lastErr) +
+			"); the stored Tuya session was NOT rejected and the streams keep running" + t.retryNoteLocked(status)
+		if status.Valid {
+			status.Detail = "the stored Tuya session was last verified by the cloud; " + status.Detail
+		}
 	case !t.lastCheckOK:
+		// A definitive negative that did not come from a probe (no probe has
+		// run yet in this process, or the last one was never conclusive).
 		status.ReloginRequired = true
 		status.Detail = "the stored Tuya session was rejected by the cloud; scan a new QR code"
 	default:
@@ -1226,6 +1568,22 @@ func (t *Tuya) buildDetail(status *SessionStatus) *SessionStatus {
 		}
 	}
 	return status
+}
+
+// retryNoteLocked adds the self-healing half to an inconclusive detail, so the
+// operator is told the situation resolves on its own rather than being left to
+// guess whether a human must act.
+func (t *Tuya) retryNoteLocked(status *SessionStatus) string {
+	if t.autoResumed > 0 {
+		return fmt.Sprintf("; %d stream(s) have already been brought back automatically after an earlier recovery", t.autoResumed)
+	}
+	if t.stopper != nil && len(t.stopper.SuspendedStreams(models.ProviderTuya)) > 0 {
+		return "; the stood-down streams will be resumed automatically as soon as a probe succeeds again"
+	}
+	if status != nil && !status.Valid {
+		return "; nothing proves the session is dead, and no QR scan is needed until the cloud actually rejects it"
+	}
+	return "; the next successful probe clears this and no QR scan is needed"
 }
 
 // detailSuffix appends a bounded, secret-free reason when there is one.
@@ -1356,6 +1714,8 @@ func (t *Tuya) Invalidate() {
 	t.session = nil
 	t.lastCheck = time.Time{}
 	t.lastCheckOK = false
+	t.lastCheckRejected = false
+	t.lastCheckUnknown = false
 	t.lastErr = ""
 	t.expiryOrigin = ""
 }

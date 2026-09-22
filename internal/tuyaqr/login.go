@@ -742,11 +742,58 @@ func (c *Client) postWithHeaders(ctx context.Context, hc *http.Client, path stri
 		}
 	}
 	if resp.StatusCode != http.StatusOK {
+		// A non-200, non-401 status is a SERVER-side condition (a 5xx, a 403
+		// from an edge, a redirect chain) and NOT the cloud's own rejection of
+		// these cookies, so it is an *APIError and not a *SessionExpiredError.
+		// Callers must treat it as inconclusive: it says nothing about whether
+		// the credential is still live.
 		var e apiEnvelope
 		_ = json.Unmarshal(raw, &e)
 		return raw, resp.StatusCode, setCookies, &APIError{StatusCode: resp.StatusCode, ErrorCode: e.ErrCode, ErrorMsg: firstNonEmpty(e.ErrMsg, strings.TrimSpace(string(raw)))}
 	}
+	// HTTP 200 carrying a rejection ENVELOPE is the cloud's own rejection: the
+	// MEASURED Tuya API answers `{"success":false,"errorCode":"USER_SESSION_LOSS",
+	// "status":"not_login"}` with a 200 on some endpoints (see postInto, which
+	// has always classified this shape). Without this check the SAME server
+	// verdict was typed one way through postInto and another way through the
+	// probe, and the probe's answer is the one that decides whether a stream is
+	// stopped — so the classification belongs here too.
+	if env, ok := sessionRejectionEnvelope(raw); ok {
+		return raw, resp.StatusCode, setCookies, &SessionExpiredError{
+			StatusCode: resp.StatusCode, ErrorCode: env.ErrCode, ErrorMsg: env.ErrMsg,
+		}
+	}
 	return raw, resp.StatusCode, setCookies, nil
+}
+
+// sessionRejectionEnvelope reports whether a 200 body carries the cloud's own
+// "these cookies are no longer logged in" signal, and if so returns the envelope
+// so the typed error can name it.
+//
+// The three markers are the ones the Tuya cloud actually uses and the ones
+// postInto has always recognised: errorCode USER_SESSION_LOSS or
+// USER_SESSION_INVALID, or status "not_login". They are matched CASE-INSENSITIVELY
+// on the errorCode, because the cloud's casing is not contractual.
+//
+// It is deliberately conservative: a body that does not parse as the envelope,
+// or that has success:true, is NOT a rejection. An unparseable body is an
+// inconclusive probe, never a dead session.
+func sessionRejectionEnvelope(raw []byte) (apiEnvelope, bool) {
+	var env apiEnvelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return env, false
+	}
+	if env.Success {
+		return env, false
+	}
+	switch strings.ToUpper(strings.TrimSpace(env.ErrCode)) {
+	case "USER_SESSION_LOSS", "USER_SESSION_INVALID":
+		return env, true
+	}
+	if strings.EqualFold(strings.TrimSpace(env.Status), "not_login") {
+		return env, true
+	}
+	return env, false
 }
 
 // postInto posts and decodes the envelope's result into out, translating cloud

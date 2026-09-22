@@ -72,31 +72,76 @@ const tuyaSessionCheckInterval = 3 * time.Minute
 // are stood down, instead of being left for the HLS watchdog to restart against
 // a dead source.
 //
+// THE LOG WORDING IS PART OF THE FIX. A probe has THREE outcomes, and only one of
+// them is "the session is invalid":
+//
+//   - accepted      -> nothing to say (the loop is silent, as before);
+//   - REJECTED      -> "session invalid" and the streams have been stood down;
+//   - unverifiable  -> "could not check". NOT "invalid", and NOT a stand-down:
+//     a transport blip says nothing about the credential, and reporting it as
+//     "session invalid" is what made the 2026-09-22 fault look like a dead
+//     session (the same cookies were accepted 2m20s later).
+//
 // It is read-mostly and cheap: the provider caches the verdict for its own
 // validateTTL, and the check itself is one authenticated call.
 func tuyaSessionWatchdog(t *provider.Tuya, log *logger.Logger) {
 	ticker := time.NewTicker(tuyaSessionCheckInterval)
 	defer ticker.Stop()
 	for range ticker.C {
-		if !t.Configured() {
+		if !tuyaSessionWatchdogOnce(t, log) {
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		status, err := t.Session(ctx)
-		cancel()
-		if err != nil {
-			log.LogWarn("tuya", "tuya", "periodic Tuya session check failed: "+err.Error())
-			continue
-		}
-		if status == nil || status.Valid {
-			continue
-		}
-		// Session(), not this loop, is what stands the streams down; log only
-		// the transition-worthy fact, never cookie material.
-		log.LogWarn("tuya", "tuya", fmt.Sprintf(
-			"periodic Tuya session check: session invalid (filePresent=%t cloudVerified=%t); streams stood down until a new QR scan",
-			status.FilePresent, status.CloudVerified))
 	}
+}
+
+// tuyaSessionWatchdogOnce performs ONE periodic check and reports whether the
+// loop should continue. It returns false only when the provider is no longer
+// configured, which is the loop's existing stop condition.
+//
+// It is split out of the loop so the LOG WORDING — which is operator-facing
+// behaviour, not decoration — can be tested without waiting three minutes for a
+// ticker. The wording is the part of this feature that was wrong: an
+// unverifiable probe used to be announced as "session invalid".
+func tuyaSessionWatchdogOnce(t *provider.Tuya, log *logger.Logger) bool {
+	if !t.Configured() {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	status, err := t.Session(ctx)
+	cancel()
+	if err != nil {
+		log.LogWarn("tuya", "tuya", "periodic Tuya session check failed: "+err.Error())
+		return true
+	}
+	if status == nil {
+		return true
+	}
+	if status.CheckFailed {
+		// INCONCLUSIVE — whether or not an earlier probe was conclusive. This
+		// is the branch that did not exist before, and its absence is what cost
+		// 6.9 hours of dead camera: an unverifiable probe was announced as
+		// "session invalid". Nothing was stood down, so the message must not
+		// even imply it was.
+		if status.Valid {
+			log.LogWarn("tuya", "tuya", fmt.Sprintf(
+				"periodic Tuya session check: could not check (%s); the session was last verified by the cloud, the streams keep running and no QR scan is needed",
+				status.CheckError))
+			return true
+		}
+		log.LogWarn("tuya", "tuya", fmt.Sprintf(
+			"periodic Tuya session check: could not check the session (%s); nothing was deemed invalid, no stream was stood down and no QR scan is needed",
+			status.CheckError))
+		return true
+	}
+	if status.Valid {
+		return true
+	}
+	// Session(), not this loop, is what stands the streams down; log only
+	// the transition-worthy fact, never cookie material.
+	log.LogWarn("tuya", "tuya", fmt.Sprintf(
+		"periodic Tuya session check: session invalid (filePresent=%t cloudVerified=%t); streams stood down until a new QR scan",
+		status.FilePresent, status.CloudVerified))
+	return true
 }
 
 // tuyaStoreReason explains, in one operator-facing sentence, where the Tuya

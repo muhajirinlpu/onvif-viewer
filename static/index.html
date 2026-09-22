@@ -555,6 +555,18 @@
                             cloud {{ tuyaSession.cloudVerified ? 'verified' : 'not verified' }} &middot;
                             expiry {{ tuyaSession.expiryKnown ? 'known' : 'unknown' }}
                           </span>
+                          <!-- M13: "could not verify" is NOT "invalid". A probe
+                               that could not reach the cloud (a transport error,
+                               a timeout, a 5xx) proves nothing about the stored
+                               session, so the streams keep running and no QR
+                               scan is demanded. Only the cloud's own rejection
+                               may ever say otherwise; that path is
+                               tuyaSession.reloginRequired below. -->
+                          <span v-if="tuyaSession.checkFailed" class="tuya-check-unknown">
+                            &middot; <span class="tuya-check-failed">the last check could not verify the session</span>
+                            <span v-if="tuyaSession.checkError"> ({{ tuyaSession.checkError }})</span>
+                            &mdash; nothing was deemed invalid and the cameras keep running
+                          </span>
                           <!-- M8: WHERE the credential is kept. A credential in
                                the project's own database is still a stored
                                credential, and the panel says so instead of
@@ -566,6 +578,25 @@
                             &middot; last checked {{ tuyaSession.checkedSecondsAgo }}s ago
                             <span v-if="tuyaSession.cacheTtlSeconds"> (cached for {{ tuyaSession.cacheTtlSeconds }}s)</span>
                           </span>
+                        </span>
+                      </span>
+                    </div>
+                  </div>
+                  <!-- M13: the unverified-but-not-invalid case for a session
+                       that has never been verified in this process either. It
+                       exists so the UI has a branch to render that is neither
+                       "verified" nor "dead": no re-login is offered, because
+                       nothing was rejected. -->
+                  <div v-else-if="tuyaSession.checkFailed"
+                    class="p-4 rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
+                    <div class="flex items-start">
+                      <i class="fas fa-circle-question mr-2 mt-0.5"></i>
+                      <span class="text-sm">
+                        <span class="tuya-check-unknown">The Tuya session could not be verified</span>
+                        <span class="block text-xs mt-1">
+                          {{ tuyaSession.checkError || 'the cloud probe did not complete' }}.
+                          Nothing was rejected, so no re-login is needed: the cameras keep streaming
+                          and the next successful check clears this on its own.
                         </span>
                       </span>
                     </div>
