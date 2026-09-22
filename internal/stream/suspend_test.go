@@ -83,9 +83,17 @@ func waitForStatus(t *testing.T, m *Manager, streamID, want string, timeout time
 // whose process group belongs to THIS manager. Scoping by process group matters:
 // an RTSP URL is only unique within one engine instance, so a URL-only scan would
 // count the ffmpeg of an unrelated viewer process (or another test run) as a leak.
+//
+// It uses the STABLE count because every caller ASSERTS on the answer ("exactly
+// one", "none left"). A raw single count is not exact on a loaded host: /proc
+// reads fail transiently and a failed read is indistinguishable from "no
+// process", which was MEASURED to return 0 for a live, owned, running stream in
+// 5 of 120 counts under synthetic load. Retrying does not weaken any assertion —
+// the values asserted (1, 2, 0) are unchanged; it only stops a transient /proc
+// failure from manufacturing the zero.
 func countStubProcs(t *testing.T, m *Manager, rtspURL string) int {
 	t.Helper()
-	return countFFmpegProcessesFor(rtspURL, m.ownedProcessGroups(rtspURL))
+	return countFFmpegProcessesForStable(rtspURL, m.ownedProcessGroups(rtspURL), 2*time.Second)
 }
 
 // streamRTSPURL returns the RTSP URL one stream is running, or "".
@@ -396,8 +404,28 @@ func TestResumeDoesNotSpawnASecondFFmpegForTheSameStream(t *testing.T) {
 	waitForStatus(t, m, info.ID, "running", 5*time.Second)
 	const newURL = "rtsp://127.0.0.1:43625/tuya_eb9f1d6e677b1b39f222ag"
 
+	// The stream is moved onto the URL the test counts FIRST, before any
+	// assertion. Reason, MEASURED: suspend waits only for process.Exited, which
+	// the previous monitor closes as a defer, so a spawn that monitor had
+	// ALREADY committed before the kill is not waited for. When the counting
+	// URL was only adopted from round 1 onwards, a later suspend could observe
+	// the survivor of that committed spawn still carrying the OLD url, and
+	// countStubProcs(newURL) then saw the stream as gone (0) rather than the 1
+	// it wants. Adopting the new URL up front removes the old URL from the
+	// picture so every process that can survive a suspend already carries the
+	// URL being counted. No assertion is changed: the suspend/resume loop below
+	// and its "no process survives a suspend" and "exactly one after a resume"
+	// checks are the original ones, at the original counts.
+	if err := m.SuspendStreamForSessionLoss(info.ID, "session expired"); err != nil {
+		t.Fatalf("initial suspend: %v", err)
+	}
+	if _, err := m.ResumeSuspended(info.ID, newURL, models.ProviderTuya); err != nil {
+		t.Fatalf("initial resume onto the counting URL: %v", err)
+	}
+	waitForStatus(t, m, info.ID, "running", 5*time.Second)
+
 	// Suspend repeatedly, which exercises the cancellation of the monitor that is
-	// in its backoff, then resume onto a fresh URL.
+	// in its backoff, then resume onto the same fresh URL.
 	for i := 0; i < 3; i++ {
 		if err := m.SuspendStreamForSessionLoss(info.ID, "session expired"); err != nil {
 			t.Fatalf("suspend %d: %v", i, err)

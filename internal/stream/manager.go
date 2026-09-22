@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -219,7 +220,6 @@ type Process struct {
 	HLSURL          string
 	Done            chan bool
 	Exited          chan struct{}
-	closed          sync.Once
 	logger          *logger.Logger
 	reconnectCount  int
 	shouldReconnect bool
@@ -233,7 +233,36 @@ type Process struct {
 	// restart it later. Used by the M6 Tuya session-loss degradation.
 	suspended       bool
 	suspendedReason string
-	mutex           sync.RWMutex
+	// runID identifies the monitor run that OWNS Done/Exited. It is allocated
+	// once by the code that created this Process and again by every resume,
+	// ALWAYS under mutex, and never mutated while a monitor that could still be
+	// exiting is running.
+	//
+	// WHY it exists: a monitor run used to protect its own Done close with
+	// process.closed, a sync.Once stored ON THE PROCESS. A resume replaced that
+	// Process value (`process.closed = sync.Once{}`), which meant the new run
+	// and the old run shared one Once variable, and the old run can win that
+	// race by unbounded amounts: suspend returns as soon as its own wait
+	// finishes, and any spawn the returning run had already committed is not
+	// waited for at all. Whichever run then called the shared Once second
+	// tripped `sync: unlock of unlocked mutex` (reproduced, see
+	// TestAMonitorRunClosingDoneCannotResetTheNextRunsOnce). Keying the flag on
+	// a per-run identity instead makes the reset structurally impossible: a run
+	// only ever shares its Once with ITSELF.
+	runID uint64
+	// runsClosed is the per-run Done-close flag recorded under runID. It must
+	// only be read or written with mutex held: sync.Once is not safe for
+	// concurrent use, so sharing one between a returning run and a live one is
+	// the defect this replaces.
+	runsClosed map[uint64]*sync.Once
+	// pgid is the process group of this stream's current ffmpeg, recorded at
+	// start. With Setpgid the child is its own group leader, so this equals the
+	// child's pid. It is cached rather than re-read from /proc so that a
+	// transient /proc failure cannot make the manager lose track of a group it
+	// owns (MEASURED: that failure made a leak check report a live ffmpeg as
+	// absent). Guarded by mutex.
+	pgid  int
+	mutex sync.RWMutex
 }
 
 // Manager manages multiple video streams
@@ -546,6 +575,8 @@ func (sm *Manager) startStreamWithOptions(profileToken, rtspURL string, provider
 		Command:         nil,
 		Done:            make(chan bool),
 		Exited:          make(chan struct{}),
+		runsClosed:      make(map[uint64]*sync.Once),
+		runID:           nextRunID(),
 		logger:          sm.logger,
 		outputPath:      streamOutputPath,
 		shouldReconnect: true,
@@ -1071,18 +1102,67 @@ func ffmpegExecutable(override string) string {
 	return override
 }
 
+// nextRunID allocates a monitor-run identity. It is process-wide and monotonic
+// so two Process values can never collide on a run identity, even if a stream
+// id were somehow reused within one test binary.
+var runIDCounter atomic.Uint64
+
+func nextRunID() uint64 { return runIDCounter.Add(1) }
+
+// closeDoneForRun closes the Done channel that runID owns, exactly once for that
+// run and only while that run is still the stream's current one.
+//
+// The Once is looked up under the process lock and is created by whichever
+// caller arrives first for a given run, so two runs can never share one
+// sync.Once. Sharing one is what produced the reproduced
+// `sync: unlock of unlocked mutex` panic: a resume zeroed the Once that a
+// returning run still held a pointer to.
+//
+// The early return when runID has been superseded is what bounds runsClosed.
+// It is not a lost wakeup: the only way a run becomes superseded is that the
+// suspend or stop path already closed that run's Done (both call this with the
+// run that was current when they took the lock), which is precisely the signal
+// the run's backoff select is waiting on. Refusing the superseded run's own
+// deferred call therefore drops nothing, and it keeps the map at one entry per
+// live run instead of one per resume.
+func (process *Process) closeDoneForRun(runID uint64, done chan bool) {
+	// The only reason this is a lookup rather than a fresh &sync.Once{} is so
+	// that the monitor's deferred close and a stop path's close for the SAME
+	// run share one flag. A superseded run's two closers must not share one
+	// with each other nor with the new run's, and the map is keyed by run, so
+	// neither can happen.
+	process.mutex.Lock()
+	if process.runID != runID {
+		process.mutex.Unlock()
+		return
+	}
+	if process.runsClosed == nil {
+		process.runsClosed = make(map[uint64]*sync.Once)
+	}
+	once, ok := process.runsClosed[runID]
+	if !ok {
+		once = &sync.Once{}
+		process.runsClosed[runID] = once
+	}
+	process.mutex.Unlock()
+	once.Do(func() { close(done) })
+}
+
 // monitorStreamWithReconnect monitors a stream and handles reconnection
 func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
-	// Capture the channels THIS run owns. A resumed stream is given fresh Done
-	// and Exited channels, so a late-deferring previous run must close its own
-	// and never whatever the field happens to point at later.
+	// Capture the channels THIS run owns, together with the run identity that
+	// owns the flag guarding their close. A resumed stream is given fresh
+	// Done/Exited channels AND a fresh runID, so a late-deferring previous run
+	// closes its own channels through its own Once and can never touch the
+	// channels or the Once of the run that replaced it.
 	process.mutex.RLock()
 	done := process.Done
 	exited := process.Exited
+	runID := process.runID
 	process.mutex.RUnlock()
 
 	defer close(exited)
-	defer process.closed.Do(func() { close(done) })
+	defer process.closeDoneForRun(runID, done)
 
 	for {
 		startedAt := time.Now()
@@ -1092,7 +1172,15 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 		cmd, err := sm.startFFmpegProcess(process, hlsDir)
 		if err == nil {
 			watchDone := make(chan struct{})
-			go sm.watchHLSOutput(process, cmd, hlsDir, startedAt, watchDone)
+			// The run's OWN done channel is passed in rather than re-read from
+			// the process. A resume replaces process.Done, and reading that
+			// field here raced the write under -race (MEASURED: DATA RACE in
+			// watchHLSOutput reading process.Done vs resumeSuspendedProcess
+			// writing it). The run already holds its own channel in `done`, and
+			// semantically it is the correct one: the watchdog exists only to
+			// restart THIS run's ffmpeg, so the cancellation that should stop it
+			// is this run's own.
+			go sm.watchHLSOutput(process, cmd, hlsDir, startedAt, watchDone, done)
 			err = cmd.Wait()
 			close(watchDone)
 			if writer, ok := cmd.Stdout.(*filteredLogWriter); ok {
@@ -1110,6 +1198,7 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 			}
 			process.mutex.Lock()
 			process.Command = nil
+			process.pgid = 0
 			process.reconnectCount = nextReconnectFailureCount(process.reconnectCount, runDuration)
 			process.mutex.Unlock()
 		} else {
@@ -1212,7 +1301,11 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 
 // watchHLSOutput restarts a live FFmpeg process when its playlist stops
 // advancing, preventing clients from replaying the final cached segments.
-func (sm *Manager) watchHLSOutput(process *Process, cmd *exec.Cmd, hlsDir string, startedAt time.Time, done <-chan struct{}) {
+//
+// runDone is the Done channel of the monitor run that started this ffmpeg. It is
+// passed in rather than read from process.Done, because a resume replaces that
+// field and reading it here raced the write.
+func (sm *Manager) watchHLSOutput(process *Process, cmd *exec.Cmd, hlsDir string, startedAt time.Time, done <-chan struct{}, runDone <-chan bool) {
 	playlist := filepath.Join(hlsDir, "stream.m3u8")
 	ticker := time.NewTicker(hlsHealthInterval)
 	defer ticker.Stop()
@@ -1246,7 +1339,7 @@ func (sm *Manager) watchHLSOutput(process *Process, cmd *exec.Cmd, hlsDir string
 			return
 		case <-done:
 			return
-		case <-process.Done:
+		case <-runDone:
 			return
 		}
 	}
@@ -1378,11 +1471,46 @@ func (sm *Manager) startFFmpegProcess(process *Process, hlsDir string) (*exec.Cm
 		return nil, fmt.Errorf("failed to start FFmpeg: %v", err)
 	}
 	process.Command = cmd
+	// The child is its own group leader (Setpgid), so its group id is its pid.
+	// Record it here while it is certain, so the ownership check never depends
+	// on a later /proc read.
+	process.pgid = cmd.Process.Pid
 	process.Info.Status = "running"
 	process.Info.ReconnectDelay = ""
 	sm.logger.LogInfo(process.Info.ID, "system", "FFmpeg process started successfully")
-	go sm.publishState(process, "running", "FFmpeg is running")
+	// The state broadcast is deferred to a goroutine because this function holds
+	// process.mutex and publishState takes it, so publishing here would
+	// self-deadlock. It must NOT be an unconditional publish: between this
+	// start and the goroutine running, a suspend can set the stream to
+	// needs_relogin, and an unguarded publish then advertises a SUSPENDED stream
+	// as "running" again. MEASURED: that is the failure
+	// TestSuspendedStreamDoesNotHotLoop caught (1 of 20 runs under verified
+	// load; 0 of 20 idle), at its "status changed to running; a suspended
+	// stream must not be restarted" assertion. The guard below makes the
+	// publish conditional on the run still being current and the stream still
+	// live, so whichever of the two gets the lock last leaves the correct state.
+	runID := process.runID
+	go sm.publishRunningIfCurrent(process, runID)
 	return cmd, nil
+}
+
+// publishRunningIfCurrent publishes "running" for one monitor run, but only while
+// that run is still the stream's current run and the stream is still meant to be
+// live. It is the guarded form of publishState(process, "running", ...) for the
+// post-start broadcast, which is asynchronous and can otherwise land after a
+// suspend has already stood the stream down.
+func (sm *Manager) publishRunningIfCurrent(process *Process, runID uint64) {
+	process.mutex.Lock()
+	if process.runID != runID || process.suspended || !process.shouldReconnect || process.Command == nil {
+		process.mutex.Unlock()
+		return
+	}
+	const detail = "FFmpeg is running"
+	process.Info.Status = "running"
+	process.Info.Detail = redactSensitiveText(detail)
+	info := process.Info
+	process.mutex.Unlock()
+	sm.broadcastLog(sm.stateEntry(info, detail))
 }
 
 func (sm *Manager) handleFFmpegLine(process *Process, source, line string) {
@@ -1484,9 +1612,18 @@ func (sm *Manager) stopStream(streamID string, removeConfig bool) error {
 	stream.shouldReconnect = false
 	stream.Info.Status = "stopping"
 	cmd := stream.Command
-	stream.closed.Do(func() { close(stream.Done) })
+	done := stream.Done
+	runID := stream.runID
 	profileToken := stream.Info.ProfileToken
 	stream.mutex.Unlock()
+	// Close Done through the SAME per-run flag the monitor's deferred close
+	// uses. A second, independent Once here would let this path and the
+	// returning monitor both close the one channel, which panics on a
+	// double close; sharing the flag means whichever gets there first closes it
+	// and the other is a no-op. Done is deliberately NOT closed while the
+	// process lock is held: the flag is only shared, not transferred, and the
+	// monitor needs no lock to reach it.
+	stream.closeDoneForRun(runID, done)
 	if removeConfig {
 		if err := sm.logger.DeleteStreamConfig(profileToken); err != nil {
 			sm.logger.LogError(streamID, "system", fmt.Sprintf("Failed to remove saved stream configuration: %v", err))
@@ -1637,6 +1774,33 @@ func (sm *Manager) StopStreamsForProvider(provider models.ProviderKind) (int, er
 // the same host can legitimately hold the same loopback URL — so a URL-only scan
 // would report a foreign process as a leak. Every ffmpeg this manager spawns is
 // put in its own process group (Setpgid), which makes the pgid the honest owner.
+//
+// IT IS NOT EXACT ON A BUSY HOST, AND CALLERS MUST NOT TREAT A SINGLE COUNT AS
+// PROOF. Two distinct /proc races are MEASURED:
+//
+//  1. A transient failed /proc read is indistinguishable from "not our process",
+//     so a live stream can count 0. MEASURED under load: 5 of 120 single counts
+//     returned 0 with ownedLen=1 and the child alive, recovering within 10ms; a
+//     30-sweep probe budget recorded 2 failures in 6150 probes. That is why this
+//     function alone must never back an assertion — use
+//     countFFmpegProcessesForStable there.
+//
+//  2. A process is matched by its /proc/<pid>/cmdline, and between fork() and
+//     execve() a child still reports its PARENT's cmdline. Any process the owned
+//     ffmpeg forks therefore becomes a second match for as long as that window
+//     lasts. MEASURED: the test stub is a shell running `while true; do sleep 1;
+//     done`, so once a second its forked `sleep 1` child counted as a second
+//     owned ffmpeg — same process group, cmdline identical to the stub's, then
+//     flipping to "sleep 1" once the exec completed. On a real ffmpeg this is a
+//     much narrower window, but the same shape exists for anything ffmpeg forks.
+//
+// The fork/exec half is handled here, by requiring the candidate to be the
+// process-group LEADER. Every stream's own ffmpeg is spawned with Setpgid, so the
+// process this function is supposed to find is always the leader of its group;
+// a forked child is in the group but is not its leader, and so cannot be counted
+// while it is briefly wearing its parent's cmdline. That removes the phantom
+// without weakening the leak check: a leaked ffmpeg from a superseded monitor is
+// itself a group leader, so it is still counted.
 func countFFmpegProcessesFor(rtspURL string, ownedPGIDs map[int]bool) int {
 	if rtspURL == "" || len(ownedPGIDs) == 0 {
 		return 0
@@ -1654,7 +1818,13 @@ func countFFmpegProcessesFor(rtspURL string, ownedPGIDs map[int]bool) int {
 		if err != nil {
 			continue
 		}
-		if pgid, err := syscall.Getpgid(pid); err != nil || !ownedPGIDs[pgid] {
+		pgid, err := syscall.Getpgid(pid)
+		if err != nil || !ownedPGIDs[pgid] {
+			continue
+		}
+		// Only the group leader can be a stream's own ffmpeg; a forked child is
+		// in the group but is not its leader. See point 2 above.
+		if pgid != pid {
 			continue
 		}
 		raw, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
@@ -1667,6 +1837,56 @@ func countFFmpegProcessesFor(rtspURL string, ownedPGIDs map[int]bool) int {
 		}
 	}
 	return n
+}
+
+// countFFmpegProcessesForStable is countFFmpegProcessesFor with a bounded retry,
+// for callers that ASSERT on the answer rather than poll.
+//
+// A single count is not exact on a busy host: /proc reads can fail transiently
+// and a failed read is indistinguishable from "no process" (see the note on
+// countFFmpegProcessesFor for the measurement — 5 false zeros in 120 counts
+// under load, all recovering within 10ms).
+//
+// The two error modes are asymmetric, so the retry is too:
+//   - want 0 (a leak check, a stop, "the process is gone"): a single zero must
+//     not be accepted, because a transient failure manufactures one. Retry until
+//     a zero is seen TWICE IN A ROW, or the budget expires; a genuine live
+//     process cannot produce two consecutive zeros for the same reason, while a
+//     genuine absence produces zeros immediately.
+//   - want >0 (a liveness check, "the stream is really running"): keep retrying
+//     until a non-zero reading appears or the budget expires, because the false
+//     reading here is a zero.
+//
+// It never returns an unfounded zero: if the budget expires while the only
+// readings have been positive, the last positive is returned.
+func countFFmpegProcessesForStable(rtspURL string, ownedPGIDs map[int]bool, timeout time.Duration) int {
+	deadline := time.Now().Add(timeout)
+	last := countFFmpegProcessesFor(rtspURL, ownedPGIDs)
+	consecutiveZeros := 0
+	if last == 0 {
+		consecutiveZeros = 1
+	}
+	for time.Now().Before(deadline) {
+		if last != 0 {
+			// A positive reading is authoritative for any caller that wants
+			// "is anything alive": return it.
+			return last
+		}
+		if consecutiveZeros >= 2 {
+			// Two consecutive zeros: the process really is gone.
+			return 0
+		}
+		time.Sleep(10 * time.Millisecond)
+		n := countFFmpegProcessesFor(rtspURL, ownedPGIDs)
+		if n == 0 {
+			consecutiveZeros++
+		} else {
+			consecutiveZeros = 0
+			last = n
+			return n
+		}
+	}
+	return last
 }
 
 // ownedProcessGroups collects the process groups of the ffmpeg children this
@@ -1688,11 +1908,25 @@ func (sm *Manager) ownedProcessGroups(rtspURL string) map[int]bool {
 		if rtspURL != "" && url != rtspURL {
 			continue
 		}
-		if cmd != nil && cmd.Process != nil {
-			if pgid, err := syscall.Getpgid(cmd.Process.Pid); err == nil {
-				owned[pgid] = true
-			}
+		if cmd == nil || cmd.Process == nil {
+			continue
 		}
+		// Use the group id recorded when the process was started rather than
+		// asking /proc for it here. With Setpgid the child becomes its own
+		// group leader, so the group id is the child's pid, fixed at Start()
+		// time and never changing. Re-reading it through syscall.Getpgid only
+		// adds a way to lose the group to a transient /proc failure — the same
+		// failure mode that made countFFmpegProcessesFor report 0 for a live
+		// process. When the field was not recorded, fall back to /proc.
+		pgid := process.pgid
+		if pgid <= 0 {
+			g, err := syscall.Getpgid(cmd.Process.Pid)
+			if err != nil {
+				continue
+			}
+			pgid = g
+		}
+		owned[pgid] = true
 	}
 	return owned
 }
@@ -1781,15 +2015,13 @@ func (sm *Manager) SuspendStreamForSessionLoss(streamID, reason string) error {
 
 // waitForNoFFmpegReader waits briefly for every ffmpeg reading rtspURL to be
 // gone, then reports how many are left (0 = all clear).
+//
+// It uses the STABLE count, not a raw one: this reading is an assertion ("the
+// stop really stopped it"), and a single raw count can report a false zero when
+// a /proc read fails transiently on a busy host, which would make a leaked
+// process look stopped.
 func waitForNoFFmpegReader(sm *Manager, rtspURL string, timeout time.Duration) int {
-	deadline := time.Now().Add(timeout)
-	for {
-		n := countFFmpegProcessesFor(rtspURL, sm.ownedProcessGroups(rtspURL))
-		if n == 0 || !time.Now().Before(deadline) {
-			return n
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
+	return countFFmpegProcessesForStable(rtspURL, sm.ownedProcessGroups(rtspURL), timeout)
 }
 
 // SuspendedStreams returns the suspended streams of a provider, in profile-token
@@ -1871,12 +2103,24 @@ func (sm *Manager) resumeSuspendedProcess(process *Process, rtspURL string, prov
 	process.Info.Status = "starting"
 	process.Info.Suspended = false
 	process.Info.SuspendedReason = ""
-	// Done and Exited are single-use: the previous monitor closed them on its
-	// way out. A resumed stream needs FRESH ones, or the new monitor would
-	// close an already-closed channel and the stop path would return instantly.
+	// The channels and the run identity are handed out HERE, under the process
+	// lock, together with the flag that guards them. Nothing that follows waits
+	// on a spawn this goroutine committed, so the previous run can still be
+	// finishing its deferred close after the resume has returned; the runID is
+	// what keeps that deferred close from touching anything of the new run's.
+	//
+	// The superseded run's flag entry is dropped by replacing the map, so a
+	// stream that is resumed thousands of times does not accumulate one flag
+	// per run for the life of the process. Replacing rather than deleting the
+	// single old key also releases any entry a just-superseded run resurrected
+	// with its own deferred close, which is the only way the map can grow after
+	// the swap. A superseded run can therefore add at most ONE entry, and the
+	// next supersession removes it, so the map stays bounded by the live run
+	// plus at most one resurrected entry.
 	process.Done = make(chan bool)
 	process.Exited = make(chan struct{})
-	process.closed = sync.Once{}
+	process.runsClosed = make(map[uint64]*sync.Once)
+	process.runID = nextRunID()
 	process.Info.ReconnectDelay = ""
 	profileToken := process.Info.ProfileToken
 	info := process.Info
