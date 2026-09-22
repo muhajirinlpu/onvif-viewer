@@ -93,6 +93,17 @@ type StreamInfo struct {
 	// "transcode_h264" (Tuya HD). It is reported so the UI can say what is
 	// actually running rather than what was requested.
 	Output string `json:"output,omitempty"`
+	// InputTimestamps reports how this stream's ffmpeg decides the time base of
+	// the input: "camera" (it trusts the camera's own RTP timestamps, which is
+	// every ONVIF stream and Tuya HD) or "wallclock" (it re-stamps the input by
+	// arrival with -use_wallclock_as_timestamps 1, which is Tuya SD).
+	//
+	// It exists because Output CANNOT carry this distinction honestly: the Tuya
+	// SD path and the ONVIF/SD path genuinely share the same container and
+	// encoder ("copy_mpegts"), so a stream where the camera's RTP clock runs
+	// ahead of what it delivers — and therefore stutters — would otherwise be
+	// indistinguishable from a healthy one in /api/stream/list and in the logs.
+	InputTimestamps string `json:"inputTimestamps,omitempty"`
 	// Transcoding is true when this stream is re-encoding video in software.
 	// HD is the only case today, and it costs real CPU on this 4-core host, so
 	// the fact is reported explicitly instead of being inferred from the

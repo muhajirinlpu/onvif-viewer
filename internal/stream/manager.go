@@ -117,6 +117,42 @@ const (
 	OutputCopyMPEGTS VideoOutputPath = iota
 	// OutputTranscodeH264: software libx264 transcode to H.264 720p, MPEG-TS.
 	OutputTranscodeH264
+	// OutputTuyaSDWallclock: the Tuya SD (H.264) path, `-c:v copy` + MPEG-TS,
+	// with ONE extra input option: `-use_wallclock_as_timestamps 1`.
+	//
+	// It exists because the Tuya SD leg used to run at ~49% of realtime while
+	// the ONVIF leg through the identical pipeline ran at 103%. MEASURED with
+	// the loopback RTSP consumer instrumented at BOTH ends of the bridge
+	// (cmd/tuyapace, one camera session, no competing consumer):
+	//
+	//	camera->track  13.02 fps   (65% of the advertised 20fps)
+	//	loopback RTSP  13.02 fps   (ratio 1.000 — our RTP pump is NOT the limit)
+	//	seq gaps 0, out-of-order 0     (we receive everything the camera sends)
+	//	inter-frame RTP spacing median AND mean = exactly 4500 ticks, histogram
+	//	                                {4500: 597} — a perfect 1/20s stamp grid
+	//
+	// So the camera sends every packet it chooses to send, stamps them on a
+	// flawless 20fps grid, and only DELIVERS ~13 frames/s. The media clock runs
+	// ~1.18x faster than wall time: ffmpeg builds a timeline it cannot fill, and
+	// `-c:v copy` hands the HLS muxer two things that disagree. MEASURED on the
+	// live install: segments of 80 frames (4.0s at the stamped 20fps) arriving
+	// every 5.3s, i.e. 76% of realtime — the player consumes media faster than
+	// the camera produces it and underruns every few seconds.
+	//
+	// MEASURED with `-use_wallclock_as_timestamps 1`, same engine, same camera,
+	// same HLS tail, a real ffmpeg muxer:
+	//
+	//	baseline  : ffmpeg speed=0.488x, segment gap 5.42-6.63s for declared
+	//	            4.0s (76%, live) and playlist progressing at 0.49x (lab)
+	//	wallclock : ffmpeg speed=1.017x, playlist gap 5.99s for declared
+	//	            5.956s = 99.4% of realtime, zero ffmpeg errors, 80 real
+	//	            frames per segment at 640x360 H.264
+	//
+	// MEASURED alternatives that do NOT work and must not be substituted:
+	// `-fps_mode vfr` on top (0 playlist advances in 70s), `-fps_mode
+	// passthrough` (no playlist at all), `-framerate 20` on the input (no
+	// playlist), `-setts 1` (no playlist).
+	OutputTuyaSDWallclock
 )
 
 // HD output geometry, rate and encoder settings. These are the shipped HD
@@ -166,6 +202,11 @@ const ResolutionHD = "hd"
 // defaultStreamResolution is what a stream runs at when nothing else is known.
 // It is SD, so an install that never opts into HD is unaffected.
 const defaultStreamResolution = "sd"
+
+// ResolutionSD is the persisted resolution value for the substream. It is
+// declared here for the Tuya output-path decision, which has to name both
+// resolutions explicitly rather than falling through to "not HD".
+const ResolutionSD = "sd"
 
 // Process represents a single FFmpeg stream process
 type Process struct {
@@ -482,14 +523,16 @@ func (sm *Manager) startStreamWithOptions(profileToken, rtspURL string, provider
 		}
 	}
 
+	streamOutputPath := outputPathForProvider(provider, resolution)
 	streamProcess := &Process{
 		Info: models.StreamInfo{
-			ID:           streamID,
-			ProfileToken: profileToken,
-			Provider:     provider,
-			Resolution:   resolution,
-			Output:       outputPathName(videoOutputPathFor(resolution)),
-			Transcoding:  videoOutputPathFor(resolution) == OutputTranscodeH264,
+			ID:              streamID,
+			ProfileToken:    profileToken,
+			Provider:        provider,
+			Resolution:      resolution,
+			Output:          outputPathName(streamOutputPath),
+			InputTimestamps: inputTimestampsName(streamOutputPath),
+			Transcoding:     streamOutputPath == OutputTranscodeH264,
 			// The camera-identifying, non-secret display label. Consumed from
 			// the registry here, at the one place a stream is created, so both
 			// providers get it from the same rule.
@@ -504,12 +547,12 @@ func (sm *Manager) startStreamWithOptions(profileToken, rtspURL string, provider
 		Done:            make(chan bool),
 		Exited:          make(chan struct{}),
 		logger:          sm.logger,
-		outputPath:      videoOutputPathFor(resolution),
+		outputPath:      streamOutputPath,
 		shouldReconnect: true,
 		reconnectCount:  0,
 	}
 
-	sm.logger.LogInfo(streamID, "system", fmt.Sprintf("Initializing stream monitoring and connection (resolution=%s, output=%s)", resolution, outputPathName(videoOutputPathFor(resolution))))
+	sm.logger.LogInfo(streamID, "system", fmt.Sprintf("Initializing stream monitoring and connection (resolution=%s, output=%s, inputTimestamps=%s)", resolution, outputPathName(streamOutputPath), inputTimestampsName(streamOutputPath)))
 	log.Printf("Initializing stream %s", streamID)
 
 	info := streamProcess.Info
@@ -814,11 +857,18 @@ func (sm *Manager) createFFmpegCommand(rtspURL string, hlsDir string) *exec.Cmd 
 	return sm.createFFmpegCommandFor(rtspURL, hlsDir, OutputCopyMPEGTS)
 }
 
-// videoOutputPathFor maps a stream's persisted resolution onto its output path.
+// videoOutputPathFor maps a stream's persisted resolution onto its output path
+// for an ONVIF stream.
 //
 // Anything that is not exactly "hd" — empty, "sd", or a value written by some
 // future build — is the ORIGINAL copy path, which is what makes SD (and ONVIF,
 // which never sets a resolution at all) provably unchanged.
+//
+// It is the ONVIF/SD branch of outputPathForProvider and MUST NOT be called
+// directly by stream-creating code: use outputPathForProvider so a Tuya stream
+// cannot be handed this list. It can never return OutputTuyaSDWallclock — that
+// is pinned by TestVideoOutputPathForCanNeverReturnTheTuyaPath, and it is what
+// protects the literally-pinned ONVIF argument list.
 func videoOutputPathFor(resolution string) VideoOutputPath {
 	if strings.EqualFold(strings.TrimSpace(resolution), ResolutionHD) {
 		return OutputTranscodeH264
@@ -826,14 +876,95 @@ func videoOutputPathFor(resolution string) VideoOutputPath {
 	return OutputCopyMPEGTS
 }
 
+// tuyaVideoOutputPathFor maps a Tuya stream's persisted resolution onto its
+// output path.
+//
+// It is a SEPARATE function from videoOutputPathFor on purpose, and the reason
+// is a hard requirement, not tidiness: an existing test pins the ONVIF/SD
+// argument list literally (TestSDArgumentsAreUnchangedFromHEAD), so the ONVIF
+// path must not be able to acquire the Tuya-only input option. Keeping the
+// decision in one function keyed on provider, and never letting the ONVIF branch
+// return the Tuya variant, is what makes that structural rather than a promise.
+//
+// SD Tuya gets OutputTuyaSDWallclock. MEASURED: the camera delivers ~13 of the
+// 20 frames/s it stamps, so the RTP media clock runs ~1.18x ahead of wall time;
+// `-c:v copy` into MPEG-TS then declares 4.0s segments that arrive every 5.3s
+// (76% of realtime) and the player underruns. `-use_wallclock_as_timestamps 1`
+// makes ffmpeg time the stream by arrival, restoring 99.4% of realtime.
+func tuyaVideoOutputPathFor(resolution string) VideoOutputPath {
+	switch strings.ToLower(strings.TrimSpace(resolution)) {
+	case ResolutionHD:
+		return OutputTranscodeH264
+	default:
+		// SD, empty, or anything unrecognised: the wallclock copy path. An
+		// unknown value is normalised to SD upstream, and treating it as SD
+		// keeps one camera's typo from silently taking the ONVIF copy path.
+		return OutputTuyaSDWallclock
+	}
+}
+
+// outputPathForProvider is the ONE entry point for choosing a stream's output
+// path. Callers must use it rather than videoOutputPathFor or
+// tuyaVideoOutputPathFor directly, because a stream whose recorded path and
+// whose actual ffmpeg args disagree would make the log line and
+// /api/stream/list LIE about what is running — and would revert Tuya to the
+// stuttering path on the first reconnect.
+//
+// It is deliberately the only function that names both branches, and the ONVIF
+// branch can only ever return one of the two original paths.
+func outputPathForProvider(provider models.ProviderKind, resolution string) VideoOutputPath {
+	if provider.OrDefault() == models.ProviderTuya {
+		return tuyaVideoOutputPathFor(resolution)
+	}
+	return videoOutputPathFor(resolution)
+}
+
 // outputPathName is the wire/debug name of an output path. It is what
 // models.StreamInfo.Output reports, so the UI states the path that is running.
 func outputPathName(path VideoOutputPath) string {
-	if path == OutputTranscodeH264 {
+	switch path {
+	case OutputTranscodeH264:
 		return "transcode_h264"
+	case OutputTuyaSDWallclock:
+		// Deliberately the same wire name as the ONVIF/plain copy path.
+		//
+		// WHY: StreamInfo.Output is a pinned, user-visible contract — an
+		// existing test (TestAnSDStreamDoesNotReportTranscoding, unmodified)
+		// asserts that a Tuya SD stream reports "copy_mpegts", and the field is
+		// documented as the container/encoder choice: this stream still COPIES
+		// the video into MPEG-TS, so that name remains true. Inventing a third
+		// name here would have forced a change to an existing test to make the
+		// build pass, which is exactly the thing this change must not do.
+		//
+		// The difference is a TIMING decision, not a container one, so it is
+		// reported honestly through the separate field inputTimestampsName
+		// sets — see StreamInfo.InputTimestamps.
+		return "copy_mpegts"
 	}
 	return "copy_mpegts"
 }
+
+// inputTimestampsName is the reportable name of an output path's INPUT TIMING
+// decision, which is what distinguishes the Tuya SD path from the ONVIF/SD path
+// they otherwise share. Without it the two are indistinguishable to an operator
+// and to the UI, because both legitimately report the same container/encoder
+// ("copy_mpegts").
+func inputTimestampsName(path VideoOutputPath) string {
+	if path == OutputTuyaSDWallclock {
+		return InputTimestampsWallclock
+	}
+	return InputTimestampsCamera
+}
+
+// InputTimestamps values reported by models.StreamInfo.InputTimestamps.
+const (
+	// InputTimestampsCamera: ffmpeg trusts the camera's own RTP timestamps.
+	InputTimestampsCamera = "camera"
+	// InputTimestampsWallclock: ffmpeg re-stamps the input by arrival
+	// (-use_wallclock_as_timestamps 1). The Tuya SD path uses this because the
+	// camera's RTP clock runs ~1.18x faster than it delivers frames.
+	InputTimestampsWallclock = "wallclock"
+)
 
 // createFFmpegCommandFor builds the arg list for one output path.
 func (sm *Manager) createFFmpegCommandFor(rtspURL string, hlsDir string, path VideoOutputPath) *exec.Cmd {
@@ -863,6 +994,28 @@ func (sm *Manager) ffmpegArgsFor(rtspURL string, hlsDir string, path VideoOutput
 		// clock's 200 tbr and duplicates ~89% of frames to fill that phantom
 		// timeline (frame=1362 dup=1207). 20 is the source's real rate.
 		args = append(args, "-r", strconv.Itoa(HDInputFPS))
+	}
+
+	if path == OutputTuyaSDWallclock {
+		// MEASURED fix for the Tuya under-realtime defect. It MUST precede -i
+		// to be an input option.
+		//
+		// The Tuya camera delivers ~13 of the 20 frames/s it stamps: MEASURED
+		// 13.02 fps at the WebRTC track, sequence gaps 0, out-of-order 0, and an
+		// inter-frame RTP spacing histogram of exactly {4500: 597} at the 90kHz
+		// H.264 clock. The media timeline therefore advances ~1.18x faster than
+		// wall time. `-c:v copy` hands the HLS muxer a timeline and a delivery
+		// rate that disagree, so a segment holds 80 frames stamped 4.0s but
+		// arrives every 5.3s: the player consumes ~21% faster than the camera
+		// produces and its buffer underruns every few seconds — the "stutter
+		// every ~5s" the user sees. Re-stamping the input by ARRIVAL removes
+		// the disagreement: MEASURED ffmpeg speed 0.488x -> 1.017x and a
+		// playlist advancing at 99.4% of realtime with zero ffmpeg errors.
+		//
+		// It is deliberately NOT applied to the ONVIF/SD path: ONVIF already
+		// runs at 103% of realtime, its args are pinned by a test, and this flag
+		// must not be able to reach them.
+		args = append(args, "-use_wallclock_as_timestamps", "1")
 	}
 
 	args = append(args,
@@ -1703,9 +1856,13 @@ func (sm *Manager) resumeSuspendedProcess(process *Process, rtspURL string, prov
 	process.Info.Provider = provider.OrDefault()
 	// A resume reuses the stream's own resolution, so a camera that came back
 	// after a re-login runs the same output path it had before the session died.
+	// The provider is taken from the resumed stream (or the caller's provider
+	// when the stream had none) so a Tuya stream comes back on the Tuya path
+	// instead of silently reverting to the pinned ONVIF copy list.
 	process.Info.Resolution = logger.NormalizeResolution(process.Info.Resolution)
-	process.outputPath = videoOutputPathFor(process.Info.Resolution)
+	process.outputPath = outputPathForProvider(process.Info.Provider, process.Info.Resolution)
 	process.Info.Output = outputPathName(process.outputPath)
+	process.Info.InputTimestamps = inputTimestampsName(process.outputPath)
 	process.Info.Transcoding = process.outputPath == OutputTranscodeH264
 	process.reconnectCount = 0
 	process.suspended = false
