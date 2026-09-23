@@ -95,7 +95,7 @@ type StreamInfo struct {
 	Output string `json:"output,omitempty"`
 	// InputTimestamps reports how this stream's ffmpeg decides the time base of
 	// the input: "camera" (it trusts the camera's own RTP timestamps, which is
-	// every ONVIF stream and Tuya HD) or "wallclock" (it re-stamps the input by
+	// every ONVIF stream and Tuya HD) or "retimed" (it re-stamps the input by
 	// arrival with -use_wallclock_as_timestamps 1, which is Tuya SD).
 	//
 	// It exists because Output CANNOT carry this distinction honestly: the Tuya

@@ -118,7 +118,7 @@ const (
 	OutputCopyMPEGTS VideoOutputPath = iota
 	// OutputTranscodeH264: software libx264 transcode to H.264 720p, MPEG-TS.
 	OutputTranscodeH264
-	// OutputTuyaSDWallclock: the Tuya SD (H.264) path, `-c:v copy` + MPEG-TS,
+	// OutputTuyaSDRetimed: the Tuya SD (H.264) path, `-c:v copy` + MPEG-TS,
 	// with ONE extra input option: `-use_wallclock_as_timestamps 1`.
 	//
 	// It exists because the Tuya SD leg used to run at ~49% of realtime while
@@ -153,8 +153,35 @@ const (
 	// `-fps_mode vfr` on top (0 playlist advances in 70s), `-fps_mode
 	// passthrough` (no playlist at all), `-framerate 20` on the input (no
 	// playlist), `-setts 1` (no playlist).
-	OutputTuyaSDWallclock
+	OutputTuyaSDRetimed
 )
+
+// tuyaSDTimeScale is the factor `-itsscale` applies to the Tuya SD input so its
+// declared timeline matches the rate the camera actually delivers.
+//
+// DERIVATION (measured, not guessed). The camera stamps a perfect 4500-tick
+// 90kHz grid = 20 fps, but only DELIVERS ~13 fps, so 20 stamped seconds of media
+// span ~30 wall seconds. The media clock therefore runs ahead by
+// stamped_rate / delivered_rate. MEASURED delivered rate, 184s capture on the
+// live install: 2292 frames / 174.84s = 13.109 fps -> 20 / 13.109 = 1.526.
+// Shorter samples read ~14.3 fps (-> 1.40), so the rate itself varies and no
+// single factor is exactly right.
+//
+// It is therefore set to 1.50 — slightly BELOW the long-run ideal — because the
+// two directions do not fail alike. Over-declaring (factor too high) makes the
+// declared timeline slower than reality: the player buffers more and output
+// latency grows, which is smooth but stale. Under-declaring (factor too low)
+// makes the timeline faster than reality: the player drains its buffer and
+// STUTTERS, which is the exact defect being fixed. MEASURED drift, second half
+// of a 100s arm vs the first: -14.3% at 1.40 and -3.3% at 1.46 (both draining),
+// ~0 at 1.5. Being wrong high costs a little latency and keeps the picture
+// smooth; being wrong low costs the picture. A 4-core host cannot afford the one
+// failure mode that needs more CPU to paper over, so choose the safe direction.
+//
+// It is deliberately NOT applied to the ONVIF/SD path: ONVIF already runs at
+// ~100% of realtime on both legs, its args are pinned by a test, and neither
+// these options nor this factor must be able to reach them.
+const tuyaSDTimeScale = 1.5
 
 // HD output geometry, rate and encoder settings. These are the shipped HD
 // defaults, and every one of them was CHOSEN FROM A MEASUREMENT, not guessed.
@@ -897,7 +924,7 @@ func (sm *Manager) createFFmpegCommand(rtspURL string, hlsDir string) *exec.Cmd 
 //
 // It is the ONVIF/SD branch of outputPathForProvider and MUST NOT be called
 // directly by stream-creating code: use outputPathForProvider so a Tuya stream
-// cannot be handed this list. It can never return OutputTuyaSDWallclock — that
+// cannot be handed this list. It can never return OutputTuyaSDRetimed — that
 // is pinned by TestVideoOutputPathForCanNeverReturnTheTuyaPath, and it is what
 // protects the literally-pinned ONVIF argument list.
 func videoOutputPathFor(resolution string) VideoOutputPath {
@@ -917,7 +944,7 @@ func videoOutputPathFor(resolution string) VideoOutputPath {
 // decision in one function keyed on provider, and never letting the ONVIF branch
 // return the Tuya variant, is what makes that structural rather than a promise.
 //
-// SD Tuya gets OutputTuyaSDWallclock. MEASURED: the camera delivers ~13 of the
+// SD Tuya gets OutputTuyaSDRetimed. MEASURED: the camera delivers ~13 of the
 // 20 frames/s it stamps, so the RTP media clock runs ~1.18x ahead of wall time;
 // `-c:v copy` into MPEG-TS then declares 4.0s segments that arrive every 5.3s
 // (76% of realtime) and the player underruns. `-use_wallclock_as_timestamps 1`
@@ -930,7 +957,7 @@ func tuyaVideoOutputPathFor(resolution string) VideoOutputPath {
 		// SD, empty, or anything unrecognised: the wallclock copy path. An
 		// unknown value is normalised to SD upstream, and treating it as SD
 		// keeps one camera's typo from silently taking the ONVIF copy path.
-		return OutputTuyaSDWallclock
+		return OutputTuyaSDRetimed
 	}
 }
 
@@ -956,7 +983,7 @@ func outputPathName(path VideoOutputPath) string {
 	switch path {
 	case OutputTranscodeH264:
 		return "transcode_h264"
-	case OutputTuyaSDWallclock:
+	case OutputTuyaSDRetimed:
 		// Deliberately the same wire name as the ONVIF/plain copy path.
 		//
 		// WHY: StreamInfo.Output is a pinned, user-visible contract — an
@@ -981,8 +1008,8 @@ func outputPathName(path VideoOutputPath) string {
 // and to the UI, because both legitimately report the same container/encoder
 // ("copy_mpegts").
 func inputTimestampsName(path VideoOutputPath) string {
-	if path == OutputTuyaSDWallclock {
-		return InputTimestampsWallclock
+	if path == OutputTuyaSDRetimed {
+		return InputTimestampsRetimed
 	}
 	return InputTimestampsCamera
 }
@@ -991,10 +1018,10 @@ func inputTimestampsName(path VideoOutputPath) string {
 const (
 	// InputTimestampsCamera: ffmpeg trusts the camera's own RTP timestamps.
 	InputTimestampsCamera = "camera"
-	// InputTimestampsWallclock: ffmpeg re-stamps the input by arrival
+	// InputTimestampsRetimed: ffmpeg re-stamps the input by arrival
 	// (-use_wallclock_as_timestamps 1). The Tuya SD path uses this because the
 	// camera's RTP clock runs ~1.18x faster than it delivers frames.
-	InputTimestampsWallclock = "wallclock"
+	InputTimestampsRetimed = "retimed"
 )
 
 // createFFmpegCommandFor builds the arg list for one output path.
@@ -1027,26 +1054,45 @@ func (sm *Manager) ffmpegArgsFor(rtspURL string, hlsDir string, path VideoOutput
 		args = append(args, "-r", strconv.Itoa(HDInputFPS))
 	}
 
-	if path == OutputTuyaSDWallclock {
-		// MEASURED fix for the Tuya under-realtime defect. It MUST precede -i
-		// to be an input option.
+	if path == OutputTuyaSDRetimed {
+		// MEASURED fix for the Tuya under-realtime defect. Both options MUST
+		// precede -i to act as input options.
 		//
-		// The Tuya camera delivers ~13 of the 20 frames/s it stamps: MEASURED
-		// 13.02 fps at the WebRTC track, sequence gaps 0, out-of-order 0, and an
-		// inter-frame RTP spacing histogram of exactly {4500: 597} at the 90kHz
-		// H.264 clock. The media timeline therefore advances ~1.18x faster than
-		// wall time. `-c:v copy` hands the HLS muxer a timeline and a delivery
-		// rate that disagree, so a segment holds 80 frames stamped 4.0s but
-		// arrives every 5.3s: the player consumes ~21% faster than the camera
-		// produces and its buffer underruns every few seconds — the "stutter
-		// every ~5s" the user sees. Re-stamping the input by ARRIVAL removes
-		// the disagreement: MEASURED ffmpeg speed 0.488x -> 1.017x and a
-		// playlist advancing at 99.4% of realtime with zero ffmpeg errors.
+		// The Tuya camera delivers ~13 of the 20 frames/s it stamps on a
+		// flawless 4500-tick 90kHz grid (MEASURED 13.02 fps at the WebRTC track,
+		// sequence gaps 0, out-of-order 0), so its RTP media clock runs ~1.5x
+		// ahead of wall time. `-c:v copy` hands the HLS muxer a timeline and a
+		// delivery rate that disagree: a segment holds 80 frames stamped 4.0s
+		// but arrives every ~6s, so the player consumes media faster than the
+		// camera produces it and its buffer underruns — the reported stutter.
 		//
-		// It is deliberately NOT applied to the ONVIF/SD path: ONVIF already
-		// runs at 103% of realtime, its args are pinned by a test, and this flag
-		// must not be able to reach them.
-		args = append(args, "-use_wallclock_as_timestamps", "1")
+		// Two candidate remedies were MEASURED against each other, same engine,
+		// same camera, interleaved repeats:
+		//
+		//	-use_wallclock_as_timestamps 1 : cures the declared-vs-arrival
+		//	    mismatch but timestamps every frame by ARRIVAL, so the P2P path's
+		//	    burstiness becomes frame timing: MEASURED 4-10% near-duplicate
+		//	    frames (PTS gap 0.0004s) alternating with 0.5-0.6s holes. `copy`
+		//	    cannot retime, so the player freezes on each hole. It trades a
+		//	    smooth-but-slow stream for an honest-but-BLIPPY one, which is the
+		//	    regression this path now exists to avoid.
+		//
+		//	-itsscale N                    : rescales the camera's OWN uniform
+		//	    1/20s grid so the declared timeline matches observed arrival.
+		//	    MEASURED flat p50=p90=p99=max=0.0700s, 0% duplicate frames, 0%
+		//	    freeze-scale gaps. Costs no CPU (timestamps only, still `copy`).
+		//
+		// N is biased HIGH on purpose. A timeline slightly slower than reality
+		// grows the player's buffer (still smooth, just more latency); one even
+		// slightly FASTER drains it and stutters. MEASURED drift, second half vs
+		// first: -14.3% at 1.40, -3.3% at 1.46, ~0 at 1.5. The camera's
+		// delivered rate is not constant (13.11 fps over 184s vs 14.3 fps over a
+		// short sample), and this box is a 4-core host where a conservative
+		// factor cannot fail — only over-declare. See tuyaSDTimeScale.
+		args = append(args,
+			"-use_wallclock_as_timestamps", "0",
+			"-itsscale", strconv.FormatFloat(tuyaSDTimeScale, 'f', 2, 64),
+		)
 	}
 
 	args = append(args,
