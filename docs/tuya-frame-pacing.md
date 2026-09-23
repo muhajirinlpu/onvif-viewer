@@ -106,3 +106,63 @@ provider to ONVIF. Production supplies `main.providerStarter`, which is what tag
 the stream `tuya`. A harness that skips that seam exercises the ONVIF output path
 for a Tuya camera and faithfully reproduces the pre-fix stutter.
 `cmd/pacedev` now mirrors the production seam.
+
+## 7. UPDATE — `-use_wallclock_as_timestamps` was only half the fix (superseded)
+
+Section 3 above is correct as far as it goes: wallclock did cure the **declared
+segment duration vs wall arrival** mismatch (71.7% -> 100.1%), and that mismatch
+was real. But it is NOT sufficient, and on its own it *introduces* the visible
+blipping. Measured later, same engine, same camera, interleaved repeats:
+
+| mode | p50 gap | p99 gap | max gap | near-duplicate | freeze-scale |
+| --- | --- | --- | --- | --- | --- |
+| baseline (`copy`, camera clock) | 0.0500 | 0.0500 | 0.0500 | 0% | 0% |
+| `-use_wallclock_as_timestamps 1` | 0.0526 | 0.2457 | **0.5439** | **10.0%** | 0.9% |
+| same, second run | 0.0680 | 0.3943 | **0.6317** | 4.4% | **2.1%** |
+| **`-itsscale 1.50`** (shipped) | **0.0750** | **0.0750** | **0.0750** | **0%** | **0%** |
+| same, second run | 0.0750 | 0.0750 | 0.0750 | 0% | 0% |
+| wallclock, simultaneous 3rd run | 0.0526 | 0.1153 | 0.3215 | **26.7%** | **1.8%** |
+| wallclock, simultaneous 4th run | 0.0637 | 0.1229 | 0.4149 | 6.4% | **1.9%** |
+
+Why: `-use_wallclock_as_timestamps 1` timestamps every frame by ARRIVAL. The P2P
+path delivers frames in bursts, so arrival spacing — not the camera's 20fps grid —
+becomes the timestamp spacing. Frames land duplicated (`gap 0.0004s`, 10% of them)
+and then stall (`gap 0.54s`, 2%). A player handed a 0.54s hole in a `-c:v copy`
+stream has nothing to interpolate with, so it visibly freezes, and the accumulated
+drift is never corrected because `copy` cannot retime frames. That is the
+"blipping every few seconds" report, and it is a *consequence of the wallclock fix*,
+not a camera fault.
+
+`-itsscale 1.50` instead rescales the camera's existing timestamps to match observed
+arrival (`20fps stamped / ~14.3fps delivered` = 1.399) and leaves them untouched
+otherwise, so the inter-frame grid stays perfectly uniform at 1/14.29fps.
+
+Factor selection. The camera's delivered rate is NOT constant: MEASURED 13.109
+fps over a 184s capture (2292 frames / 174.84s -> implied factor 1.526) but ~14.3
+fps over short samples (-> 1.40). No single factor is exactly right, so 1.50 is
+chosen and biased HIGH deliberately. Over-declaring (factor too high) makes the
+declared timeline slower than reality: the player buffers more, latency grows —
+smooth but stale. Under-declaring makes the timeline faster than reality: the
+player drains its buffer and STUTTERS. MEASURED drift, second half of a 100s arm
+vs the first: **-14.3% at 1.40** and **-3.3% at 1.46** (both draining the buffer
+toward the stutter), **~0 at 1.5**. Being wrong high costs latency; being wrong
+low costs the picture.
+
+Accepted cost: live latency settles at ~20s (vs the old stream's ~8s when it was
+healthy, and 0-205s when it was not). That is inherent to 5.6s segments with
+`hls_list_size 5` plus hls.js's `liveSyncDurationCount 3`; it can only be reduced
+by shortening segments, which needs a re-encode this host cannot afford.
+
+CONFIRMED ON THE LIVE DEPLOYMENT after shipping (headless Chromium, 240s per
+stream, sampling `video.currentTime` / `buffered` / hls.js `latency`):
+
+| | before (wallclock) | after (itsscale 1.50) |
+| --- | --- | --- |
+| Tuya playback | 23.2% - 106.6%, wild swings | **100.0%** |
+| Tuya latency | **0 -> 205s** | **19.5 - 25.8s, stable** |
+| Tuya blips | froze at t=44.6s and never recovered | startup transient only |
+| ONVIF control | 99.9% | 99.9% |
+
+Rejected alternatives: `-c:v libx264 -r 20` (CFR transcode, perfect 0.05s grid but
+**0.74x realtime**, not viable); `-fps_mode vfr` / `-fps_mode passthrough` /
+`-framerate 20` / `-setts 1` (no usable playlist).
