@@ -215,19 +215,23 @@ var tuyaSDAudioArgs = []string{"-af", tuyaSDAudioFilter}
 // silence or zeros, and the aggregate audio rate was exactly 8000 samples/s
 // over 180s — nothing dropped. It is a gain/level behaviour.
 //
-// loudnorm MEASURES best of the candidates tried against the same capture:
+// a compressor MEASURES best, and the numbers must be read at 8000 Hz: an
+// earlier A/B of mine appeared to favour loudnorm, but loudnorm resamples
+// internally and the capture had become 96 kHz while I analysed it as 8 kHz —
+// a wrong rate smooths the envelope and flatters whichever filter changed it.
+// Re-measured honestly (every arm brought to 8000 Hz first):
 //
-//	none              p05 0.25  p95 2.84  sd 1.113  max 14.7x
-//	loudnorm I=-16    p05 0.50  p95 1.75  sd 0.401  max  5.7x   <- chosen
-//	acompressor+gain  p05 0.26  p95 2.04  sd 0.617  max  8.4x
-//	dynaudnorm        p05 0.25  p95 2.83  sd 1.077  max 13.2x (no effect)
-//	compressor+limit  p05 0.26  p95 2.48  sd 0.835  max 12.2x
+//	none                        p05 0.25  p95 2.84  sd 1.113  max 14.7x
+//	loudnorm I=-16              p05 0.26  p95 2.80  sd 0.965  max 12.1x (near-neutral)
+//	dynaudnorm                  p05 0.25  p95 2.85  sd 1.045  max 12.2x (near-neutral)
+//	acompressor -20/4           p05 0.25  p95 2.55  sd 0.860  max 12.6x
+//	acompressor -24/8           p05 0.27  p95 1.90  sd 0.565  max  7.4x
+//	acompressor -28/6 +9dB      p05 0.30  p95 1.67  sd 0.463  max  5.7x  <- chosen
 //
-// It is measured CLIP-FREE on the same input (peak 27571 of 32767, 0 clipped
-// samples) whereas a limiter-based chain clipped 56 samples. loudnorm needs a
-// small lookahead, which is irrelevant here because the stream already runs
-// ~20s behind live.
-const tuyaSDAudioFilter = "loudnorm=I=-16:TP=-1.5:LRA=11"
+// The chosen chain cuts the worst-case swing from 14.7x to 5.7x and the envelope
+// sd from 1.113 to 0.463, while leaving the stream LOUDER than the source
+// (rms 1949 vs 1506) with 0 clipped samples. alimiter is a transient guard.
+const tuyaSDAudioFilter = "acompressor=threshold=-28dB:ratio=6:attack=10:release=300,volume=9dB,alimiter=limit=0.95,aresample=8000"
 
 // HD output geometry, rate and encoder settings. These are the shipped HD
 // defaults, and every one of them was CHOSEN FROM A MEASUREMENT, not guessed.
