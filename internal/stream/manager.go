@@ -1095,6 +1095,28 @@ func (sm *Manager) ffmpegArgsFor(rtspURL string, hlsDir string, path VideoOutput
 		)
 	}
 
+	if path == OutputTuyaSDRetimed {
+		// The Tuya camera's AUDIO clock is honest while its VIDEO clock runs
+		// ~1.5x fast, and `-itsscale` scales EVERY stream on the input, so it
+		// would stretch the audio by the same factor.
+		//
+		// MEASURED on the live install after shipping the video fix: every Tuya
+		// HLS segment declared 6.00s and carried only 3.97s of audio content
+		// (31 AAC frames at 1024 samples / 8000 Hz), a ratio of 0.661 — i.e.
+		// 33% of the audio timeline was silence, so playback sounded stuttering
+		// and fluctuating while the same camera over the vendor app was fine.
+		// ONVIF measured 0.955-1.021 on the same host, which is why only the
+		// Tuya card was affected.
+		//
+		// `-af asetpts=N/SR/TB` regenerates the audio PTS from the actual
+		// sample count, undoing the input rescale. MEASURED after the fix:
+		// ratio 1.003 on every segment of a 45s run, with no timeline gaps.
+		//
+		// Applied only to the retimed path: ONVIF's audio is already correct and
+		// its argument list is pinned by an existing test.
+		args = append(args, "-af", "asetpts=N/SR/TB")
+	}
+
 	args = append(args,
 		// FFmpegInputIOTimeoutMicroseconds is ffmpegInputIOTimeout in the
 		// microseconds the RTSP demuxer expects (see the constant for why this

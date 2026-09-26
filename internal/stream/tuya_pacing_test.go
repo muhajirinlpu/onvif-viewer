@@ -118,6 +118,19 @@ func TestTuyaSDReportAndArgsAgreeAndCarryTheFix(t *testing.T) {
 		t.Errorf("Tuya SD must still copy the video\nfull: %s", got)
 	}
 
+	// The AUDIO timeline must be regenerated from the sample count.
+	//
+	// `-itsscale` scales every stream on the input, and the Tuya camera's audio
+	// clock is honest while its video clock is not, so without this filter the
+	// audio is stretched by the same factor as the video. MEASURED on the live
+	// install when it was missing: each segment declared 6.00s and carried only
+	// 3.97s of audio content (ratio 0.661), so a third of the audio timeline was
+	// silence and playback sounded stuttering even though the video was smooth.
+	// MEASURED with `-af asetpts=N/SR/TB`: ratio 1.003.
+	if !strings.Contains(got, "-af asetpts=N/SR/TB") {
+		t.Errorf("Tuya SD audio is not retimed; -itsscale will stretch it and the sound will stutter\nfull: %s", got)
+	}
+
 	// What /api/stream/list serves must agree, or the card misreports the path.
 	listed := m.ListStreams()
 	if len(listed) != 1 || listed[0].InputTimestamps != InputTimestampsRetimed || listed[0].Output != "copy_mpegts" {
@@ -257,7 +270,8 @@ func TestTuyaSDRetimedArgsShape(t *testing.T) {
 
 	got := joinedArgs(m.ffmpegArgsFor("rtsp://127.0.0.1:1/tuya_camera", "/tmp/hls", OutputTuyaSDRetimed))
 	want := "-y -fflags +genpts+igndts -rtsp_transport tcp -rtsp_flags prefer_tcp " +
-		"-use_wallclock_as_timestamps 0 -itsscale 1.50 -timeout 30000000 -i rtsp://127.0.0.1:1/tuya_camera " +
+		"-use_wallclock_as_timestamps 0 -itsscale 1.50 -af asetpts=N/SR/TB -timeout 30000000 " +
+		"-i rtsp://127.0.0.1:1/tuya_camera " +
 		"-c:v copy -c:a aac -avoid_negative_ts make_zero -max_interleave_delta 0 " +
 		"-hls_time 2 -hls_list_size 5 -hls_start_number_source epoch " +
 		"-hls_flags delete_segments+independent_segments -hls_segment_type mpegts " +
@@ -268,7 +282,7 @@ func TestTuyaSDRetimedArgsShape(t *testing.T) {
 	// The ONLY difference from the pinned ONVIF/SD list is the input timing flags.
 	// Anyone adding another flag to this path has to justify it here.
 	onvif := joinedArgs(m.ffmpegArgsFor("rtsp://127.0.0.1:1/tuya_camera", "/tmp/hls", OutputCopyMPEGTS))
-	timing := "-use_wallclock_as_timestamps 0 -itsscale " + strconv.FormatFloat(tuyaSDTimeScale, 'f', 2, 64) + " "
+	timing := "-use_wallclock_as_timestamps 0 -itsscale " + strconv.FormatFloat(tuyaSDTimeScale, 'f', 2, 64) + " -af asetpts=N/SR/TB "
 	if diff := strings.Replace(got, timing, "", 1); diff != onvif {
 		t.Fatalf("the Tuya path differs from the ONVIF/SD path by more than the measured input flag\nremove: %s\nonvif: %s", diff, onvif)
 	}
