@@ -1921,6 +1921,8 @@
               if (video.hls) {
                 video.hls.destroy();
               }
+              let resetting = false;
+              let lastResetAt = 0;
               const hls = new Hls({
                 enableWorker: true,
                 lowLatencyMode: true,
@@ -1931,22 +1933,89 @@
               hls.attachMedia(video);
 
               hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                // Start at the live edge. A rebuilt player otherwise begins at
+                // the OLDEST segment in the playlist and has to work forward,
+                // which is what made a recovery take ~20s of visible dead time.
+                // liveSyncPosition is the player's own estimate of where live is.
+                if (Number.isFinite(hls.liveSyncPosition)) {
+                  try { video.currentTime = hls.liveSyncPosition; } catch (e) { }
+                }
                 video.play().catch(e => console.log("Auto-play prevented:", e));
               });
 
+              // Recovery for a LIVE stream. Measured against a backend blip
+              // (segment requests cut): the previous handler (startLoad /
+              // recoverMediaError / destroy+reinit) left playback frozen with 49
+              // fatal errors and never recovered, because a live-stream blip
+              // surfaces as mediaError/bufferAppendError and recoverMediaError()
+              // cannot fix an unplayable buffer -- it just loops. Rebuilding the
+              // player clears the buffer outright, and once the source returned
+              // playback resumed within ~1s at the live edge.
+              let lastProgressAt = Date.now();
+              let resetFailures = 0;
+              const resetPlayer = (why) => {
+                if (resetting) return;
+                // Grow the gap between rebuilds while they keep failing so a
+                // long outage cannot spawn a reset storm. A hard cap is wrong
+                // here: it would give up permanently on an outage that outlasts
+                // the cap. The counter is forgotten after a minute of healthy
+                // playback, so an unrelated later blip starts fresh.
+                const backoff = Math.min(4000 * Math.pow(2, resetFailures), 60000);
+                if (Date.now() - lastResetAt < backoff) return;
+                resetting = true;
+                resetFailures++;
+                lastResetAt = Date.now();
+                console.warn('HLS: rebuilding the player (' + why + ')');
+                try { hls.destroy(); } catch (err) { }
+                window.setTimeout(() => {
+                  resetting = false;
+                  // Re-init only while the user still has the video open; when
+                  // showVideo is false the element is gone (v-if), so there is
+                  // nothing to rebuild.
+                  if (stream.showVideo) initializeVideoPlayer(stream);
+                }, 1000);
+              };
               hls.on(Hls.Events.ERROR, (event, data) => {
                 if (!data.fatal) return;
                 console.error('Fatal HLS error:', data);
                 if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                  // A transport blip: ask for the data again and make sure the
+                  // element is still playing. Without the play() a paused
+                  // element stays paused after a 502/404 and looks disconnected.
                   hls.startLoad();
-                } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-                  hls.recoverMediaError();
-                } else {
-                  hls.destroy();
-                  video.hls = null;
-                  window.setTimeout(() => initializeVideoPlayer(stream), 3000);
+                  video.play().catch(() => { });
+                  return;
                 }
+                // Media errors cannot be patched in place on a live stream.
+                resetPlayer('fatal ' + data.details);
               });
+
+              // Watchdog: a player can also die without any fatal event (the
+              // buffer becomes unplayable while no error fires), and a network
+              // error can recover into a silent stall. No progress for this long
+              // means rebuild, which is what the user perceives as "it just
+              // disconnects".
+              if (video.recoveryWatchdog) window.clearInterval(video.recoveryWatchdog);
+              let lastTime = video.currentTime;
+              let stuckTicks = 0;
+              let graceTicks = 15; // a fresh player needs time to fetch + buffer
+              video.recoveryWatchdog = window.setInterval(() => {
+                if (graceTicks > 0) { graceTicks--; lastTime = video.currentTime; return; }
+                if (!stream.showVideo || !video.isConnected) {
+                  window.clearInterval(video.recoveryWatchdog);
+                  video.recoveryWatchdog = null;
+                  return;
+                }
+                if (Math.abs(video.currentTime - lastTime) < 0.05) {
+                  stuckTicks++;
+                  if (stuckTicks >= 12) { stuckTicks = 0; resetPlayer('watchdog: no progress for 12s'); }
+                } else {
+                  stuckTicks = 0;
+                  lastTime = video.currentTime;
+                  if (Date.now() - lastProgressAt > 60000) resetFailures = 0;
+                  lastProgressAt = Date.now();
+                }
+              }, 1000);
             }
           });
         };
