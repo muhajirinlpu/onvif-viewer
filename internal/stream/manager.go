@@ -199,7 +199,35 @@ const tuyaSDTimeScale = 1.5
 // parsing options for input file" / exit status 234 — the camera never starts.
 // That mistake was shipped once; TestTuyaSDReportAndArgsAgreeAndCarryTheFix now
 // pins the ordering.
-var tuyaSDAudioArgs = []string{"-af", "asetpts=N/SR/TB"}
+var tuyaSDAudioArgs = []string{"-af", tuyaSDAudioFilter}
+
+// tuyaSDAudioFilter is the audio filter chain for the Tuya SD stream.
+//
+// WHY IT IS NEEDED AT ALL: this camera's audio level swings far more than a
+// normal camera's. MEASURED on the engine source with NO filters and NO HLS
+// (so it is the camera/bridge, not our pipeline): the RMS envelope wandered
+// 43 times below 35% of its local median in 180s, with per-window levels
+// spanning 0.25x to 14.7x the local median — heard as sound that "disappears
+// and comes back", an up-and-down wave.
+//
+// WHAT IT IS NOT: not packet loss. Every dip measured as present-but-quiet
+// (segments of peak amplitude 340-2364 with 94-100% non-zero samples), never
+// silence or zeros, and the aggregate audio rate was exactly 8000 samples/s
+// over 180s — nothing dropped. It is a gain/level behaviour.
+//
+// loudnorm MEASURES best of the candidates tried against the same capture:
+//
+//	none              p05 0.25  p95 2.84  sd 1.113  max 14.7x
+//	loudnorm I=-16    p05 0.50  p95 1.75  sd 0.401  max  5.7x   <- chosen
+//	acompressor+gain  p05 0.26  p95 2.04  sd 0.617  max  8.4x
+//	dynaudnorm        p05 0.25  p95 2.83  sd 1.077  max 13.2x (no effect)
+//	compressor+limit  p05 0.26  p95 2.48  sd 0.835  max 12.2x
+//
+// It is measured CLIP-FREE on the same input (peak 27571 of 32767, 0 clipped
+// samples) whereas a limiter-based chain clipped 56 samples. loudnorm needs a
+// small lookahead, which is irrelevant here because the stream already runs
+// ~20s behind live.
+const tuyaSDAudioFilter = "loudnorm=I=-16:TP=-1.5:LRA=11"
 
 // HD output geometry, rate and encoder settings. These are the shipped HD
 // defaults, and every one of them was CHOSEN FROM A MEASUREMENT, not guessed.
@@ -1109,7 +1137,12 @@ func (sm *Manager) ffmpegArgsFor(rtspURL string, hlsDir string, path VideoOutput
 		// factor cannot fail — only over-declare. See tuyaSDTimeScale.
 		args = append(args,
 			"-use_wallclock_as_timestamps", "0",
-			"-itsscale", strconv.FormatFloat(tuyaSDTimeScale, 'f', 2, 64),
+			// -itsscale:v (VIDEO ONLY). The camera's video clock runs fast but its
+			// AUDIO clock is honest, so a bare -itsscale would also stretch the
+			// audio — MEASURED at ratio 0.661 (a third of the audio timeline was
+			// silence). Scaling video only leaves the audio timestamped by the
+			// camera and needs no compensating filter at all.
+			"-itsscale:v", strconv.FormatFloat(tuyaSDTimeScale, 'f', 2, 64),
 		)
 	}
 

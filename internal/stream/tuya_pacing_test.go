@@ -95,10 +95,10 @@ func TestTuyaSDReportAndArgsAgreeAndCarryTheFix(t *testing.T) {
 	// The ACTUAL built args must carry the fix, BEFORE -i to be input options.
 	args := m.ffmpegArgsFor("rtsp://127.0.0.1:1/tuya_camera-pace", "/tmp/hls", recorded)
 	got := joinedArgs(args)
-	if !strings.Contains(got, "-itsscale "+strconv.FormatFloat(tuyaSDTimeScale, 'f', 2, 64)) {
+	if !strings.Contains(got, "-itsscale:v "+strconv.FormatFloat(tuyaSDTimeScale, 'f', 2, 64)) {
 		t.Fatalf("Tuya SD args are missing the measured fix\nfull: %s", got)
 	}
-	isIdx, iIdx := indexOf(args, "-itsscale"), indexOf(args, "-i")
+	isIdx, iIdx := indexOf(args, "-itsscale:v"), indexOf(args, "-i")
 	if isIdx < 0 || iIdx < 0 || isIdx > iIdx {
 		t.Fatalf("-itsscale must precede -i (is=%d -i=%d)\nfull: %s", isIdx, iIdx, got)
 	}
@@ -127,8 +127,8 @@ func TestTuyaSDReportAndArgsAgreeAndCarryTheFix(t *testing.T) {
 	// 3.97s of audio content (ratio 0.661), so a third of the audio timeline was
 	// silence and playback sounded stuttering even though the video was smooth.
 	// MEASURED with `-af asetpts=N/SR/TB`: ratio 1.003.
-	if !strings.Contains(got, "-af asetpts=N/SR/TB") {
-		t.Errorf("Tuya SD audio is not retimed; -itsscale will stretch it and the sound will stutter\nfull: %s", got)
+	if !strings.Contains(got, "-af "+tuyaSDAudioFilter) {
+		t.Errorf("Tuya SD audio has no level/timeline filter\nfull: %s", got)
 	}
 
 	// The audio filter must come AFTER -i. `-af` is an output option; emitted
@@ -183,7 +183,7 @@ func TestResumedTuyaStreamKeepsTheRetimedPath(t *testing.T) {
 	}
 	// And the args it would actually restart with must still carry the fix.
 	args := joinedArgs(m.ffmpegArgsFor("rtsp://127.0.0.1:2/tuya_camera-resume", "/tmp/hls", recorded))
-	if !strings.Contains(args, "-itsscale "+strconv.FormatFloat(tuyaSDTimeScale, 'f', 2, 64)) {
+	if !strings.Contains(args, "-itsscale:v "+strconv.FormatFloat(tuyaSDTimeScale, 'f', 2, 64)) {
 		t.Fatalf("the resumed Tuya stream reverted to the timing path and would stutter again\nfull: %s", args)
 	}
 	if err := m.ReconnectStream(info.ID); err != nil {
@@ -279,9 +279,9 @@ func TestTuyaSDRetimedArgsShape(t *testing.T) {
 
 	got := joinedArgs(m.ffmpegArgsFor("rtsp://127.0.0.1:1/tuya_camera", "/tmp/hls", OutputTuyaSDRetimed))
 	want := "-y -fflags +genpts+igndts -rtsp_transport tcp -rtsp_flags prefer_tcp " +
-		"-use_wallclock_as_timestamps 0 -itsscale 1.50 -timeout 30000000 " +
+		"-use_wallclock_as_timestamps 0 -itsscale:v 1.50 -timeout 30000000 " +
 		"-i rtsp://127.0.0.1:1/tuya_camera " +
-		"-c:v copy -c:a aac -af asetpts=N/SR/TB -avoid_negative_ts make_zero -max_interleave_delta 0 " +
+		"-c:v copy -c:a aac -af " + tuyaSDAudioFilter + " -avoid_negative_ts make_zero -max_interleave_delta 0 " +
 		"-hls_time 2 -hls_list_size 5 -hls_start_number_source epoch " +
 		"-hls_flags delete_segments+independent_segments -hls_segment_type mpegts " +
 		"-f hls /tmp/hls/stream.m3u8"
@@ -291,8 +291,8 @@ func TestTuyaSDRetimedArgsShape(t *testing.T) {
 	// The ONLY difference from the pinned ONVIF/SD list is the input timing flags.
 	// Anyone adding another flag to this path has to justify it here.
 	onvif := joinedArgs(m.ffmpegArgsFor("rtsp://127.0.0.1:1/tuya_camera", "/tmp/hls", OutputCopyMPEGTS))
-	timing := "-use_wallclock_as_timestamps 0 -itsscale " + strconv.FormatFloat(tuyaSDTimeScale, 'f', 2, 64) + " "
-	audio := "-af asetpts=N/SR/TB "
+	timing := "-use_wallclock_as_timestamps 0 -itsscale:v " + strconv.FormatFloat(tuyaSDTimeScale, 'f', 2, 64) + " "
+	audio := "-af " + tuyaSDAudioFilter + " "
 	diff := strings.Replace(got, timing, "", 1)
 	diff = strings.Replace(diff, audio, "", 1)
 	if diff != onvif {
@@ -327,7 +327,7 @@ func TestTuyaRetimedPathIsReachableFromThePersistedResolution(t *testing.T) {
 	if info.InputTimestamps != InputTimestampsRetimed {
 		t.Fatalf("a Tuya stream started without an explicit resolution reports inputTimestamps=%q, want %q", info.InputTimestamps, InputTimestampsRetimed)
 	}
-	if !strings.Contains(argsFor(t, m, OutputTuyaSDRetimed), "-itsscale "+strconv.FormatFloat(tuyaSDTimeScale, 'f', 2, 64)) {
+	if !strings.Contains(argsFor(t, m, OutputTuyaSDRetimed), "-itsscale:v "+strconv.FormatFloat(tuyaSDTimeScale, 'f', 2, 64)) {
 		t.Fatal("the persisted-resolution path does not produce the measured fix")
 	}
 }
