@@ -215,23 +215,27 @@ var tuyaSDAudioArgs = []string{"-af", tuyaSDAudioFilter}
 // silence or zeros, and the aggregate audio rate was exactly 8000 samples/s
 // over 180s — nothing dropped. It is a gain/level behaviour.
 //
-// a compressor MEASURES best, and the numbers must be read at 8000 Hz: an
-// earlier A/B of mine appeared to favour loudnorm, but loudnorm resamples
-// internally and the capture had become 96 kHz while I analysed it as 8 kHz —
-// a wrong rate smooths the envelope and flatters whichever filter changed it.
-// Re-measured honestly (every arm brought to 8000 Hz first):
+// A two-stage compressor MEASURES best. Stage 1 pulls the loud passages down;
+// stage 2 is an "upward" compressor (threshold far below the signal) that lifts
+// the quiet ones. Both numbers must be read at 8000 Hz: an earlier A/B of mine
+// appeared to favour loudnorm, but loudnorm resamples internally and the capture
+// had become 96 kHz while I analysed it as 8 kHz -- a wrong rate smooths the
+// envelope and flatters whichever filter caused the rate change. Re-measured
+// honestly, every arm brought to 8000 Hz first:
 //
-//	none                        p05 0.25  p95 2.84  sd 1.113  max 14.7x
-//	loudnorm I=-16              p05 0.26  p95 2.80  sd 0.965  max 12.1x (near-neutral)
-//	dynaudnorm                  p05 0.25  p95 2.85  sd 1.045  max 12.2x (near-neutral)
-//	acompressor -20/4           p05 0.25  p95 2.55  sd 0.860  max 12.6x
-//	acompressor -24/8           p05 0.27  p95 1.90  sd 0.565  max  7.4x
-//	acompressor -28/6 +9dB      p05 0.30  p95 1.67  sd 0.463  max  5.7x  <- chosen
+//	none                          p05 0.25  p95 2.84  sd 1.113  max 14.7x  rms 1506
+//	loudnorm I=-16                p05 0.26  p95 2.80  sd 0.965  max 12.1x  (near-neutral)
+//	dynaudnorm                    p05 0.25  p95 2.85  sd 1.045  max 12.2x  (near-neutral)
+//	down-comp only -28/6 +9dB     p05 0.30  p95 1.67  sd 0.462  max  5.8x  rms 2052
+//	down + UP -45/2 +14dB         p05 0.48  p95 1.45  sd 0.286  max  2.7x  rms 2130
+//	                                  ^ chosen: quietest-to-loudest ratio 2.7x,
+//	                                    and LOUDER than source, 0 clipped samples
 //
-// The chosen chain cuts the worst-case swing from 14.7x to 5.7x and the envelope
-// sd from 1.113 to 0.463, while leaving the stream LOUDER than the source
-// (rms 1949 vs 1506) with 0 clipped samples. alimiter is a transient guard.
-const tuyaSDAudioFilter = "acompressor=threshold=-28dB:ratio=6:attack=10:release=300,volume=9dB,alimiter=limit=0.95,aresample=8000"
+// A limiter was measured to add nothing here (the compressor already keeps the
+// peak at 12044/32767), so the chain stays a plain compressor pair.
+// aresample=8000 is load-bearing: without it the encoder is fed 96000 Hz, which
+// was MEASURED live as aac,96000,1.
+const tuyaSDAudioFilter = "acompressor=threshold=-28dB:ratio=6:attack=10:release=300,volume=9dB,acompressor=threshold=-45dB:ratio=2:attack=5:release=500,volume=14dB,aresample=8000"
 
 // HD output geometry, rate and encoder settings. These are the shipped HD
 // defaults, and every one of them was CHOSEN FROM A MEASUREMENT, not guessed.
