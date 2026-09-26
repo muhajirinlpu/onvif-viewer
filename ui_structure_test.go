@@ -57,9 +57,29 @@ func TestFrontendRecoversFatalHLSFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	html := string(data)
-	for _, token := range []string{"Hls.ErrorTypes.NETWORK_ERROR", "hls.startLoad()", "Hls.ErrorTypes.MEDIA_ERROR", "hls.recoverMediaError()"} {
+	// A transport blip is still answered in place: ask for the data again and
+	// make sure the element is playing (without the play() a paused element
+	// stays paused after a 502/404 and looks disconnected).
+	for _, token := range []string{"Hls.ErrorTypes.NETWORK_ERROR", "hls.startLoad()"} {
 		if !strings.Contains(html, token) {
 			t.Errorf("missing HLS recovery behavior %q", token)
+		}
+	}
+	// Everything else is NOT recoverable in place on a live stream. This used to
+	// assert hls.recoverMediaError(), but a blip surfaces as
+	// mediaError/bufferAppendError (and mediaSourceRequiresReset), and
+	// recoverMediaError() cannot fix an unplayable buffer -- it loops forever,
+	// which is the frozen picture users reported. Measured: 49 fatal errors and
+	// no recovery at all with the old handler, versus full recovery once the
+	// player is rebuilt. The assertion is therefore inverted: in-place media
+	// recovery must NOT be relied on, a rebuild must be reachable, and the
+	// recovery must not give up permanently.
+	if strings.Contains(html, "hls.recoverMediaError()") {
+		t.Error("in-place media recovery cannot fix a live-stream blip; rebuild the player instead")
+	}
+	for _, token := range []string{"resetPlayer", "hls.liveSyncPosition", "recoveryWatchdog"} {
+		if !strings.Contains(html, token) {
+			t.Errorf("missing live-stream player recovery %q", token)
 		}
 	}
 }
@@ -373,4 +393,3 @@ func TestFrontendDoesNotRenderADeadVideoElementForADeadSession(t *testing.T) {
 		t.Error("an affected card must say the stream was stopped deliberately, not that it failed")
 	}
 }
-
