@@ -770,6 +770,24 @@ func nextReconnectFailureCount(current int, runDuration time.Duration) int {
 	return current + 1
 }
 
+// Tuya's in-process RTSP engine is not the camera. DESCRIBE creates another
+// cloud producer, so probing its media session on reconnect competes with the
+// next ffmpeg attempt instead of diagnosing the failed one.
+func isTuyaLoopbackSource(provider models.ProviderKind, rtspURL string) bool {
+	if provider != models.ProviderTuya {
+		return false
+	}
+	parsed, err := url.Parse(rtspURL)
+	if err != nil || parsed.Scheme != "rtsp" || parsed.Port() == "" {
+		return false
+	}
+	switch parsed.Hostname() {
+	case "127.0.0.1", "::1", "localhost":
+		return true
+	}
+	return false
+}
+
 // hlsOutputUnhealthy reports a stalled stream.
 //
 // IMPORTANT: this camera's HLS muxer does not create stream.m3u8 until the first
@@ -1358,9 +1376,10 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 		process.Info.ReconnectCount = failures
 		process.Info.ReconnectDelay = delay.String()
 		rtspURL := process.Info.RtspURL
+		tuyaEngine := isTuyaLoopbackSource(process.Info.Provider, rtspURL)
 		process.mutex.Unlock()
 		onvifAddress := ""
-		if parsed, err := url.Parse(rtspURL); err == nil && parsed.Hostname() != "" {
+		if parsed, err := url.Parse(rtspURL); !tuyaEngine && err == nil && parsed.Hostname() != "" {
 			onvifAddress = net.JoinHostPort(parsed.Hostname(), "8000")
 		}
 		diagnosis := diagnoseReachability(rtspURL, onvifAddress, 2*time.Second)
@@ -1369,7 +1388,11 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 		// Probe the RTSP session itself so an exhausted session table (the
 		// ~1h "connected but no frames" stall) is identified instead of being
 		// reported as a healthy host.
-		probe, probeDetail := probeSessionState(rtspURL, sessionProbeTimeout, sessionProbeCollect)
+		var probe RTSPProbeResult
+		var probeDetail string
+		if !tuyaEngine {
+			probe, probeDetail = probeSessionState(rtspURL, sessionProbeTimeout, sessionProbeCollect)
+		}
 		if probe.SessionTableFull() {
 			// Retrying quickly cannot clear this; the camera reaps orphaned
 			// sessions on its own schedule. Hold off and keep the stream
@@ -1399,7 +1422,7 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 			process.reconnectCount = 0
 			process.mutex.Unlock()
 			continue
-		} else if probe.Err == nil {
+		} else if !tuyaEngine && probe.Err == nil {
 			diagnosis = fmt.Sprintf("%s; %s", diagnosis, probeDetail)
 		}
 
