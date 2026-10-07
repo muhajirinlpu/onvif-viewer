@@ -376,6 +376,14 @@ type Manager struct {
 	// the provider having registered a label (a restored stream). See
 	// SetStreamLabelResolver.
 	streamLabelResolver func(profileToken, rtspURL string) string
+	// recordingObserver consumes only published HLS playlists in its own goroutine.
+	// It is opt-in and never acquires stream/process locks while staging bytes.
+	recordingObserver func(camera, run, dir string, received time.Time)
+}
+
+// SetRecordingObserver must be called before streams are restored or started.
+func (sm *Manager) SetRecordingObserver(observer func(camera, run, dir string, received time.Time)) {
+	sm.recordingObserver = observer
 }
 
 // NewManager creates a new stream manager
@@ -1289,6 +1297,11 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 			// restart THIS run's ffmpeg, so the cancellation that should stop it
 			// is this run's own.
 			go sm.watchHLSOutput(process, cmd, hlsDir, startedAt, watchDone, done)
+			if sm.recordingObserver != nil {
+				// Reconnection gets a fresh run identity; no second camera input.
+				camera := string(process.Info.Provider) + ":" + process.Info.ProfileToken
+				go sm.observeRecordedPlaylist(camera, fmt.Sprintf("%s-%d", process.Info.ID, startedAt.UnixNano()), hlsDir, watchDone)
+			}
 			err = cmd.Wait()
 			close(watchDone)
 			if writer, ok := cmd.Stdout.(*filteredLogWriter); ok {

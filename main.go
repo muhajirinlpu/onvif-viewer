@@ -396,6 +396,10 @@ func main() {
 
 	// Initialize Stream Manager
 	streamManager := stream.NewManager(hlsBaseDir, dbLogger)
+	recorder, recordingToken, err := setupRecording(dbLogger, streamManager)
+	if err != nil {
+		log.Fatalf("Recording configuration rejected: %v", err)
+	}
 	go streamManager.CleanupInactiveClients()
 
 	// Tuya bridge: the Tuya source runs IN THIS PROCESS through the vendored
@@ -572,6 +576,10 @@ func main() {
 	// Define HTTP handlers
 	http.Handle("/", http.FileServer(http.FS(staticFS)))
 	http.Handle("/hls/", http.StripPrefix("/hls/", http.FileServer(http.Dir(hlsBaseDir))))
+	if recorder != nil {
+		http.Handle("/api/recordings", handlers.RecordingRoutes(recorder, recordingToken))
+		http.Handle("/api/recordings/", handlers.RecordingRoutes(recorder, recordingToken))
+	}
 
 	// API routes
 	http.HandleFunc("/api/functest", apiHandler.FuncTest)

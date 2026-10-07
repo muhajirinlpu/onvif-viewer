@@ -1085,6 +1085,19 @@
     </button>
   </div>
 
+  <section id="recording-playback" class="panel p-5" aria-label="Recorded footage">
+    <h2>Recorded footage</h2>
+    <p>Private recording playback (WIB). Paste the recording-only bearer token; it stays in this tab.</p>
+    <label>Token <input id="recording-token" type="password" autocomplete="off" /></label>
+    <label>Camera key <input id="recording-camera" placeholder="tuya:device-id or onvif:profile-token" /></label>
+    <label>From (WIB) <input id="recording-from" type="datetime-local" /></label>
+    <label>To (WIB) <input id="recording-to" type="datetime-local" /></label>
+    <button id="recording-load" type="button">Load timeline</button>
+    <p id="recording-status" role="status"></p>
+    <div id="recording-timeline" aria-label="Recording coverage and gaps"></div>
+    <video id="recording-video" controls playsinline style="width:100%;max-width:780px;background:#000"></video>
+    <button id="recording-live" type="button">Return to Live</button>
+  </section>
   <!-- Footer -->
   <footer class="footer-shell page-container border-t border-slate-200 dark:border-white/10">
     <div class="text-slate-500 dark:text-slate-400">
@@ -2273,6 +2286,61 @@
         };
       },
     }).mount('#app');
+  </script>
+  <script>
+    (() => {
+      const $ = id => document.getElementById(id);
+      const player = $('recording-video');
+      let hls = null;
+      let intervals = [];
+      const status = message => { $('recording-status').textContent = message; };
+      const dateWIB = iso => new Intl.DateTimeFormat('en-GB', {timeZone:'Asia/Jakarta', dateStyle:'medium', timeStyle:'medium'}).format(new Date(iso));
+      const iso = id => {const value = $(id).value; return value ? new Date(value+':00+07:00').toISOString() : '';};
+      function playInterval(index) {
+        const s = intervals[index]; if (!s) return;
+        const token = $('recording-token').value;
+        const query = new URLSearchParams({camera:$('recording-camera').value,from:s.start,to:s.end});
+        if (hls) {hls.destroy();hls=null;}
+        player.pause();player.removeAttribute('src');player.load();
+        const url = '/api/recordings/playlist.m3u8?' + query;
+        if (window.Hls && Hls.isSupported()) {
+          hls = new Hls({xhrSetup:xhr => xhr.setRequestHeader('Authorization', 'Bearer '+token)});
+          hls.on(Hls.Events.ERROR, (_,data) => {if(data.fatal)status('Playback error: '+data.details);});
+          hls.loadSource(url);hls.attachMedia(player);
+          hls.on(Hls.Events.MANIFEST_PARSED, () => player.play().catch(() => status('Press play to begin')));
+        } else {status('Authenticated HLS playback requires hls.js in this browser');return;}
+        status('Playing recorded footage from '+dateWIB(s.start));
+      }
+      $('recording-load').addEventListener('click', async () => {
+        try {
+          const from=iso('recording-from'), to=iso('recording-to');
+          const query=new URLSearchParams({camera:$('recording-camera').value,from,to});
+          const response=await fetch('/api/recordings?'+query,{headers:{Authorization:'Bearer '+$('recording-token').value},cache:'no-store'});
+          if(!response.ok) throw new Error('Coverage HTTP '+response.status);
+          const data=await response.json();
+          intervals=[];
+          const explicitGaps=[];
+          for (const segment of (data.segments || [])) {
+            if(segment.state==='gap'){explicitGaps.push(segment);continue;}
+            const previous=intervals[intervals.length-1];
+            if (previous && !segment.discontinuity && new Date(segment.start)-new Date(previous.end)<=1000 && new Date(segment.start)>=new Date(previous.start)) {
+              previous.end=segment.end;
+            } else intervals.push({start:segment.start,end:segment.end});
+          }
+          const container=$('recording-timeline');container.replaceChildren();
+          let last=new Date(from).getTime();
+          intervals.forEach((s,index) => {
+            const start=new Date(s.start).getTime();
+            if(start>last+1000){const gap=document.createElement('span');gap.textContent=' Gap: '+dateWIB(new Date(last).toISOString())+' – '+dateWIB(s.start)+' ';container.append(gap);}
+            const button=document.createElement('button');button.type='button';button.textContent=dateWIB(s.start)+' – '+dateWIB(s.end);button.addEventListener('click',()=>playInterval(index));container.append(button);
+            last=Math.max(last,new Date(s.end).getTime());
+          });
+          for(const gap of explicitGaps){const label=document.createElement('span');label.textContent=' Capture failed / gap: '+dateWIB(gap.start)+' – '+dateWIB(gap.end)+' ';container.append(label);}
+          status((intervals.length ? intervals.length+' recorded interval(s); select one to play or seek with the video controls' : 'No recorded footage in this interval')+(explicitGaps.length?' — '+explicitGaps.length+' capture gap(s)':'');
+        } catch(error){status(error.message);}
+      });
+      $('recording-live').addEventListener('click',()=>{if(hls){hls.destroy();hls=null;}player.pause();player.removeAttribute('src');player.load();status('Returned to Live; live stream cards are unchanged');document.querySelector('.stream-grid')?.scrollIntoView({behavior:'smooth'});});
+    })();
   </script>
 </body>
 
