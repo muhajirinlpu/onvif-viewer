@@ -342,8 +342,10 @@ type Process struct {
 	// transient /proc failure cannot make the manager lose track of a group it
 	// owns (MEASURED: that failure made a leak check report a live ffmpeg as
 	// absent). Guarded by mutex.
-	pgid  int
-	mutex sync.RWMutex
+	pgid int
+	// lastFreshnessRecovery persists across ffmpeg runs to bound automatic restarts.
+	lastFreshnessRecovery time.Time
+	mutex                 sync.RWMutex
 }
 
 // Manager manages multiple video streams
@@ -1300,6 +1302,9 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 
 	for {
 		startedAt := time.Now()
+		process.mutex.Lock()
+		process.Info.Freshness = nil // prior run's rate is not this run's rate
+		process.mutex.Unlock()
 		// Remove stale metadata from a prior attempt so the new process gets its
 		// complete startup grace period before health evaluation.
 		_ = os.Remove(filepath.Join(hlsDir, "stream.m3u8"))
@@ -1314,7 +1319,10 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 			// semantically it is the correct one: the watchdog exists only to
 			// restart THIS run's ffmpeg, so the cancellation that should stop it
 			// is this run's own.
-			go sm.watchHLSOutput(process, cmd, hlsDir, startedAt, watchDone, done)
+			process.mutex.RLock()
+			freshnessCooldownStart := process.lastFreshnessRecovery
+			process.mutex.RUnlock()
+			go sm.watchHLSOutput(process, cmd, hlsDir, startedAt, watchDone, done, runID, freshnessCooldownStart)
 			if sm.recordingObserver != nil {
 				// Reconnection gets a fresh run identity; no second camera input.
 				camera := string(process.Info.Provider) + ":" + process.Info.ProfileToken
@@ -1449,8 +1457,10 @@ func (sm *Manager) monitorStreamWithReconnect(process *Process, hlsDir string) {
 // runDone is the Done channel of the monitor run that started this ffmpeg. It is
 // passed in rather than read from process.Done, because a resume replaces that
 // field and reading it here raced the write.
-func (sm *Manager) watchHLSOutput(process *Process, cmd *exec.Cmd, hlsDir string, startedAt time.Time, done <-chan struct{}, runDone <-chan bool) {
+func (sm *Manager) watchHLSOutput(process *Process, cmd *exec.Cmd, hlsDir string, startedAt time.Time, done <-chan struct{}, runDone <-chan bool, runID uint64, lastRecovery time.Time) {
 	playlist := filepath.Join(hlsDir, "stream.m3u8")
+	var freshness hlsFreshness
+	freshness.cooldownUntil = lastRecovery.Add(freshnessCooldown)
 	ticker := time.NewTicker(hlsHealthInterval)
 	defer ticker.Stop()
 	// Track progress across playlist and segment files, since this camera does
@@ -1467,6 +1477,18 @@ func (sm *Manager) watchHLSOutput(process *Process, cmd *exec.Cmd, hlsDir string
 					process.Info.LastHLSAdvance = &advanced
 				}
 				process.mutex.Unlock()
+			}
+			process.mutex.RLock()
+			provider := process.Info.Provider
+			process.mutex.RUnlock()
+			if provider == models.ProviderTuya {
+				sample := freshness.observe(hlsDir, now, provider)
+				process.publishFreshness(sample, now, runID)
+				if sample.recover && process.recoverFreshness(cmd, runID, now) {
+					sm.publishState(process, "reconnecting", fmt.Sprintf("HLS elapsed media exceeds elapsed wall by %.1fs; Tuya-only recovery", sample.driftSeconds))
+					sm.logger.LogWarn(process.Info.ID, "system", fmt.Sprintf("Tuya HLS elapsed drift %.1fs (wall %.1fs, media %.1fs); restarting owned FFmpeg", sample.driftSeconds, sample.wallSeconds, sample.mediaSeconds))
+					return
+				}
 			}
 			if !hlsRunUnhealthy(hlsDir, &lastProgress, &lastName, now, startedAt, hlsStallTimeout) {
 				continue

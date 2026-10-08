@@ -54,6 +54,17 @@ type GetStreamUriRequest struct {
 	ProfileToken string `json:"profileToken"`
 }
 
+// HLSFreshness is a rate comparison, not an absolute capture timestamp.
+// Positive drift means published media duration is outpacing wall time;
+// it does not identify where frames were buffered before HLS publishing.
+type HLSFreshness struct {
+	Kind                string    `json:"kind"`
+	MeasuredAt          time.Time `json:"measuredAt"`
+	WallElapsedSeconds  float64   `json:"wallElapsedSeconds"`
+	MediaElapsedSeconds float64   `json:"mediaElapsedSeconds"`
+	DriftSeconds        float64   `json:"driftSeconds"`
+}
+
 // StreamInfo contains information about an active FFmpeg stream.
 type StreamInfo struct {
 	ID           string       `json:"id"`
@@ -86,6 +97,11 @@ type StreamInfo struct {
 	ReconnectDelay string `json:"reconnectDelay,omitempty"`
 	// LastHLSAdvance is when the HLS playlist last moved forward.
 	LastHLSAdvance *time.Time `json:"lastHlsAdvance,omitempty"`
+	// Freshness compares the elapsed duration of newly completed HLS segments
+	// with wall elapsed time within one encoder run. It is not capture age,
+	// source PTS, program-date-time, or browser playback latency.
+	Freshness *HLSFreshness `json:"freshness,omitempty"`
+
 	// Detail is a secret-free explanation of the stream's current condition.
 	Detail string `json:"detail,omitempty"`
 	// Output reports which video output path this stream's ffmpeg is on:
