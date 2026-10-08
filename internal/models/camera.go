@@ -58,11 +58,14 @@ type GetStreamUriRequest struct {
 // Positive drift means published media duration is outpacing wall time;
 // it does not identify where frames were buffered before HLS publishing.
 type HLSFreshness struct {
-	Kind                string    `json:"kind"`
-	MeasuredAt          time.Time `json:"measuredAt"`
-	WallElapsedSeconds  float64   `json:"wallElapsedSeconds"`
-	MediaElapsedSeconds float64   `json:"mediaElapsedSeconds"`
-	DriftSeconds        float64   `json:"driftSeconds"`
+	// CaptureLatencyStatus is explicit because elapsed HLS drift is not capture
+	// age. The current bridge carries no trusted capture-clock mapping.
+	CaptureLatencyStatus string    `json:"captureLatencyStatus"`
+	Kind                 string    `json:"kind"`
+	MeasuredAt           time.Time `json:"measuredAt"`
+	WallElapsedSeconds   float64   `json:"wallElapsedSeconds"`
+	MediaElapsedSeconds  float64   `json:"mediaElapsedSeconds"`
+	DriftSeconds         float64   `json:"driftSeconds"`
 }
 
 // StreamInfo contains information about an active FFmpeg stream.

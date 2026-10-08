@@ -43,5 +43,5 @@ func (p *Process) publishFreshness(s freshnessSample, now time.Time, runID uint6
 		p.Info.Freshness = nil
 		return
 	}
-	p.Info.Freshness = &models.HLSFreshness{Kind: "hls_elapsed_drift", MeasuredAt: now, WallElapsedSeconds: s.wallSeconds, MediaElapsedSeconds: s.mediaSeconds, DriftSeconds: s.driftSeconds}
+	p.Info.Freshness = &models.HLSFreshness{CaptureLatencyStatus: "unavailable_no_source_clock", Kind: "hls_elapsed_drift", MeasuredAt: now, WallElapsedSeconds: s.wallSeconds, MediaElapsedSeconds: s.mediaSeconds, DriftSeconds: s.driftSeconds}
 }

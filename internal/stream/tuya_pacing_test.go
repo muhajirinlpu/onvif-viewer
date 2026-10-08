@@ -281,20 +281,22 @@ func TestTuyaSDRetimedArgsShape(t *testing.T) {
 	want := "-y -fflags +genpts+igndts -rtsp_transport tcp -rtsp_flags prefer_tcp " +
 		"-use_wallclock_as_timestamps 0 -itsscale:v 1.50 -timeout 30000000 " +
 		"-i rtsp://127.0.0.1:1/tuya_camera " +
-		"-c:v copy -c:a aac -af " + tuyaSDAudioFilter + " -avoid_negative_ts make_zero -max_interleave_delta 0 " +
+		"-c:v copy -c:a aac -af " + tuyaSDAudioFilter + " -avoid_negative_ts make_zero -max_interleave_delta 1000000 " +
 		"-hls_time 2 -hls_list_size 5 -hls_start_number_source epoch " +
 		"-hls_flags delete_segments+independent_segments -hls_segment_type mpegts " +
 		"-f hls /tmp/hls/stream.m3u8"
 	if got != want {
 		t.Fatalf("Tuya SD retimed args changed\ngot:  %s\nwant: %s", got, want)
 	}
-	// The ONLY difference from the pinned ONVIF/SD list is the input timing flags.
-	// Anyone adding another flag to this path has to justify it here.
+	// Tuya differs only by measured input timing/audio flags and a finite mux
+	// interleave limit. Zero is unbounded and the synthetic capture replay proves
+	// that it queues minutes of video behind an independently clocked audio track.
 	onvif := joinedArgs(m.ffmpegArgsFor("rtsp://127.0.0.1:1/tuya_camera", "/tmp/hls", OutputCopyMPEGTS))
 	timing := "-use_wallclock_as_timestamps 0 -itsscale:v " + strconv.FormatFloat(tuyaSDTimeScale, 'f', 2, 64) + " "
 	audio := "-af " + tuyaSDAudioFilter + " "
 	diff := strings.Replace(got, timing, "", 1)
 	diff = strings.Replace(diff, audio, "", 1)
+	diff = strings.Replace(diff, "-max_interleave_delta 1000000", "-max_interleave_delta 0", 1)
 	if diff != onvif {
 		t.Fatalf("the Tuya path differs from the ONVIF/SD path by more than the measured input flag\nremove: %s\nonvif: %s", diff, onvif)
 	}

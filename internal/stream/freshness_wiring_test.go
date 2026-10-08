@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"encoding/json"
 	"os/exec"
 	"syscall"
 	"testing"
@@ -102,6 +103,17 @@ func TestTelemetryIncludesElapsedWallMediaNotCaptureTimestamp(t *testing.T) {
 	now := time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC)
 	p.publishFreshness(freshnessSample{updated: true, valid: true, wallSeconds: 600, mediaSeconds: 660, driftSeconds: 60}, now, 1)
 	got := p.Info.Freshness
+	wire, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(wire, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if fields["captureLatencyStatus"] != "unavailable_no_source_clock" {
+		t.Fatalf("must explicitly report unavailable capture latency: %s", wire)
+	}
 	if got == nil || got.WallElapsedSeconds != 600 || got.MediaElapsedSeconds != 660 || got.DriftSeconds != 60 || got.MeasuredAt != now || got.Kind != "hls_elapsed_drift" {
 		t.Fatalf("honest drift snapshot: %+v", got)
 	}

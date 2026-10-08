@@ -1217,7 +1217,7 @@ func (sm *Manager) ffmpegArgsFor(rtspURL string, hlsDir string, path VideoOutput
 
 	args = append(args,
 		"-avoid_negative_ts", "make_zero", // Handle negative timestamps
-		"-max_interleave_delta", "0", // Do not buffer to re-order; keep latency low
+		"-max_interleave_delta", interleaveDeltaFor(path), // Zero means unbounded, not disabled.
 		"-hls_time", "2", // 2 second segments
 		"-hls_list_size", "5", // Keep 5 segments in playlist
 		"-hls_start_number_source", "epoch", // Keep sequence monotonic across reconnects
@@ -1227,6 +1227,19 @@ func (sm *Manager) ffmpegArgsFor(rtspURL string, hlsDir string, path VideoOutput
 		filepath.Join(hlsDir, "stream.m3u8"),
 	)
 	return args
+}
+
+// interleaveDeltaFor bounds the Tuya SD mux queue in timestamp space. Its
+// independently clocked video (scaled) and audio can diverge over long runs.
+// FFmpeg's zero disables its escape limit and lets the leading stream build an
+// arbitrarily old queue behind the lagging stream. A positive value forces
+// packets out without dropping encoded frames or resetting either timebase.
+// Other provider/output paths retain their existing behavior.
+func interleaveDeltaFor(path VideoOutputPath) string {
+	if path == OutputTuyaSDRetimed {
+		return "1000000"
+	}
+	return "0"
 }
 
 // ffmpegExecutable resolves the encoder binary. Empty means the PATH's ffmpeg,
