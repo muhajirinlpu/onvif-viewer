@@ -1083,21 +1083,74 @@
       class="mobile-fab fixed bottom-5 right-5 z-40 items-center justify-center w-14 h-14 bg-indigo-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 shadow-xl transition-transform hover:scale-105 p-4 rounded-full">
       <i class="fas fa-cog text-xl"></i>
     </button>
-  </div>
 
-  <section id="recording-playback" class="panel p-5" aria-label="Recorded footage">
-    <h2>Recorded footage</h2>
-    <p>Private recording playback (WIB). Paste the recording-only bearer token; it stays in this tab.</p>
-    <label>Token <input id="recording-token" type="password" autocomplete="off" /></label>
-    <label>Camera key <input id="recording-camera" placeholder="tuya:device-id or onvif:profile-token" /></label>
-    <label>From (WIB) <input id="recording-from" type="datetime-local" /></label>
-    <label>To (WIB) <input id="recording-to" type="datetime-local" /></label>
-    <button id="recording-load" type="button">Load timeline</button>
-    <p id="recording-status" role="status"></p>
-    <div id="recording-timeline" aria-label="Recording coverage and gaps"></div>
-    <video id="recording-video" controls playsinline style="width:100%;max-width:780px;background:#000"></video>
-    <button id="recording-live" type="button">Return to Live</button>
+  <section id="recording-playback" class="panel page-container mt-6" aria-label="Recorded footage">
+    <button type="button" class="panel-heading cursor-pointer w-full text-left" @click="toggleRecording"
+      :aria-expanded="String(!recordingCollapsed)" aria-controls="recording-playback-body">
+      <span class="flex items-center justify-between w-full">
+        <span class="flex items-center">
+          <i class="fas fa-history mr-2 text-indigo-500 dark:text-blue-400"></i>
+          <span class="text-lg font-semibold">Recorded footage</span>
+          <span class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-slate-100 dark:bg-white/10 text-slate-600 dark:text-slate-300 ml-3">
+            PLAYBACK
+          </span>
+        </span>
+        <i class="fas fa-chevron-up transition-transform" :class="recordingCollapsed ? 'rotate-180' : ''"></i>
+      </span>
+    </button>
+
+    <div id="recording-playback-body" class="transition-all duration-300" v-show="!recordingCollapsed">
+      <div class="panel-body p-5">
+        <p class="text-sm text-slate-500 dark:text-slate-400 mb-4">
+          Private recording playback, shown in WIB. Paste the recording-only bearer token; it stays in this tab
+          and is never sent anywhere except this viewer.
+        </p>
+
+        <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+          <label class="flex flex-col gap-1.5 text-sm text-slate-600 dark:text-slate-300">
+            <span class="font-medium">Recording token</span>
+            <input id="recording-token" type="password" autocomplete="off"
+              class="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-white/15 bg-white dark:bg-white/5 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/40" />
+          </label>
+          <label class="flex flex-col gap-1.5 text-sm text-slate-600 dark:text-slate-300">
+            <span class="font-medium">Camera key</span>
+            <input id="recording-camera" placeholder="tuya:device-id or onvif:profile-token"
+              class="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-white/15 bg-white dark:bg-white/5 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/40" />
+          </label>
+          <label class="flex flex-col gap-1.5 text-sm text-slate-600 dark:text-slate-300">
+            <span class="font-medium">From (WIB)</span>
+            <input id="recording-from" type="datetime-local"
+              class="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-white/15 bg-white dark:bg-white/5 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/40" />
+          </label>
+          <label class="flex flex-col gap-1.5 text-sm text-slate-600 dark:text-slate-300">
+            <span class="font-medium">To (WIB)</span>
+            <input id="recording-to" type="datetime-local"
+              class="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-white/15 bg-white dark:bg-white/5 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/40" />
+          </label>
+        </div>
+
+        <div class="flex flex-wrap items-center gap-3 mt-4">
+          <button id="recording-load" type="button"
+            class="inline-flex items-center px-4 py-2 rounded-lg bg-indigo-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 text-sm font-medium disabled:opacity-50">
+            <i class="fas fa-list-ul mr-2"></i> Load timeline
+          </button>
+          <button id="recording-live" type="button"
+            class="inline-flex items-center px-4 py-2 rounded-lg border border-slate-300 dark:border-white/15 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-white/10 text-sm font-medium">
+            <i class="fas fa-satellite-dish mr-2"></i> Return to Live
+          </button>
+        </div>
+
+        <p id="recording-status" role="status" class="text-sm text-slate-500 dark:text-slate-400 mt-3"></p>
+
+        <div id="recording-timeline" aria-label="Recording coverage and gaps"
+          class="flex flex-wrap gap-2 mt-3 empty:mt-0"></div>
+
+        <video id="recording-video" controls playsinline
+          class="w-full max-w-[780px] bg-black rounded-lg mt-4"></video>
+      </div>
+    </div>
   </section>
+  </div>
   <!-- Footer -->
   <footer class="footer-shell page-container border-t border-slate-200 dark:border-white/10">
     <div class="text-slate-500 dark:text-slate-400">
@@ -1134,6 +1187,7 @@
         const logConnectionStatus = ref('disconnected');
         const maxLogEntries = ref(250);
         const logsCollapsed = ref(true);
+        const recordingCollapsed = ref(true); // Recording playback is secondary to live
         const logsContainer = ref(null);
         let eventSource = null;
         let modalTrigger = null;
@@ -1733,6 +1787,10 @@
           }
         });
 
+        const toggleRecording = () => {
+          recordingCollapsed.value = !recordingCollapsed.value;
+        };
+
         const toggleLogsPanel = () => {
           logsCollapsed.value = !logsCollapsed.value;
 
@@ -2283,6 +2341,8 @@
           refreshTuyaCameras,
           signOutTuya,
           startTuyaCamera,
+          recordingCollapsed,
+          toggleRecording,
         };
       },
     }).mount('#app');
@@ -2293,7 +2353,11 @@
       const player = $('recording-video');
       let hls = null;
       let intervals = [];
-      const status = message => { $('recording-status').textContent = message; };
+      const status = message => {
+        const el = $('recording-status');
+        el.textContent = message;
+        el.classList.toggle('hidden', !message);
+      };
       const dateWIB = iso => new Intl.DateTimeFormat('en-GB', {timeZone:'Asia/Jakarta', dateStyle:'medium', timeStyle:'medium'}).format(new Date(iso));
       const iso = id => {const value = $(id).value; return value ? new Date(value+':00+07:00').toISOString() : '';};
       function playInterval(index) {
@@ -2331,11 +2395,26 @@
           let last=new Date(from).getTime();
           intervals.forEach((s,index) => {
             const start=new Date(s.start).getTime();
-            if(start>last+1000){const gap=document.createElement('span');gap.textContent=' Gap: '+dateWIB(new Date(last).toISOString())+' – '+dateWIB(s.start)+' ';container.append(gap);}
-            const button=document.createElement('button');button.type='button';button.textContent=dateWIB(s.start)+' – '+dateWIB(s.end);button.addEventListener('click',()=>playInterval(index));container.append(button);
+            if(start>last+1000){
+              const gap=document.createElement('span');
+              gap.className='inline-flex items-center px-3 py-1.5 rounded-lg text-xs font-medium bg-amber-100/60 dark:bg-amber-500/15 text-amber-700 dark:text-amber-300';
+              gap.textContent='Gap: '+dateWIB(new Date(last).toISOString())+' – '+dateWIB(s.start);
+              container.append(gap);
+            }
+            const button=document.createElement('button');
+            button.type='button';
+            button.className='inline-flex items-center px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-300 dark:border-white/15 hover:bg-indigo-600 hover:text-white dark:hover:bg-blue-500 transition-colors';
+            button.textContent=dateWIB(s.start)+' – '+dateWIB(s.end);
+            button.addEventListener('click',()=>playInterval(index));
+            container.append(button);
             last=Math.max(last,new Date(s.end).getTime());
           });
-          for(const gap of explicitGaps){const label=document.createElement('span');label.textContent=' Capture failed / gap: '+dateWIB(gap.start)+' – '+dateWIB(gap.end)+' ';container.append(label);}
+          for(const gap of explicitGaps){
+            const label=document.createElement('span');
+            label.className='inline-flex items-center px-3 py-1.5 rounded-lg text-xs font-medium bg-red-100/60 dark:bg-red-500/15 text-red-700 dark:text-red-300';
+            label.textContent='Capture failed: '+dateWIB(gap.start)+' – '+dateWIB(gap.end);
+            container.append(label);
+          }
           status((intervals.length ? intervals.length+' recorded interval(s); select one to play or seek with the video controls' : 'No recorded footage in this interval')+(explicitGaps.length?' — '+explicitGaps.length+' capture gap(s)':'');
         } catch(error){status(error.message);}
       });
