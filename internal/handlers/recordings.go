@@ -18,7 +18,11 @@ import (
 
 // RecordingRoutes is deliberately separate from legacy unauthenticated live APIs.
 // A missing token denies every method, including HEAD, before catalog access.
-func RecordingRoutes(rec *recording.Recorder, token string) http.Handler {
+func RecordingRoutes(rec *recording.Recorder, token string, opts ...RecordingOption) http.Handler {
+	cfg := recordingRouteConfig{}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Referrer-Policy", "no-referrer")
@@ -30,12 +34,21 @@ func RecordingRoutes(rec *recording.Recorder, token string) http.Handler {
 			http.Error(w, "recording unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		if r.Method != "GET" && r.Method != "HEAD" {
+		path := strings.TrimPrefix(r.URL.Path, "/api/recordings")
+		// The status/config surface accepts POST on settings only; the media
+		// surface accepts GET/HEAD only. Method rules are decided per route so a
+		// write cannot ride in on the read path.
+		readOnly := path != "/settings"
+		if readOnly && r.Method != "GET" && r.Method != "HEAD" {
 			w.Header().Set("Allow", "GET, HEAD")
 			http.Error(w, "method not allowed", 405)
 			return
 		}
-		path := strings.TrimPrefix(r.URL.Path, "/api/recordings")
+		if !readOnly && r.Method != "GET" && r.Method != "HEAD" && r.Method != "POST" {
+			w.Header().Set("Allow", "GET, HEAD, POST")
+			http.Error(w, "method not allowed", 405)
+			return
+		}
 		switch {
 		case path == "" || path == "/":
 			camera := r.URL.Query().Get("camera")
@@ -54,6 +67,34 @@ func RecordingRoutes(rec *recording.Recorder, token string) http.Handler {
 			if r.Method == "GET" {
 				_ = json.NewEncoder(w).Encode(map[string]any{"segments": segs, "camera": camera})
 			}
+		case path == "/status":
+			status, e := rec.Status()
+			if e != nil {
+				http.Error(w, "recording status unavailable", http.StatusInternalServerError)
+				return
+			}
+			writeRecordingJSON(w, r, status)
+		case path == "/summary":
+			camera := r.URL.Query().Get("camera")
+			from, e1 := time.Parse(time.RFC3339, r.URL.Query().Get("from"))
+			to, e2 := time.Parse(time.RFC3339, r.URL.Query().Get("to"))
+			if e1 != nil || e2 != nil {
+				http.Error(w, "from/to required in RFC3339", 400)
+				return
+			}
+			buckets, e := parseBuckets(r.URL.Query().Get("buckets"))
+			if e != nil {
+				http.Error(w, "buckets must be a positive integer", 400)
+				return
+			}
+			summary, e := rec.Summary(camera, from, to, buckets)
+			if e != nil {
+				http.Error(w, "invalid summary query", 400)
+				return
+			}
+			writeRecordingJSON(w, r, summary)
+		case path == "/settings":
+			handleSettings(w, r, rec, cfg)
 		case path == "/playlist.m3u8":
 			from, e1 := time.Parse(time.RFC3339, r.URL.Query().Get("from"))
 			to, e2 := time.Parse(time.RFC3339, r.URL.Query().Get("to"))

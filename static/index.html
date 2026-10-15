@@ -1142,8 +1142,80 @@
 
         <p id="recording-status" role="status" class="text-sm text-slate-500 dark:text-slate-400 mt-3"></p>
 
+        <!-- Coverage timeline: recorded-vs-gap proportion for the selected window. -->
+        <div id="recording-timeline-panel" class="mt-4">
+          <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+            <span class="text-sm font-medium text-slate-600 dark:text-slate-300">Coverage timeline (WIB)</span>
+            <span class="flex items-center gap-2">
+              <button id="recording-zoom-in" type="button" aria-label="Zoom timeline in"
+                class="px-2.5 py-1 rounded-lg border border-slate-300 dark:border-white/15 text-xs text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-white/10">Zoom in</button>
+              <button id="recording-zoom-out" type="button" aria-label="Zoom timeline out"
+                class="px-2.5 py-1 rounded-lg border border-slate-300 dark:border-white/15 text-xs text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-white/10">Zoom out</button>
+              <button id="recording-zoom-reset" type="button" aria-label="Reset timeline zoom"
+                class="px-2.5 py-1 rounded-lg border border-slate-300 dark:border-white/15 text-xs text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-white/10">Reset</button>
+            </span>
+          </div>
+          <div id="recording-strip" role="img" aria-label="Recorded versus gap proportion for the selected window"
+            class="relative w-full h-8 rounded-lg overflow-hidden bg-slate-100 dark:bg-white/10 border border-slate-200 dark:border-white/10">
+            <div id="recording-strip-recorded" class="absolute inset-y-0 left-0 bg-indigo-500/80 dark:bg-blue-500/80" style="width:0%"></div>
+            <div id="recording-strip-cursor" class="absolute inset-y-0 w-0.5 bg-red-500" style="left:0%"></div>
+          </div>
+          <div id="recording-strip-meta" class="flex flex-wrap items-center gap-3 mt-1.5 text-xs text-slate-500 dark:text-slate-400"></div>
+          <p id="recording-truncation" role="status" class="text-xs text-amber-700 dark:text-amber-300 mt-1.5 hidden"></p>
+        </div>
+
         <div id="recording-timeline" aria-label="Recording coverage and gaps"
           class="flex flex-wrap gap-2 mt-3 empty:mt-0"></div>
+
+        <!-- Storage and configuration sub-section. -->
+        <div id="recording-config" class="mt-5 border-t border-slate-200 dark:border-white/10 pt-4">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <span class="text-sm font-medium text-slate-600 dark:text-slate-300">Storage &amp; configuration</span>
+            <button id="recording-config-refresh" type="button"
+              class="px-2.5 py-1 rounded-lg border border-slate-300 dark:border-white/15 text-xs text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-white/10">Refresh</button>
+          </div>
+          <dl id="recording-config-fields" class="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-x-6 gap-y-2 mt-3 text-sm">
+            <div class="flex justify-between gap-3"><dt class="text-slate-500 dark:text-slate-400">Driver</dt><dd id="recording-config-driver" class="font-medium text-slate-800 dark:text-slate-100">—</dd></div>
+            <div class="flex justify-between gap-3"><dt class="text-slate-500 dark:text-slate-400">Location</dt><dd id="recording-config-location" class="font-medium text-slate-800 dark:text-slate-100 truncate">—</dd></div>
+            <div class="flex justify-between gap-3"><dt class="text-slate-500 dark:text-slate-400">Paused</dt><dd id="recording-config-paused" class="font-medium text-slate-800 dark:text-slate-100">—</dd></div>
+            <div class="flex justify-between gap-3"><dt class="text-slate-500 dark:text-slate-400">Quota</dt><dd id="recording-config-quota" class="font-medium text-slate-800 dark:text-slate-100">—</dd></div>
+            <div class="flex justify-between gap-3"><dt class="text-slate-500 dark:text-slate-400">Used</dt><dd id="recording-config-used" class="font-medium text-slate-800 dark:text-slate-100">—</dd></div>
+            <div class="flex justify-between gap-3"><dt class="text-slate-500 dark:text-slate-400">Free</dt><dd id="recording-config-free" class="font-medium text-slate-800 dark:text-slate-100">—</dd></div>
+            <div class="flex justify-between gap-3"><dt class="text-slate-500 dark:text-slate-400">Pending uploads</dt><dd id="recording-config-uploads" class="font-medium text-slate-800 dark:text-slate-100">—</dd></div>
+            <div class="flex justify-between gap-3"><dt class="text-slate-500 dark:text-slate-400">Oldest pending</dt><dd id="recording-config-oldest" class="font-medium text-slate-800 dark:text-slate-100">—</dd></div>
+            <div class="flex justify-between gap-3"><dt class="text-slate-500 dark:text-slate-400">Pending deletions</dt><dd id="recording-config-deletions" class="font-medium text-slate-800 dark:text-slate-100">—</dd></div>
+            <div class="flex justify-between gap-3"><dt class="text-slate-500 dark:text-slate-400">App key</dt><dd id="recording-config-appkey" class="font-medium text-slate-800 dark:text-slate-100">—</dd></div>
+          </dl>
+          <p id="recording-config-switch" class="text-xs text-slate-500 dark:text-slate-400 mt-2"></p>
+          <p id="recording-config-note" class="text-xs text-amber-700 dark:text-amber-300 mt-1"></p>
+
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
+            <label class="flex flex-col gap-1.5 text-sm text-slate-600 dark:text-slate-300">
+              <span class="font-medium">Retention (days)</span>
+              <input id="recording-config-retention" type="number" min="1" step="1"
+                class="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-white/15 bg-white dark:bg-white/5 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/40" />
+            </label>
+            <label class="flex flex-col gap-1.5 text-sm text-slate-600 dark:text-slate-300">
+              <span class="font-medium">Quota (bytes)</span>
+              <input id="recording-config-quota-input" type="number" min="1" step="1"
+                class="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-white/15 bg-white dark:bg-white/5 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/40" />
+            </label>
+            <label class="flex flex-col gap-1.5 text-sm text-slate-600 dark:text-slate-300">
+              <span class="font-medium">Reserve (bytes)</span>
+              <input id="recording-config-reserve-input" type="number" min="0" step="1"
+                class="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-white/15 bg-white dark:bg-white/5 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500/40" />
+            </label>
+          </div>
+          <button id="recording-config-save" type="button"
+            class="inline-flex items-center px-4 py-2 mt-3 rounded-lg bg-indigo-600 dark:bg-blue-500 text-white hover:bg-blue-700 dark:hover:bg-blue-600 text-sm font-medium">
+            <i class="fas fa-floppy-disk mr-2"></i> Save limits
+          </button>
+
+          <div id="recording-cameras" class="mt-4">
+            <span class="text-sm font-medium text-slate-600 dark:text-slate-300">Per-camera recording</span>
+            <div id="recording-camera-list" class="flex flex-col gap-2 mt-2"></div>
+          </div>
+        </div>
 
         <video id="recording-video" controls playsinline
           class="w-full max-w-[780px] bg-black rounded-lg mt-4"></video>
@@ -2350,75 +2422,342 @@
   <script>
     (() => {
       const $ = id => document.getElementById(id);
-      const player = $('recording-video');
-      let hls = null;
-      let intervals = [];
+      // MEASURED: Vue replaces the panel subtree when it mounts, so an element
+      // reference captured at parse time points at a DETACHED node. hls.js then
+      // attaches to a video nobody can see, the element never fires loadeddata,
+      // and currentTime stays 0. Every access is therefore resolved lazily by
+      // id, and only the live node is ever touched.
+      const video = () => $('recording-video');
       const status = message => {
         const el = $('recording-status');
+        if (!el) return;
         el.textContent = message;
         el.classList.toggle('hidden', !message);
       };
+      let hls = null;
+      let intervals = [];
       const dateWIB = iso => new Intl.DateTimeFormat('en-GB', {timeZone:'Asia/Jakarta', dateStyle:'medium', timeStyle:'medium'}).format(new Date(iso));
       const iso = id => {const value = $(id).value; return value ? new Date(value+':00+07:00').toISOString() : '';};
+      function stopPlayback(){
+        if (hls) {hls.destroy();hls=null;}
+        const el = video();
+        if (el) {el.pause();el.removeAttribute('src');el.load();}
+      }
       function playInterval(index) {
         const s = intervals[index]; if (!s) return;
+        const el = video(); if (!el) return;
         const token = $('recording-token').value;
         const query = new URLSearchParams({camera:$('recording-camera').value,from:s.start,to:s.end});
-        if (hls) {hls.destroy();hls=null;}
-        player.pause();player.removeAttribute('src');player.load();
+        stopPlayback();
         const url = '/api/recordings/playlist.m3u8?' + query;
         if (window.Hls && Hls.isSupported()) {
           hls = new Hls({xhrSetup:xhr => xhr.setRequestHeader('Authorization', 'Bearer '+token)});
           hls.on(Hls.Events.ERROR, (_,data) => {if(data.fatal)status('Playback error: '+data.details);});
-          hls.loadSource(url);hls.attachMedia(player);
-          hls.on(Hls.Events.MANIFEST_PARSED, () => player.play().catch(() => status('Press play to begin')));
+          hls.loadSource(url);hls.attachMedia(el);
+          hls.on(Hls.Events.MANIFEST_PARSED, () => el.play().catch(() => status('Press play to begin')));
         } else {status('Authenticated HLS playback requires hls.js in this browser');return;}
         status('Playing recorded footage from '+dateWIB(s.start));
       }
-      $('recording-load').addEventListener('click', async () => {
+      // ---- Coverage timeline (recorded vs gap) --------------------------------
+      // All times are STORED as UTC and DISPLAYED in WIB. The strip is driven by
+      // the bounded summary endpoint, never by an unbounded coverage read.
+      const wib = value => new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Jakarta',dateStyle:'medium',timeStyle:'medium'}).format(new Date(value));
+      let summary = null;
+      let referenceFrom = null, referenceTo = null;   // the full loaded window
+      let windowFrom = null, windowTo = null;         // the zoomed sub-window
+
+      const authHeaders = () => ({Authorization:'Bearer '+$('recording-token').value});
+
+      function humanBytes(bytes){
+        if(!Number.isFinite(bytes)) return '—';
+        const units=['B','KiB','MiB','GiB','TiB'];let v=bytes,i=0;
+        while(v>=1024 && i<units.length-1){v/=1024;i++;}
+        return (i===0?v.toFixed(0):v.toFixed(2))+' '+units[i];
+      }
+      function humanAge(seconds){
+        if(!Number.isFinite(seconds)||seconds<=0) return 'none';
+        if(seconds<60) return seconds.toFixed(0)+'s';
+        if(seconds<3600) return (seconds/60).toFixed(1)+' min';
+        return (seconds/3600).toFixed(1)+' h';
+      }
+
+      function renderStrip(){
+        const strip=$('recording-strip');
+        strip.querySelectorAll('.recording-gap-mark').forEach(node=>node.remove());
+        const recorded=$('recording-strip-recorded');
+        const cursor=$('recording-strip-cursor');
+        if(!summary || !windowFrom || !windowTo){recorded.style.width='0%';cursor.style.left='0%';return;}
+        const from=new Date(windowFrom).getTime(), to=new Date(windowTo).getTime();
+        const windowSeconds=Math.max((to-from)/1000,0.000001);
+        let recordedSeconds=0, gapSeconds=0;
+        for(const bucket of summary.buckets){
+          recordedSeconds+=Number(bucket.recordedSeconds)||0;
+          gapSeconds+=Number(bucket.gapSeconds)||0;
+        }
+        const recordedPct=Math.min(100,Math.max(0,recordedSeconds/windowSeconds*100));
+        recorded.style.width=recordedPct.toFixed(3)+'%';
+        cursor.style.left=recordedPct.toFixed(3)+'%';
+        strip.dataset.recordedSeconds=recordedSeconds.toFixed(3);
+        strip.dataset.gapSeconds=gapSeconds.toFixed(3);
+        strip.dataset.windowSeconds=windowSeconds.toFixed(3);
+        strip.dataset.bucketCount=String(summary.buckets.length);
+        // Explicit gap markers are drawn at their true position so a gap is a
+        // visible absence rather than the strip simply looking short.
+        for(const bucket of summary.buckets){
+          const gap=Number(bucket.gapSeconds)||0;
+          if(gap<=0) continue;
+          const start=new Date(bucket.start).getTime();
+          const end=new Date(bucket.end).getTime();
+          const mark=document.createElement('div');
+          mark.className='recording-gap-mark absolute inset-y-0 bg-amber-400/70 dark:bg-amber-400/60';
+          mark.style.left=Math.min(100,Math.max(0,(start-from)/1000/windowSeconds*100)).toFixed(3)+'%';
+          mark.style.width=Math.min(100,Math.max(0.4,(end-start)/1000/windowSeconds*100)).toFixed(3)+'%';
+          mark.title='No footage recorded here ('+gap.toFixed(1)+'s)';
+          strip.append(mark);
+        }
+        const meta=$('recording-strip-meta');
+        meta.replaceChildren();
+        const add=(text,cls)=>{const span=document.createElement('span');span.className=cls||'';span.textContent=text;meta.append(span);};
+        add('Window: '+wib(windowFrom)+' – '+wib(windowTo));
+        add('Recorded: '+recordedSeconds.toFixed(1)+'s');
+        if(gapSeconds>0) add('No footage: '+gapSeconds.toFixed(1)+'s','text-amber-700 dark:text-amber-300');
+        else add('No gap recorded in this window','text-slate-500 dark:text-slate-400');
+        const truncation=$('recording-truncation');
+        if(summary.truncated){
+          truncation.textContent='The catalog returned more segments than one read is bounded to, so this strip may be incomplete. Narrow the window to see every interval.';
+          truncation.classList.remove('hidden');
+        } else truncation.classList.add('hidden');
+      }
+
+      async function loadSummary(){
+        if(!windowFrom || !windowTo) return;
+        const query=new URLSearchParams({camera:$('recording-camera').value,from:windowFrom,to:windowTo,buckets:'120'});
+        const response=await fetch('/api/recordings/summary?'+query,{headers:authHeaders(),cache:'no-store'});
+        if(!response.ok) throw new Error('Summary HTTP '+response.status);
+        summary=await response.json();
+        renderStrip();
+      }
+
+      async function loadCoverage(){
+        const from=iso('recording-from'), to=iso('recording-to');
+        const query=new URLSearchParams({camera:$('recording-camera').value,from,to});
+        const response=await fetch('/api/recordings?'+query,{headers:authHeaders(),cache:'no-store'});
+        if(!response.ok) throw new Error('Coverage HTTP '+response.status);
+        const data=await response.json();
+        intervals=[];
+        const explicitGaps=[];
+        for (const segment of (data.segments || [])) {
+          if(segment.state==='gap'){explicitGaps.push(segment);continue;}
+          const previous=intervals[intervals.length-1];
+          if (previous && !segment.discontinuity && new Date(segment.start)-new Date(previous.end)<=1000 && new Date(segment.start)>=new Date(previous.start)) {
+            previous.end=segment.end;
+          } else intervals.push({start:segment.start,end:segment.end});
+        }
+        const container=$('recording-timeline');container.replaceChildren();
+        let last=new Date(from).getTime();
+        intervals.forEach((s,index) => {
+          const start=new Date(s.start).getTime();
+          if(start>last+1000){
+            const gap=document.createElement('span');
+            gap.className='inline-flex items-center px-3 py-1.5 rounded-lg text-xs font-medium bg-amber-100/60 dark:bg-amber-500/15 text-amber-700 dark:text-amber-300';
+            gap.textContent='Gap: '+wib(new Date(last).toISOString())+' – '+wib(s.start);
+            container.append(gap);
+          }
+          const button=document.createElement('button');
+          button.type='button';
+          button.className='inline-flex items-center px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-300 dark:border-white/15 hover:bg-indigo-600 hover:text-white dark:hover:bg-blue-500 transition-colors';
+          button.textContent=wib(s.start)+' – '+wib(s.end);
+          button.addEventListener('click',()=>playInterval(index));
+          container.append(button);
+          last=Math.max(last,new Date(s.end).getTime());
+        });
+        for(const gap of explicitGaps){
+          const label=document.createElement('span');
+          label.className='inline-flex items-center px-3 py-1.5 rounded-lg text-xs font-medium bg-red-100/60 dark:bg-red-500/15 text-red-700 dark:text-red-300';
+          label.textContent='Capture failed: '+wib(gap.start)+' – '+wib(gap.end);
+          container.append(label);
+        }
+        return {from,to,intervalCount:intervals.length,gapCount:explicitGaps.length};
+      }
+
+      async function loadTimeline(){
         try {
-          const from=iso('recording-from'), to=iso('recording-to');
-          const query=new URLSearchParams({camera:$('recording-camera').value,from,to});
-          const response=await fetch('/api/recordings?'+query,{headers:{Authorization:'Bearer '+$('recording-token').value},cache:'no-store'});
-          if(!response.ok) throw new Error('Coverage HTTP '+response.status);
-          const data=await response.json();
-          intervals=[];
-          const explicitGaps=[];
-          for (const segment of (data.segments || [])) {
-            if(segment.state==='gap'){explicitGaps.push(segment);continue;}
-            const previous=intervals[intervals.length-1];
-            if (previous && !segment.discontinuity && new Date(segment.start)-new Date(previous.end)<=1000 && new Date(segment.start)>=new Date(previous.start)) {
-              previous.end=segment.end;
-            } else intervals.push({start:segment.start,end:segment.end});
-          }
-          const container=$('recording-timeline');container.replaceChildren();
-          let last=new Date(from).getTime();
-          intervals.forEach((s,index) => {
-            const start=new Date(s.start).getTime();
-            if(start>last+1000){
-              const gap=document.createElement('span');
-              gap.className='inline-flex items-center px-3 py-1.5 rounded-lg text-xs font-medium bg-amber-100/60 dark:bg-amber-500/15 text-amber-700 dark:text-amber-300';
-              gap.textContent='Gap: '+dateWIB(new Date(last).toISOString())+' – '+dateWIB(s.start);
-              container.append(gap);
-            }
-            const button=document.createElement('button');
-            button.type='button';
-            button.className='inline-flex items-center px-3 py-1.5 rounded-lg text-xs font-medium border border-slate-300 dark:border-white/15 hover:bg-indigo-600 hover:text-white dark:hover:bg-blue-500 transition-colors';
-            button.textContent=dateWIB(s.start)+' – '+dateWIB(s.end);
-            button.addEventListener('click',()=>playInterval(index));
-            container.append(button);
-            last=Math.max(last,new Date(s.end).getTime());
-          });
-          for(const gap of explicitGaps){
-            const label=document.createElement('span');
-            label.className='inline-flex items-center px-3 py-1.5 rounded-lg text-xs font-medium bg-red-100/60 dark:bg-red-500/15 text-red-700 dark:text-red-300';
-            label.textContent='Capture failed: '+dateWIB(gap.start)+' – '+dateWIB(gap.end);
-            container.append(label);
-          }
-          status((intervals.length ? intervals.length+' recorded interval(s); select one to play or seek with the video controls' : 'No recorded footage in this interval')+(explicitGaps.length?' — '+explicitGaps.length+' capture gap(s)':'');
+          const loaded=await loadCoverage();
+          if(!loaded){return;}
+          referenceFrom=loaded.from;referenceTo=loaded.to;
+          windowFrom=loaded.from;windowTo=loaded.to;
+          await loadSummary();
+          status((loaded.intervalCount ? loaded.intervalCount+' recorded interval(s); select one to play or seek with the video controls' : 'No recorded footage in this interval')+(loaded.gapCount?' — '+loaded.gapCount+' capture gap(s)':''));
+          // The configuration surface needs the same token, and the token is
+          // only known once the operator has typed it, so it is refreshed here
+          // rather than only on mount. A failure here must not hide the timeline
+          // that already loaded.
+          loadConfig().catch(()=>{});
         } catch(error){status(error.message);}
+      }
+
+      // ---- Zoom ---------------------------------------------------------------
+      function zoom(factor){
+        if(!referenceFrom||!referenceTo) return;
+        const fullFrom=new Date(referenceFrom).getTime(), fullTo=new Date(referenceTo).getTime();
+        let from=new Date(windowFrom).getTime(), to=new Date(windowTo).getTime();
+        const centre=(from+to)/2, span=(to-from)*factor;
+        from=centre-span/2;to=centre+span/2;
+        if(from<fullFrom){to+=fullFrom-from;from=fullFrom;}
+        if(to>fullTo){from-=to-fullTo;to=fullTo;}
+        if(from<fullFrom)from=fullFrom;
+        if(to>fullTo)to=fullTo;
+        if(to-from<1000){to=from+1000;}
+        windowFrom=new Date(from).toISOString();windowTo=new Date(to).toISOString();
+        loadSummary().catch(error=>status(error.message));
+      }
+      function zoomReset(){
+        if(!referenceFrom||!referenceTo) return;
+        windowFrom=referenceFrom;windowTo=referenceTo;
+        loadSummary().catch(error=>status(error.message));
+      }
+      function returnToLive(){
+        stopPlayback();
+        status('Returned to Live; live stream cards are unchanged');
+        document.querySelector('.stream-grid')?.scrollIntoView({behavior:'smooth'});
+      }
+
+      // ---- Storage & configuration panel --------------------------------------
+      function renderStatus(data){
+        const location=data.location||{};
+        $('recording-config-driver').textContent=data.driver||'—';
+        let place='—';
+        if(location.kind==='local'&&location.path){place=location.path;}
+        else if(location.kind==='s3'){place=(location.endpoint||'')+(location.bucket?(' / '+location.bucket):'');}
+        $('recording-config-location').textContent=place;
+        const capacity=data.capacity||{}, backlog=data.backlog||{}, health=data.health||{};
+        $('recording-config-paused').textContent=capacity.paused?'YES':'no';
+        $('recording-config-quota').textContent=humanBytes(capacity.quotaBytes);
+        $('recording-config-used').textContent=humanBytes(capacity.usedBytes);
+        $('recording-config-free').textContent=humanBytes(capacity.freeBytes);
+        $('recording-config-uploads').textContent=String(backlog.pendingUploads??0);
+        $('recording-config-oldest').textContent=humanAge(backlog.oldestUploadSeconds);
+        $('recording-config-deletions').textContent=String(backlog.pendingDeletions??0);
+        $('recording-config-appkey').textContent=data.appKeyAvailable?'available':'not configured';
+        const note=$('recording-config-note');
+        const notes=[];
+        if(location.unavailable) notes.push('Storage driver unavailable: '+location.unavailable+'.');
+        if(!data.appKeyAvailable) notes.push('No application key is configured, so encrypted S3 credentials cannot be used.');
+        if(health.lastError) notes.push('Last storage error: '+health.lastError+'.');
+        if(health.lastUploadNs) notes.push('Last upload: '+wib(health.lastUploadNs/1e6)+'.');
+        note.textContent=notes.join(' ');
+        $('recording-config-retention').value=String(data.retentionDays||'');
+        $('recording-config-quota-input').value=String(capacity.quotaBytes||'');
+        $('recording-config-reserve-input').value=String(capacity.reserveBytes||'');
+      }
+      function renderSwitch(data){
+        const el=$('recording-config-switch');
+        if(data.driverSwitchAllowed){
+          el.textContent='The catalog is empty, so the storage driver can still be changed by configuration.';
+        } else {
+          el.textContent='Storage driver changes are disabled while footage exists: '+(data.driverSwitchReason||'a migration is required');
+        }
+      }
+      function renderCameras(cameras){
+        const list=$('recording-camera-list');list.replaceChildren();
+        if(!cameras||!cameras.length){
+          const p=document.createElement('span');
+          p.className='text-xs text-slate-500 dark:text-slate-400';
+          p.textContent='No camera has a recording setting yet.';
+          list.append(p);return;
+        }
+        for(const camera of cameras){
+          const row=document.createElement('label');
+          row.className='flex items-center justify-between gap-3 text-sm text-slate-600 dark:text-slate-300';
+          const name=document.createElement('span');
+          name.className='font-medium truncate';
+          name.textContent=camera.camera;
+          const box=document.createElement('input');
+          box.type='checkbox';box.checked=!!camera.enabled;
+          box.setAttribute('aria-label','Record '+camera.camera);
+          box.dataset.camera=camera.camera;
+          box.className='recording-camera-toggle h-4 w-4';
+          box.addEventListener('change',async()=>{
+            try{
+              const response=await fetch('/api/recordings/settings',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},authHeaders()),
+                body:JSON.stringify({camera:camera.camera,enabled:box.checked})});
+              if(!response.ok) throw new Error('Save HTTP '+response.status);
+              status('Recording for '+camera.camera+' is now '+(box.checked?'enabled':'disabled'));
+              await loadConfig();
+            }catch(error){box.checked=!box.checked;status(error.message);}
+          });
+          row.append(name,box);list.append(row);
+        }
+      }
+      async function loadConfig(){
+        const headers=authHeaders();
+        const [statusResponse,settingsResponse]=await Promise.all([
+          fetch('/api/recordings/status',{headers,cache:'no-store'}),
+          fetch('/api/recordings/settings',{headers,cache:'no-store'}),
+        ]);
+        if(!statusResponse.ok) throw new Error('Status HTTP '+statusResponse.status);
+        if(!settingsResponse.ok) throw new Error('Settings HTTP '+settingsResponse.status);
+        const data=await statusResponse.json();
+        const settings=await settingsResponse.json();
+        renderStatus(data);
+        renderSwitch({driverSwitchAllowed:settings.driverSwitchAllowed,driverSwitchReason:settings.driverSwitchReason});
+        renderCameras(settings.cameras||data.cameras);
+      }
+      function saveLimits(){
+        const payload={
+          retentionDays:Number($('recording-config-retention').value),
+          quotaBytes:Number($('recording-config-quota-input').value),
+          reserveBytes:Number($('recording-config-reserve-input').value),
+        };
+        if(!Number.isFinite(payload.retentionDays)||payload.retentionDays<=0){status('Retention must be at least one day');return;}
+        if(!Number.isFinite(payload.quotaBytes)||payload.quotaBytes<=0){status('Quota must be a positive byte count');return;}
+        if(!Number.isFinite(payload.reserveBytes)||payload.reserveBytes<0){status('Reserve must not be negative');return;}
+        return (async()=>{
+          try{
+            const response=await fetch('/api/recordings/settings',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},authHeaders()),body:JSON.stringify(payload)});
+            if(!response.ok) throw new Error('Save HTTP '+response.status);
+            const saved=await response.json();
+            status('Storage limits saved and applied without a restart (retention '+saved.retentionDays+' day(s))');
+            await loadConfig();
+          }catch(error){status(error.message);}
+        })();
+      }
+
+      // The recorded-footage panel lives INSIDE the Vue app, and Vue replaces
+      // those nodes when it mounts. A listener attached to a node during parse
+      // would therefore sit on a detached element and never fire, which is
+      // exactly what happened here. One DELEGATED listener on the document
+      // survives the mount and any later re-render.
+      const RECORDING_ACTIONS={
+        'recording-load':()=>loadTimeline(),
+        'recording-live':()=>returnToLive(),
+        'recording-zoom-in':()=>zoom(0.5),
+        'recording-zoom-out':()=>zoom(2),
+        'recording-zoom-reset':()=>zoomReset(),
+        'recording-config-refresh':()=>loadConfig().catch(error=>status(error.message)),
+        'recording-config-save':()=>saveLimits(),
+      };
+      document.addEventListener('click',event=>{
+        const action=event.target instanceof Element ? event.target.closest('[id]') : null;
+        const handler=action && RECORDING_ACTIONS[action.id];
+        if(handler) handler();
       });
-      $('recording-live').addEventListener('click',()=>{if(hls){hls.destroy();hls=null;}player.pause();player.removeAttribute('src');player.load();status('Returned to Live; live stream cards are unchanged');document.querySelector('.stream-grid')?.scrollIntoView({behavior:'smooth'});});
+
+      // Load the configuration the first time the panel becomes VISIBLE and a
+      // token has been entered, so a collapsed panel stays collapsed, no request
+      // is made without the credential the endpoint requires, and there is no
+      // background polling. The observer watches #app because the body element
+      // itself is replaced by the Vue mount.
+      let configLoaded=false;
+      const maybeLoadConfig=()=>{
+        if(configLoaded) return;
+        const panel=$('recording-playback-body');
+        if(!panel || getComputedStyle(panel).display==='none') return;
+        if(!($('recording-token')?.value||'').trim()) return;
+        configLoaded=true;
+        loadConfig().catch(()=>{});
+      };
+      new MutationObserver(maybeLoadConfig).observe(document.getElementById('app'),{attributes:true,childList:true,subtree:true});
     })();
   </script>
 </body>

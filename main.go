@@ -396,7 +396,7 @@ func main() {
 
 	// Initialize Stream Manager
 	streamManager := stream.NewManager(hlsBaseDir, dbLogger)
-	recorder, recordingToken, err := setupRecording(dbLogger, streamManager)
+	recorder, recordingToken, recordingSettings, err := setupRecording(dbLogger, streamManager)
 	if err != nil {
 		log.Fatalf("Recording configuration rejected: %v", err)
 	}
@@ -577,8 +577,8 @@ func main() {
 	http.Handle("/", http.FileServer(http.FS(staticFS)))
 	http.Handle("/hls/", http.StripPrefix("/hls/", http.FileServer(http.Dir(hlsBaseDir))))
 	if recorder != nil {
-		http.Handle("/api/recordings", handlers.RecordingRoutes(recorder, recordingToken))
-		http.Handle("/api/recordings/", handlers.RecordingRoutes(recorder, recordingToken))
+		http.Handle("/api/recordings", handlers.RecordingRoutes(recorder, recordingToken, handlers.WithStorageSettings(recordingSettings)))
+		http.Handle("/api/recordings/", handlers.RecordingRoutes(recorder, recordingToken, handlers.WithStorageSettings(recordingSettings)))
 	}
 
 	// API routes

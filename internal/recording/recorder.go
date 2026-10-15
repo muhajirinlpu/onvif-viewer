@@ -48,6 +48,10 @@ type Recorder struct {
 	mu        sync.Mutex
 	processMu sync.Mutex
 	inFlight  int64
+	// desc is set once at wiring time and reports the active driver/location.
+	desc         StoreDescription
+	lastUploadNS int64
+	lastError    string
 }
 
 func New(db *sql.DB, spool string, store storage.Store, cfg Config) (*Recorder, error) {
@@ -57,8 +61,10 @@ func New(db *sql.DB, spool string, store storage.Store, cfg Config) (*Recorder, 
 	if err := os.MkdirAll(spool, 0700); err != nil {
 		return nil, err
 	}
-	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS recording_settings(camera TEXT PRIMARY KEY,enabled INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS recording_store_identity(id INTEGER PRIMARY KEY CHECK(id=1), store_id TEXT NOT NULL);
+	if err := EnsureStorageSchema(db); err != nil {
+		return nil, err
+	}
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS recording_store_identity(id INTEGER PRIMARY KEY CHECK(id=1), store_id TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS recording_segments(id INTEGER PRIMARY KEY,camera TEXT NOT NULL,run TEXT NOT NULL,sequence INTEGER NOT NULL,start_ns INTEGER NOT NULL,end_ns INTEGER NOT NULL,duration REAL NOT NULL,discontinuity INTEGER NOT NULL,key TEXT NOT NULL,sha256 TEXT NOT NULL,size INTEGER NOT NULL,spool TEXT NOT NULL,state TEXT NOT NULL,UNIQUE(camera,run,sequence));
 CREATE INDEX IF NOT EXISTS recording_camera_time ON recording_segments(camera,start_ns);
 CREATE TABLE IF NOT EXISTS recording_upload_jobs(segment_id INTEGER PRIMARY KEY,attempts INTEGER NOT NULL DEFAULT 0,next_ns INTEGER NOT NULL DEFAULT 0,lease_ns INTEGER NOT NULL DEFAULT 0,last_error TEXT NOT NULL DEFAULT '',FOREIGN KEY(segment_id) REFERENCES recording_segments(id));
@@ -575,6 +581,15 @@ func (r *Recorder) Process(ctx context.Context) error {
 			if first == nil {
 				first = e
 			}
+		}
+		// Health is recorded under the same lock that guards the catalog
+		// transition, and the error is reduced to a category: a raw store error
+		// carries object keys and absolute paths.
+		if e == nil {
+			r.lastUploadNS = time.Now().UTC().UnixNano()
+			r.lastError = ""
+		} else {
+			r.recordFailureLocked(e)
 		}
 		r.mu.Unlock()
 	}
